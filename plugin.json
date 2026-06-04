@@ -1,0 +1,19 @@
+{
+  "name": "slash-filter",
+  "author": "fyuan",
+  "version": "1.2.5",
+  "minAppVersion": "3.1.27",
+  "backends": ["all"],
+  "frontends": ["all"],
+  "main": "index.js",
+  "displayName": {
+    "default": "Slash Menu Filter",
+    "zh_CN": "斜杠菜单过滤"
+  },
+  "description": {
+    "default": "Toggle each / slash menu item on or off in plugin settings",
+    "zh_CN": "在插件设置中逐项开关斜杠 / 菜单选项，关闭后输入 / 不再显示"
+  },
+  "keywords": ["slash", "filter", "heading", "斜杠", "过滤", "设置"],
+  "i18n": ["zh_CN", "en_US"]
+}
