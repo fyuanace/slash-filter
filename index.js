@@ -11,6 +11,7 @@ const IMAGE_CENTER_CSS = `.p:has(span.img) {
     margin-right: auto;
 }`;
 const IMAGE_SCALE_RETRY_DELAYS = [100, 400, 1000, 2500];
+const IMAGE_AUTO_WIDTH = "calc(100% - 8px)";
 
 function setImageCenterCssEnabled(enabled) {
     let styleEl = document.getElementById(IMAGE_CENTER_STYLE_ID);
@@ -125,6 +126,76 @@ function calcImageWidthFromDpi(naturalWidth, dpi) {
     return Math.max(17, Math.round(naturalWidth * SCREEN_DPI / safeDpi));
 }
 
+function getProtyleContentMaxWidth(protyle) {
+    const wysiwyg = protyle?.wysiwyg?.element;
+    if (!wysiwyg) {
+        return null;
+    }
+    const realWidth = parseInt(wysiwyg.getAttribute("data-realwidth") || "", 10);
+    if (Number.isFinite(realWidth) && realWidth > 0) {
+        return realWidth;
+    }
+    const protyleEl = protyle.element || wysiwyg.closest(".protyle");
+    if (protyleEl) {
+        const cssWidth = getComputedStyle(protyleEl).getPropertyValue("--b3-width-protyle-wysiwyg").trim();
+        const parsed = parseInt(cssWidth, 10);
+        if (Number.isFinite(parsed) && parsed > 0) {
+            return parsed;
+        }
+    }
+    const style = window.getComputedStyle(wysiwyg);
+    const paddingLeft = parseFloat(style.paddingLeft) || 0;
+    const paddingRight = parseFloat(style.paddingRight) || 0;
+    const contentWidth = wysiwyg.clientWidth - paddingLeft - paddingRight;
+    return contentWidth > 0 ? Math.round(contentWidth) : null;
+}
+
+function resolveImageWidthPolicy(naturalWidth, dpi, editorMaxWidth) {
+    const targetWidth = calcImageWidthFromDpi(naturalWidth, dpi);
+    if (!editorMaxWidth || targetWidth >= editorMaxWidth) {
+        return { mode: "auto", targetWidth };
+    }
+    return { mode: "fixed", targetWidth, width: targetWidth };
+}
+
+function normalizeWidthStyle(value) {
+    return String(value || "").replace(/\s/g, "");
+}
+
+function getPolicyWidthStyle(policy) {
+    return policy.mode === "auto" ? IMAGE_AUTO_WIDTH : `${policy.width}px`;
+}
+
+function resetImgWrapperStyle(wrapper) {
+    if (!wrapper) {
+        return;
+    }
+    if (wrapper.style.minWidth) {
+        wrapper.style.width = "";
+    } else {
+        wrapper.removeAttribute("style");
+    }
+}
+
+function applyWidthPolicyToImage(img, policy) {
+    const widthSpan = getImageWidthSpan(img);
+    if (!widthSpan) {
+        return false;
+    }
+    const wrapper = widthSpan.parentElement;
+    resetImgWrapperStyle(wrapper);
+    img.style.height = "";
+    widthSpan.style.width = getPolicyWidthStyle(policy);
+    return true;
+}
+
+function isSameWidthPolicy(widthSpan, policy) {
+    if (!widthSpan) {
+        return false;
+    }
+    return normalizeWidthStyle(widthSpan.style.width) === normalizeWidthStyle(getPolicyWidthStyle(policy));
+}
+
 function getImageWidthSpan(img) {
     const widthSpan = img?.parentElement;
     if (!widthSpan || widthSpan.tagName !== "SPAN") {
@@ -135,11 +206,6 @@ function getImageWidthSpan(img) {
         return null;
     }
     return widthSpan;
-}
-
-function imageWidthSpanNeedsScaling(widthSpan) {
-    const style = widthSpan.getAttribute("style") || "";
-    return !/width\s*:/i.test(style);
 }
 
 function persistBlockUpdate(protyle, nodeElement) {
@@ -158,64 +224,76 @@ function persistBlockUpdate(protyle, nodeElement) {
     }]);
 }
 
-function applyImageScale(img, plugin, protyle) {
-    if (!plugin?.config?.imageScale?.enabled) {
-        return false;
-    }
-    const widthSpan = getImageWidthSpan(img);
-    if (!widthSpan) {
-        return false;
-    }
-    const wrapper = widthSpan.parentElement;
-    if (wrapper.dataset.sfScaled === "1" || !imageWidthSpanNeedsScaling(widthSpan)) {
-        return false;
-    }
-    const naturalWidth = img.naturalWidth;
-    if (!naturalWidth) {
-        return false;
-    }
-    const dpi = getEffectiveDpi(plugin.config.imageScale);
-    if (dpi === null) {
-        return false;
-    }
-    let width = calcImageWidthFromDpi(naturalWidth, dpi);
-    const wysiwyg = protyle?.wysiwyg?.element;
-    if (wysiwyg?.clientWidth) {
-        width = Math.min(width, Math.max(17, wysiwyg.clientWidth - 48));
-    }
-    const nodeElement = wrapper.closest('[data-node-id][data-type="NodeParagraph"]');
-    if (!nodeElement) {
-        return false;
-    }
-    widthSpan.style.width = `${width}px`;
-    wrapper.dataset.sfScaled = "1";
-    persistBlockUpdate(protyle, nodeElement);
-    return true;
-}
-
-function processImageWhenReady(img, plugin, protyle) {
-    if (!img || img.dataset.sfWatch === "1") {
-        return;
-    }
-    img.dataset.sfWatch = "1";
-    const run = () => applyImageScale(img, plugin, protyle);
-    if (img.complete && img.naturalWidth) {
-        run();
-        return;
-    }
-    img.addEventListener("load", run, { once: true });
-    img.addEventListener("error", () => {
-        delete img.dataset.sfWatch;
-    }, { once: true });
-}
-
-function processImagesInProtyle(plugin, protyle) {
+function refreshAllImagesInProtyle(plugin, protyle) {
     if (!plugin?.config?.imageScale?.enabled || !protyle?.wysiwyg?.element) {
         return;
     }
+    const dpi = getEffectiveDpi(plugin.config.imageScale);
+    if (dpi === null) {
+        return;
+    }
+    const editorMaxWidth = getProtyleContentMaxWidth(protyle);
     protyle.wysiwyg.element.querySelectorAll('[data-type="img"] img').forEach((img) => {
-        processImageWhenReady(img, plugin, protyle);
+        const naturalWidth = img.naturalWidth;
+        if (!naturalWidth) {
+            return;
+        }
+        const widthSpan = getImageWidthSpan(img);
+        if (!widthSpan) {
+            return;
+        }
+        const policy = resolveImageWidthPolicy(naturalWidth, dpi, editorMaxWidth);
+        if (isSameWidthPolicy(widthSpan, policy)) {
+            return;
+        }
+        const nodeElement = widthSpan.parentElement?.closest('[data-node-id][data-type="NodeParagraph"]');
+        if (!nodeElement) {
+            return;
+        }
+        applyWidthPolicyToImage(img, policy);
+        persistBlockUpdate(protyle, nodeElement);
     });
+}
+
+function scheduleLayoutRefresh(plugin) {
+    window.clearTimeout(plugin.layoutRefreshTimer);
+    plugin.layoutRefreshTimer = window.setTimeout(() => {
+        getAllEditor().forEach(({ protyle }) => refreshAllImagesInProtyle(plugin, protyle));
+    }, 150);
+}
+
+function watchProtyleLayout(plugin, protyle) {
+    const wysiwyg = protyle?.wysiwyg?.element;
+    if (!wysiwyg || plugin.protyleLayoutWatchers.has(wysiwyg)) {
+        return;
+    }
+    const triggerRefresh = () => scheduleLayoutRefresh(plugin);
+    const resizeObserver = new ResizeObserver(triggerRefresh);
+    resizeObserver.observe(wysiwyg);
+    const attrObserver = new MutationObserver((mutations) => {
+        if (mutations.some((item) => item.attributeName === "data-realwidth")) {
+            triggerRefresh();
+        }
+    });
+    attrObserver.observe(wysiwyg, {
+        attributes: true,
+        attributeFilter: ["data-realwidth"],
+    });
+    plugin.protyleLayoutWatchers.set(wysiwyg, { resizeObserver, attrObserver });
+}
+
+function watchAllEditorLayouts(plugin) {
+    getAllEditor().forEach(({ protyle }) => watchProtyleLayout(plugin, protyle));
+}
+
+function unwatchAllProtyleLayouts(plugin) {
+    plugin.protyleLayoutWatchers.forEach(({ resizeObserver, attrObserver }) => {
+        resizeObserver.disconnect();
+        attrObserver.disconnect();
+    });
+    plugin.protyleLayoutWatchers.clear();
+    window.clearTimeout(plugin.layoutRefreshTimer);
+    plugin.layoutRefreshTimer = null;
 }
 
 function scheduleImageScaleForProtyle(plugin, protyle) {
@@ -223,7 +301,7 @@ function scheduleImageScaleForProtyle(plugin, protyle) {
         return;
     }
     IMAGE_SCALE_RETRY_DELAYS.forEach((delay) => {
-        window.setTimeout(() => processImagesInProtyle(plugin, protyle), delay);
+        window.setTimeout(() => refreshAllImagesInProtyle(plugin, protyle), delay);
     });
 }
 
@@ -668,6 +746,7 @@ function scheduleSlashHintHook(plugin) {
 
 function patchAllEditors(plugin) {
     scheduleSlashHintHook(plugin);
+    watchAllEditorLayouts(plugin);
 }
 
 module.exports = class SlashFilterPlugin extends Plugin {
@@ -683,6 +762,9 @@ module.exports = class SlashFilterPlugin extends Plugin {
     imageDpiManualModeEl = null;
     imageManualDpiEl = null;
     imageScaleCenterEl = null;
+    protyleLayoutWatchers = new Map();
+    layoutRefreshTimer = null;
+    windowResizeHandler = null;
 
     onload() {
         this.data[STORAGE_NAME] = createDefaultConfig();
@@ -723,6 +805,14 @@ module.exports = class SlashFilterPlugin extends Plugin {
         this.eventBus.on("loaded-protyle-dynamic", this.protyleLoadHandler);
         this.eventBus.on("loaded-protyle-static", this.protyleLoadHandler);
 
+        this.windowResizeHandler = () => {
+            if (!this.config.imageScale?.enabled) {
+                return;
+            }
+            scheduleLayoutRefresh(this);
+        };
+        window.addEventListener("resize", this.windowResizeHandler);
+
         this.registerBazaarSettingWatcher();
         this.scheduleBazaarSettingButtonFix();
     }
@@ -754,6 +844,11 @@ module.exports = class SlashFilterPlugin extends Plugin {
             this.eventBus.off("loaded-protyle-static", this.protyleLoadHandler);
             this.protyleLoadHandler = null;
         }
+        if (this.windowResizeHandler) {
+            window.removeEventListener("resize", this.windowResizeHandler);
+            this.windowResizeHandler = null;
+        }
+        unwatchAllProtyleLayouts(this);
         setImageCenterCssEnabled(false);
     }
 
@@ -805,6 +900,9 @@ module.exports = class SlashFilterPlugin extends Plugin {
             };
             this.data[STORAGE_NAME] = this.config;
             this.applyImageCenterStyle();
+            if (this.config.imageScale?.enabled) {
+                scheduleLayoutRefresh(this);
+            }
         }
     }
 
@@ -967,6 +1065,7 @@ module.exports = class SlashFilterPlugin extends Plugin {
         this.syncSettingFormToConfig();
         this.applyImageCenterStyle();
         this.data[STORAGE_NAME] = this.config;
+        scheduleLayoutRefresh(this);
         return this.saveData(STORAGE_NAME, this.config);
     }
 

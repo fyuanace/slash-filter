@@ -10,7 +10,7 @@
   "filterKeywords": "Triggers",
   "saveFailed": "Failed to save settings",
   "imageScaleEnable": "Scale on paste by DPI",
-  "imageScaleEnableDesc": "Pasted or dropped images get a native span width from DPI; images that already have a width are skipped.",
+  "imageScaleEnableDesc": "Apply to all images: fixed px when DPI width is below editor content width, calc(100% - 8px) otherwise; refreshes on resize (including manually adjusted images).",
   "dpiManualMode": "Manual DPI",
   "manualDpi": "Manual DPI value",
   "manualDpiDesc": "Off: auto system DPI (Siyuan UI zoom excluded). On: use the value below (150% ≈ 144).",
