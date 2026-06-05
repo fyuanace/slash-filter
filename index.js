@@ -3,6 +3,229 @@ const { Plugin, Setting, getAllEditor, showMessage } = require("siyuan");
 const STORAGE_NAME = "slash-filter-config.json";
 const LEGACY_STORAGE_NAME = "slash-filter-config";
 const ZWSP = "\u200b";
+const SCREEN_DPI = 96;
+const SIYUAN_LOCAL_ZOOM_KEY = "local-zoom";
+const IMAGE_CENTER_STYLE_ID = "slash-filter-img-center-css";
+const IMAGE_CENTER_CSS = `.p:has(span.img) {
+    margin-left: auto;
+    margin-right: auto;
+}`;
+const IMAGE_SCALE_RETRY_DELAYS = [100, 400, 1000, 2500];
+
+function setImageCenterCssEnabled(enabled) {
+    let styleEl = document.getElementById(IMAGE_CENTER_STYLE_ID);
+    if (enabled) {
+        if (!styleEl) {
+            styleEl = document.createElement("style");
+            styleEl.id = IMAGE_CENTER_STYLE_ID;
+            document.head.appendChild(styleEl);
+        }
+        styleEl.textContent = IMAGE_CENTER_CSS;
+        return;
+    }
+    styleEl?.remove();
+}
+
+function createDefaultImageScaleConfig() {
+    return {
+        enabled: false,
+        center: false,
+        dpiMode: "auto",
+        manualDpi: 144,
+    };
+}
+
+function tryGetSiyuanAppZoom() {
+    const storageZoom = window.siyuan?.storage?.[SIYUAN_LOCAL_ZOOM_KEY];
+    if (Number.isFinite(storageZoom) && storageZoom > 0) {
+        return storageZoom;
+    }
+    try {
+        const req = typeof window !== "undefined" && window.require;
+        if (req) {
+            const { webFrame } = req("electron");
+            const zoomFactor = webFrame?.getZoomFactor?.();
+            if (Number.isFinite(zoomFactor) && zoomFactor > 0) {
+                return zoomFactor;
+            }
+        }
+    } catch (error) {
+        console.debug("[slash-filter] webFrame zoom unavailable", error);
+    }
+    return 1;
+}
+
+function getAutoDpiInfo() {
+    if (typeof window === "undefined") {
+        return null;
+    }
+    const rawDpr = window.devicePixelRatio;
+    if (!Number.isFinite(rawDpr) || rawDpr <= 0) {
+        return null;
+    }
+    const appZoom = tryGetSiyuanAppZoom();
+    const dpr = rawDpr / appZoom;
+    if (!Number.isFinite(dpr) || dpr <= 0) {
+        return null;
+    }
+    const percent = Math.round(dpr * 100);
+    return {
+        dpr,
+        rawDpr,
+        appZoom,
+        percent,
+        dpi: Math.round((SCREEN_DPI * percent) / 100),
+        compensated: Math.abs(appZoom - 1) > 0.001,
+    };
+}
+
+function getAutoDpi() {
+    return getAutoDpiInfo()?.dpi ?? null;
+}
+
+function getEffectiveDpi(imageScale) {
+    if (imageScale?.dpiMode === "manual") {
+        const dpi = Math.round(Number(imageScale.manualDpi));
+        return dpi > 0 ? dpi : null;
+    }
+    return getAutoDpi();
+}
+
+function canUseImageScale(imageScale) {
+    return getEffectiveDpi(imageScale) !== null;
+}
+
+function getDpiModeDescription(i18n, imageScale) {
+    if (imageScale?.dpiMode === "manual") {
+        const dpi = Math.round(Number(imageScale.manualDpi)) || 0;
+        return i18n.manualDpiActiveLabel.replace("${dpi}", String(dpi > 0 ? dpi : "—"));
+    }
+    return getAutoDpiDescription(i18n);
+}
+
+function getAutoDpiDescription(i18n) {
+    const info = getAutoDpiInfo();
+    if (!info) {
+        return i18n.autoDpiUnavailable;
+    }
+    if (info.compensated) {
+        return i18n.autoDpiCompensatedLabel
+            .replace("${dpi}", String(info.dpi))
+            .replace("${percent}", String(info.percent))
+            .replace("${appZoomPercent}", String(Math.round(info.appZoom * 100)))
+            .replace("${rawPercent}", String(Math.round(info.rawDpr * 100)));
+    }
+    return i18n.autoDpiLabel
+        .replace("${dpi}", String(info.dpi))
+        .replace("${percent}", String(info.percent));
+}
+
+function calcImageWidthFromDpi(naturalWidth, dpi) {
+    const safeDpi = Math.max(1, Number(dpi) || SCREEN_DPI);
+    return Math.max(17, Math.round(naturalWidth * SCREEN_DPI / safeDpi));
+}
+
+function getImageWidthSpan(img) {
+    const widthSpan = img?.parentElement;
+    if (!widthSpan || widthSpan.tagName !== "SPAN") {
+        return null;
+    }
+    const wrapper = widthSpan.parentElement;
+    if (!wrapper || wrapper.getAttribute("data-type") !== "img") {
+        return null;
+    }
+    return widthSpan;
+}
+
+function imageWidthSpanNeedsScaling(widthSpan) {
+    const style = widthSpan.getAttribute("style") || "";
+    return !/width\s*:/i.test(style);
+}
+
+function persistBlockUpdate(protyle, nodeElement) {
+    const id = nodeElement?.getAttribute("data-node-id");
+    if (!id || !protyle) {
+        return;
+    }
+    const instance = typeof protyle.getInstance === "function" ? protyle.getInstance() : protyle;
+    if (!instance?.transaction) {
+        return;
+    }
+    instance.transaction([{
+        action: "update",
+        id,
+        data: nodeElement.outerHTML,
+    }]);
+}
+
+function applyImageScale(img, plugin, protyle) {
+    if (!plugin?.config?.imageScale?.enabled) {
+        return false;
+    }
+    const widthSpan = getImageWidthSpan(img);
+    if (!widthSpan) {
+        return false;
+    }
+    const wrapper = widthSpan.parentElement;
+    if (wrapper.dataset.sfScaled === "1" || !imageWidthSpanNeedsScaling(widthSpan)) {
+        return false;
+    }
+    const naturalWidth = img.naturalWidth;
+    if (!naturalWidth) {
+        return false;
+    }
+    const dpi = getEffectiveDpi(plugin.config.imageScale);
+    if (dpi === null) {
+        return false;
+    }
+    let width = calcImageWidthFromDpi(naturalWidth, dpi);
+    const wysiwyg = protyle?.wysiwyg?.element;
+    if (wysiwyg?.clientWidth) {
+        width = Math.min(width, Math.max(17, wysiwyg.clientWidth - 48));
+    }
+    const nodeElement = wrapper.closest('[data-node-id][data-type="NodeParagraph"]');
+    if (!nodeElement) {
+        return false;
+    }
+    widthSpan.style.width = `${width}px`;
+    wrapper.dataset.sfScaled = "1";
+    persistBlockUpdate(protyle, nodeElement);
+    return true;
+}
+
+function processImageWhenReady(img, plugin, protyle) {
+    if (!img || img.dataset.sfWatch === "1") {
+        return;
+    }
+    img.dataset.sfWatch = "1";
+    const run = () => applyImageScale(img, plugin, protyle);
+    if (img.complete && img.naturalWidth) {
+        run();
+        return;
+    }
+    img.addEventListener("load", run, { once: true });
+    img.addEventListener("error", () => {
+        delete img.dataset.sfWatch;
+    }, { once: true });
+}
+
+function processImagesInProtyle(plugin, protyle) {
+    if (!plugin?.config?.imageScale?.enabled || !protyle?.wysiwyg?.element) {
+        return;
+    }
+    protyle.wysiwyg.element.querySelectorAll('[data-type="img"] img').forEach((img) => {
+        processImageWhenReady(img, plugin, protyle);
+    });
+}
+
+function scheduleImageScaleForProtyle(plugin, protyle) {
+    if (!plugin?.config?.imageScale?.enabled || !protyle) {
+        return;
+    }
+    IMAGE_SCALE_RETRY_DELAYS.forEach((delay) => {
+        window.setTimeout(() => processImagesInProtyle(plugin, protyle), delay);
+    });
+}
 
 function buildNativeSlashCatalog() {
     const L = window.siyuan?.languages || {};
@@ -333,7 +556,10 @@ function filterSlashItems(data, plugin, protyleArg = null) {
 }
 
 function createDefaultConfig() {
-    return { disabled: {} };
+    return {
+        disabled: {},
+        imageScale: createDefaultImageScaleConfig(),
+    };
 }
 
 function isItemEnabled(item, config) {
@@ -446,12 +672,17 @@ function patchAllEditors(plugin) {
 
 module.exports = class SlashFilterPlugin extends Plugin {
     slashHandler = null;
+    pasteHandler = null;
     protyleLoadHandler = null;
     bazaarObserver = null;
     topBarEntry = null;
     config = createDefaultConfig();
     slashCatalog = new Map();
     settingToggleEls = new Map();
+    imageScaleEnableEl = null;
+    imageDpiManualModeEl = null;
+    imageManualDpiEl = null;
+    imageScaleCenterEl = null;
 
     onload() {
         this.data[STORAGE_NAME] = createDefaultConfig();
@@ -479,6 +710,15 @@ module.exports = class SlashFilterPlugin extends Plugin {
         };
         this.eventBus.on("protyle-slash", this.slashHandler);
 
+        this.pasteHandler = (event) => {
+            const detail = event.detail ?? event;
+            if (!this.config.imageScale?.enabled || !detail?.protyle) {
+                return;
+            }
+            scheduleImageScaleForProtyle(this, detail.protyle);
+        };
+        this.eventBus.on("paste", this.pasteHandler);
+
         this.protyleLoadHandler = () => patchAllEditors(this);
         this.eventBus.on("loaded-protyle-dynamic", this.protyleLoadHandler);
         this.eventBus.on("loaded-protyle-static", this.protyleLoadHandler);
@@ -505,11 +745,16 @@ module.exports = class SlashFilterPlugin extends Plugin {
             this.eventBus.off("protyle-slash", this.slashHandler);
             this.slashHandler = null;
         }
+        if (this.pasteHandler) {
+            this.eventBus.off("paste", this.pasteHandler);
+            this.pasteHandler = null;
+        }
         if (this.protyleLoadHandler) {
             this.eventBus.off("loaded-protyle-dynamic", this.protyleLoadHandler);
             this.eventBus.off("loaded-protyle-static", this.protyleLoadHandler);
             this.protyleLoadHandler = null;
         }
+        setImageCenterCssEnabled(false);
     }
 
     uninstall() {
@@ -553,16 +798,25 @@ module.exports = class SlashFilterPlugin extends Plugin {
         if (data && typeof data === "object") {
             this.config = {
                 disabled: { ...(data.disabled || {}) },
+                imageScale: {
+                    ...createDefaultImageScaleConfig(),
+                    ...(data.imageScale || {}),
+                },
             };
             this.data[STORAGE_NAME] = this.config;
+            this.applyImageCenterStyle();
         }
+    }
+
+    applyImageCenterStyle() {
+        setImageCenterCssEnabled(this.config?.imageScale?.center === true);
     }
 
     loadSlashConfig() {
         return this.loadData(STORAGE_NAME).then((data) => {
             const hasNewConfig = data
                 && typeof data === "object"
-                && Object.keys(data.disabled || {}).length > 0;
+                && (Object.keys(data.disabled || {}).length > 0 || data.imageScale);
             if (hasNewConfig) {
                 this.applyConfig(data);
                 return;
@@ -601,7 +855,10 @@ module.exports = class SlashFilterPlugin extends Plugin {
                 disabled[key] = true;
             }
         }
-        this.config = { disabled };
+        this.config = {
+            disabled,
+            imageScale: { ...(this.config.imageScale || createDefaultImageScaleConfig()) },
+        };
         this.settingToggleEls.forEach((input, key) => {
             input.checked = enabled;
         });
@@ -612,15 +869,11 @@ module.exports = class SlashFilterPlugin extends Plugin {
             height: "80vh",
             width: "768px",
             confirmCallback: () => {
-                this.saveSlashConfig().catch((error) => {
+                this.saveConfig().catch((error) => {
                     console.warn("[slash-filter] saveData failed", error);
                     showMessage(this.i18n.saveFailed);
                 });
             },
-        });
-        this.setting.addItem({
-            title: this.i18n.settingHint,
-            description: "",
         });
     }
 
@@ -669,23 +922,126 @@ module.exports = class SlashFilterPlugin extends Plugin {
         });
     }
 
-    saveSlashConfig() {
-        const disabled = {};
+    syncSettingFormToConfig() {
+        const disabled = { ...(this.config.disabled || {}) };
         this.settingToggleEls.forEach((input, key) => {
-            if (!input.checked) {
+            if (input.checked) {
+                delete disabled[key];
+            } else {
                 disabled[key] = true;
             }
         });
-        this.config = { disabled };
+        this.config.disabled = disabled;
+        if (this.imageScaleEnableEl) {
+            this.config.imageScale.enabled = this.imageScaleEnableEl.checked;
+        }
+        if (this.imageScaleCenterEl) {
+            this.config.imageScale.center = this.imageScaleCenterEl.checked;
+        }
+        if (this.imageDpiManualModeEl) {
+            this.config.imageScale.dpiMode = this.imageDpiManualModeEl.checked ? "manual" : "auto";
+        }
+        if (this.imageManualDpiEl) {
+            this.config.imageScale.manualDpi = Math.max(1, Number(this.imageManualDpiEl.value) || SCREEN_DPI);
+        }
+    }
+
+    updateImageScaleControlState() {
+        const imageScale = this.config.imageScale || createDefaultImageScaleConfig();
+        if (this.imageDpiManualModeEl) {
+            imageScale.dpiMode = this.imageDpiManualModeEl.checked ? "manual" : "auto";
+        }
+        if (this.imageManualDpiEl) {
+            imageScale.manualDpi = Math.max(1, Number(this.imageManualDpiEl.value) || SCREEN_DPI);
+        }
+        const available = canUseImageScale(imageScale);
+        if (this.imageScaleEnableEl) {
+            this.imageScaleEnableEl.disabled = !available;
+        }
+        if (this.imageManualDpiEl) {
+            this.imageManualDpiEl.disabled = imageScale.dpiMode !== "manual";
+        }
+    }
+
+    saveConfig() {
+        this.syncSettingFormToConfig();
+        this.applyImageCenterStyle();
         this.data[STORAGE_NAME] = this.config;
         return this.saveData(STORAGE_NAME, this.config);
     }
 
     buildSettingItems() {
         this.settingToggleEls.clear();
+        this.imageScaleEnableEl = null;
+        this.imageDpiManualModeEl = null;
+        this.imageManualDpiEl = null;
+        this.imageScaleCenterEl = null;
+        const imageScale = this.config.imageScale || createDefaultImageScaleConfig();
+        const dpiAvailable = canUseImageScale(imageScale);
+
         this.setting.addItem({
             title: this.i18n.configPathLabel,
             description: this.getStoragePathDisplay(),
+        });
+        this.setting.addItem({
+            title: this.i18n.imageScaleEnable,
+            direction: "row",
+            description: this.i18n.imageScaleEnableDesc,
+            createActionElement: () => {
+                const input = document.createElement("input");
+                input.className = "b3-switch";
+                input.type = "checkbox";
+                input.checked = imageScale.enabled === true;
+                input.disabled = !dpiAvailable;
+                this.imageScaleEnableEl = input;
+                return input;
+            },
+        });
+        this.setting.addItem({
+            title: this.i18n.dpiManualMode,
+            direction: "row",
+            description: getDpiModeDescription(this.i18n, imageScale),
+            createActionElement: () => {
+                const input = document.createElement("input");
+                input.className = "b3-switch";
+                input.type = "checkbox";
+                input.checked = imageScale.dpiMode === "manual";
+                input.disabled = imageScale.dpiMode !== "manual" && getAutoDpi() === null;
+                input.addEventListener("change", () => this.updateImageScaleControlState());
+                this.imageDpiManualModeEl = input;
+                return input;
+            },
+        });
+        this.setting.addItem({
+            title: this.i18n.manualDpi,
+            direction: "row",
+            description: this.i18n.manualDpiDesc,
+            createActionElement: () => {
+                const input = document.createElement("input");
+                input.className = "b3-text-field fn__flex-center fn__size200";
+                input.type = "number";
+                input.min = "1";
+                input.max = "1200";
+                input.step = "1";
+                input.value = String(imageScale.manualDpi || 144);
+                input.disabled = imageScale.dpiMode !== "manual";
+                input.addEventListener("input", () => this.updateImageScaleControlState());
+                this.imageManualDpiEl = input;
+                return input;
+            },
+        });
+        this.setting.addItem({
+            title: this.i18n.imageScaleCenter,
+            direction: "row",
+            description: this.i18n.imageScaleCenterDesc,
+            createActionElement: () => {
+                const input = document.createElement("input");
+                input.className = "b3-switch";
+                input.type = "checkbox";
+                input.checked = imageScale.center === true;
+                this.imageScaleCenterEl = input;
+                return input;
+            },
         });
         this.setting.addItem({
             title: this.i18n.settingHint,

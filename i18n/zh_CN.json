@@ -8,5 +8,16 @@
   "enableAll": "全部启用",
   "disableAll": "全部关闭",
   "filterKeywords": "触发词",
-  "saveFailed": "保存设置失败"
+  "saveFailed": "保存设置失败",
+  "imageScaleEnable": "粘贴时按 DPI 缩放",
+  "imageScaleEnableDesc": "粘贴或拖入图片时按 DPI 计算宽度并写入原生 span 样式；已有宽度的图片不会重复处理。",
+  "dpiManualMode": "手动指定 DPI",
+  "manualDpi": "手动 DPI",
+  "manualDpiDesc": "关闭时自动读取系统 DPI（已扣除思源界面缩放）；开启后使用下方数值（150% 缩放对应 144）。",
+  "manualDpiActiveLabel": "当前使用手动 DPI：${dpi}。",
+  "imageScaleCenter": "图片段落居中",
+  "imageScaleCenterDesc": "全局注入 CSS：.p:has(span.img) { margin-left: auto; margin-right: auto; }，不修改文档块属性。",
+  "autoDpiLabel": "当前系统 DPI：${dpi}（${percent}%）。",
+  "autoDpiCompensatedLabel": "当前系统 DPI：${dpi}（${percent}%）。已扣除思源界面缩放 ${appZoomPercent}%（devicePixelRatio ${rawPercent}%）。",
+  "autoDpiUnavailable": "无法读取 DPI，可改用手动指定 DPI。"
 }

@@ -8,5 +8,16 @@
   "enableAll": "Enable all",
   "disableAll": "Disable all",
   "filterKeywords": "Triggers",
-  "saveFailed": "Failed to save settings"
+  "saveFailed": "Failed to save settings",
+  "imageScaleEnable": "Scale on paste by DPI",
+  "imageScaleEnableDesc": "Pasted or dropped images get a native span width from DPI; images that already have a width are skipped.",
+  "dpiManualMode": "Manual DPI",
+  "manualDpi": "Manual DPI value",
+  "manualDpiDesc": "Off: auto system DPI (Siyuan UI zoom excluded). On: use the value below (150% ≈ 144).",
+  "manualDpiActiveLabel": "Using manual DPI: ${dpi}.",
+  "imageScaleCenter": "Center image paragraphs",
+  "imageScaleCenterDesc": "Injects global CSS: .p:has(span.img) { margin-left: auto; margin-right: auto; } without changing block attributes.",
+  "autoDpiLabel": "System DPI: ${dpi} (${percent}%).",
+  "autoDpiCompensatedLabel": "System DPI: ${dpi} (${percent}%). Siyuan UI zoom ${appZoomPercent}% excluded (devicePixelRatio ${rawPercent}%).",
+  "autoDpiUnavailable": "Cannot read DPI; enable Manual DPI instead."
 }
