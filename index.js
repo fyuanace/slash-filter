@@ -215,69 +215,173 @@ function addPanguSpacingToMarkdownAware(text) {
     return result;
 }
 
-function collectMeaningfulCharsInRoot(root, range = null) {
+const PANGU_LOOKBACK_CHARS = 120;
+const PANGU_IME_LOOKBACK_CHARS = 200;
+const PANGU_PASTE_RADIUS_CHARS = 400;
+
+const PANGU_TEXT_WALKER_FILTER = {
+    acceptNode(node) {
+        return isInsideBlockCode(node) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;
+    },
+};
+
+function annotateInlineCodeBoundaries(chars) {
+    for (let i = 0; i < chars.length; i++) {
+        const entry = chars[i];
+        if (!entry.codeRoot) {
+            entry.isFirstInCode = false;
+            entry.isLastInCode = false;
+            continue;
+        }
+        entry.isFirstInCode = i === 0 || chars[i - 1].codeRoot !== entry.codeRoot;
+        entry.isLastInCode = i === chars.length - 1 || chars[i + 1].codeRoot !== entry.codeRoot;
+    }
+}
+
+function collectMeaningfulCharsBeforeCursor(root, range, maxLookback) {
+    const chars = [];
+    if (!root || !range || maxLookback <= 0) {
+        return chars;
+    }
+    const pushChar = (textNode, index) => {
+        const ch = textNode.data[index];
+        if (isIgnorableSpacingChar(ch)) {
+            return;
+        }
+        chars.unshift({
+            node: textNode,
+            offset: index,
+            ch,
+            codeRoot: getInlineCodeRoot(textNode),
+        });
+    };
+    let node = range.startContainer;
+    let offset = range.startOffset;
+    if (node.nodeType === Node.TEXT_NODE) {
+        while (offset > 0 && chars.length < maxLookback) {
+            offset--;
+            pushChar(node, offset);
+        }
+    }
+    if (chars.length >= maxLookback) {
+        annotateInlineCodeBoundaries(chars);
+        return chars;
+    }
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, PANGU_TEXT_WALKER_FILTER);
+    if (node.nodeType === Node.TEXT_NODE && walker.currentNode !== node) {
+        try {
+            walker.currentNode = node;
+        } catch (error) {
+            console.debug("[slash-filter] walker anchor failed", error);
+        }
+    }
+    let prev = node.nodeType === Node.TEXT_NODE ? walker.previousNode() : walker.previousNode();
+    while (prev && chars.length < maxLookback) {
+        for (let i = prev.data.length - 1; i >= 0 && chars.length < maxLookback; i--) {
+            pushChar(prev, i);
+        }
+        prev = walker.previousNode();
+    }
+    annotateInlineCodeBoundaries(chars);
+    return chars;
+}
+
+function collectMeaningfulCharsAfterCursor(root, range, maxLookahead) {
+    const chars = [];
+    if (!root || !range || maxLookahead <= 0) {
+        return chars;
+    }
+    const pushChar = (textNode, index) => {
+        const ch = textNode.data[index];
+        if (isIgnorableSpacingChar(ch)) {
+            return;
+        }
+        chars.push({
+            node: textNode,
+            offset: index,
+            ch,
+            codeRoot: getInlineCodeRoot(textNode),
+        });
+    };
+    let node = range.startContainer;
+    let offset = range.startOffset;
+    if (node.nodeType === Node.TEXT_NODE) {
+        const text = node.data;
+        while (offset < text.length && chars.length < maxLookahead) {
+            pushChar(node, offset);
+            offset++;
+        }
+    }
+    if (chars.length >= maxLookahead) {
+        annotateInlineCodeBoundaries(chars);
+        return chars;
+    }
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, PANGU_TEXT_WALKER_FILTER);
+    if (node.nodeType === Node.TEXT_NODE) {
+        try {
+            walker.currentNode = node;
+        } catch (error) {
+            console.debug("[slash-filter] walker anchor failed", error);
+        }
+    }
+    let next = walker.nextNode();
+    while (next && chars.length < maxLookahead) {
+        for (let i = 0; i < next.data.length && chars.length < maxLookahead; i++) {
+            pushChar(next, i);
+        }
+        next = walker.nextNode();
+    }
+    annotateInlineCodeBoundaries(chars);
+    return chars;
+}
+
+function collectMeaningfulCharsNearCursor(root, range, radius) {
+    const before = collectMeaningfulCharsBeforeCursor(root, range, radius);
+    const after = collectMeaningfulCharsAfterCursor(root, range, radius);
+    if (!after.length) {
+        return before;
+    }
+    const merged = before.concat(after);
+    annotateInlineCodeBoundaries(merged);
+    return merged;
+}
+
+function rootHasInlineCode(root) {
+    return !!root?.querySelector?.('[data-type="code"]');
+}
+
+function applyPanguSpacingToTextNodes(root) {
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, PANGU_TEXT_WALKER_FILTER);
+    while (walker.nextNode()) {
+        const node = walker.currentNode;
+        const spaced = addPanguSpacingToText(node.data);
+        if (spaced !== node.data) {
+            node.data = spaced;
+        }
+    }
+}
+
+function collectMeaningfulCharsInRoot(root) {
     const chars = [];
     if (!root) {
         return chars;
     }
-    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, PANGU_TEXT_WALKER_FILTER);
     while (walker.nextNode()) {
         const node = walker.currentNode;
-        if (isInsideBlockCode(node)) {
-            continue;
-        }
         const codeRoot = getInlineCodeRoot(node);
         const text = node.data;
         for (let i = 0; i < text.length; i++) {
-            if (range) {
-                let compareResult = 0;
-                try {
-                    compareResult = range.comparePoint(node, i);
-                } catch (error) {
-                    console.debug("[slash-filter] comparePoint failed", error);
-                    return chars;
-                }
-                if (compareResult > 0) {
-                    return chars;
-                }
-            }
             if (!isIgnorableSpacingChar(text[i])) {
                 chars.push({ node, offset: i, ch: text[i], codeRoot });
             }
         }
     }
+    annotateInlineCodeBoundaries(chars);
     return chars;
 }
 
-function isLastCharInInlineCode(chars, index) {
-    const entry = chars[index];
-    if (!entry.codeRoot) {
-        return false;
-    }
-    for (let j = index + 1; j < chars.length; j++) {
-        if (chars[j].codeRoot === entry.codeRoot) {
-            return false;
-        }
-        return true;
-    }
-    return true;
-}
-
-function isFirstCharInInlineCode(chars, index) {
-    const entry = chars[index];
-    if (!entry.codeRoot) {
-        return false;
-    }
-    for (let j = index - 1; j >= 0; j--) {
-        if (chars[j].codeRoot === entry.codeRoot) {
-            return false;
-        }
-        return true;
-    }
-    return true;
-}
-
-function findPanguInsertionActions(chars, lookback = 100) {
+function findPanguInsertionActions(chars, lookback = PANGU_LOOKBACK_CHARS) {
     if (chars.length < 2) {
         return [];
     }
@@ -294,7 +398,7 @@ function findPanguInsertionActions(chars, lookback = 100) {
             continue;
         }
 
-        if (!left.codeRoot && right.codeRoot && isFirstCharInInlineCode(chars, i + 1)) {
+        if (!left.codeRoot && right.codeRoot && right.isFirstInCode) {
             const key = right.codeRoot;
             if (!seenBefore.has(key)) {
                 seenBefore.add(key);
@@ -303,7 +407,7 @@ function findPanguInsertionActions(chars, lookback = 100) {
             continue;
         }
 
-        if (left.codeRoot && !right.codeRoot && isLastCharInInlineCode(chars, i)) {
+        if (left.codeRoot && !right.codeRoot && left.isLastInCode) {
             const key = left.codeRoot;
             if (!seenAfter.has(key)) {
                 seenAfter.add(key);
@@ -371,8 +475,18 @@ function applyPanguInsertionActions(actions, range, selection) {
     return true;
 }
 
-function processPanguSpacingInRoot(root) {
+function processPanguSpacingInRoot(root, range = null) {
     if (!root) {
+        return;
+    }
+    if (range) {
+        const chars = collectMeaningfulCharsNearCursor(root, range, PANGU_PASTE_RADIUS_CHARS);
+        const actions = findPanguInsertionActions(chars, chars.length);
+        applyPanguInsertionActions(actions, range, window.getSelection());
+        return;
+    }
+    if (!rootHasInlineCode(root)) {
+        applyPanguSpacingToTextNodes(root);
         return;
     }
     const chars = collectMeaningfulCharsInRoot(root);
@@ -421,7 +535,7 @@ function buildPanguPastePayload(detail) {
     return payload;
 }
 
-function applyPanguSpacingScan(state, scanMode = "beforeCursor") {
+function applyPanguSpacingScan(state, options = {}) {
     if (state.suppressInput) {
         state.suppressInput = false;
         return false;
@@ -435,11 +549,9 @@ function applyPanguSpacingScan(state, scanMode = "beforeCursor") {
     if (!root || isInSkippableEditableBlock(root)) {
         return false;
     }
-    const meaningful = scanMode === "fullBlock"
-        ? collectMeaningfulCharsInRoot(root)
-        : collectMeaningfulCharsInRoot(root, range);
-    const lookback = scanMode === "fullBlock" ? meaningful.length : 100;
-    const actions = findPanguInsertionActions(meaningful, lookback);
+    const radius = options.imeSettle ? PANGU_IME_LOOKBACK_CHARS : PANGU_LOOKBACK_CHARS;
+    const meaningful = collectMeaningfulCharsBeforeCursor(root, range, radius);
+    const actions = findPanguInsertionActions(meaningful, meaningful.length);
     if (!actions.length) {
         return false;
     }
@@ -447,17 +559,120 @@ function applyPanguSpacingScan(state, scanMode = "beforeCursor") {
     return applyPanguInsertionActions(actions, range, selection);
 }
 
-function applyPanguSpacingToProtyle(protyle) {
-    const wysiwyg = protyle?.wysiwyg?.element;
-    if (!wysiwyg) {
+function getPreviousBlockEditableRoot(blockRoot) {
+    const block = blockRoot?.closest?.("[data-node-id]");
+    if (!block) {
+        return null;
+    }
+    let prev = block.previousElementSibling;
+    while (prev) {
+        const editable = prev.querySelector?.('div[contenteditable="true"]');
+        if (editable && !isInSkippableEditableBlock(editable)) {
+            return editable;
+        }
+        prev = prev.previousElementSibling;
+    }
+    return null;
+}
+
+function getFirstMeaningfulCharInRoot(root) {
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, PANGU_TEXT_WALKER_FILTER);
+    while (walker.nextNode()) {
+        const node = walker.currentNode;
+        const text = node.data;
+        for (let i = 0; i < text.length; i++) {
+            if (!isIgnorableSpacingChar(text[i])) {
+                return {
+                    node,
+                    offset: i,
+                    ch: text[i],
+                    codeRoot: getInlineCodeRoot(node),
+                    isFirstInCode: true,
+                    isLastInCode: true,
+                };
+            }
+        }
+    }
+    return null;
+}
+
+function getLastMeaningfulCharInRoot(root) {
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, PANGU_TEXT_WALKER_FILTER);
+    const textNodes = [];
+    while (walker.nextNode()) {
+        textNodes.push(walker.currentNode);
+    }
+    for (let n = textNodes.length - 1; n >= 0; n--) {
+        const node = textNodes[n];
+        const text = node.data;
+        for (let i = text.length - 1; i >= 0; i--) {
+            if (!isIgnorableSpacingChar(text[i])) {
+                return {
+                    node,
+                    offset: i,
+                    ch: text[i],
+                    codeRoot: getInlineCodeRoot(node),
+                    isFirstInCode: true,
+                    isLastInCode: true,
+                };
+            }
+        }
+    }
+    return null;
+}
+
+function fixAdjacentBlockBoundary(leftRoot, rightRoot) {
+    const left = getLastMeaningfulCharInRoot(leftRoot);
+    const right = getFirstMeaningfulCharInRoot(rightRoot);
+    if (!left || !right || !needsPanguSpaceBetween(left.ch, right.ch)) {
         return;
     }
-    wysiwyg.querySelectorAll('[data-node-id] div[contenteditable="true"]').forEach((root) => {
-        if (isInSkippableEditableBlock(root)) {
-            return;
+    if (!left.codeRoot && right.codeRoot) {
+        left.isFirstInCode = false;
+        left.isLastInCode = false;
+        right.isFirstInCode = true;
+        right.isLastInCode = false;
+        annotateInlineCodeBoundaries([left, right]);
+        applyPanguInsertionActions(
+            [{ type: "beforeElement", element: right.codeRoot }],
+            null,
+            null,
+        );
+        return;
+    }
+    if (left.codeRoot && !right.codeRoot) {
+        annotateInlineCodeBoundaries([left, right]);
+        applyPanguInsertionActions(
+            [{ type: "afterElement", element: left.codeRoot }],
+            null,
+            null,
+        );
+        return;
+    }
+    applyPanguInsertionActions(
+        [{ type: "text", node: right.node, offset: right.offset }],
+        null,
+        null,
+    );
+}
+
+function applyPanguSpacingNearPasteSite(protyle) {
+    const selection = window.getSelection();
+    if (!selection?.rangeCount) {
+        return;
+    }
+    const range = selection.getRangeAt(0);
+    const blockRoot = getEditableTextRoot(range.startContainer);
+    if (!blockRoot || isInSkippableEditableBlock(blockRoot)) {
+        return;
+    }
+    processPanguSpacingInRoot(blockRoot, range);
+    if (collectMeaningfulCharsBeforeCursor(blockRoot, range, 1).length === 0) {
+        const prevRoot = getPreviousBlockEditableRoot(blockRoot);
+        if (prevRoot) {
+            fixAdjacentBlockBoundary(prevRoot, blockRoot);
         }
-        processPanguSpacingInRoot(root);
-    });
+    }
 }
 
 function clearPanguSpacingTimers(state) {
@@ -465,7 +680,9 @@ function clearPanguSpacingTimers(state) {
         window.clearTimeout(state.debounceTimer);
         state.debounceTimer = null;
     }
-    state.imeSettleTimers.forEach((timer) => window.clearTimeout(timer));
+    state.imeSettleTimers.forEach((timer) => {
+        window.cancelAnimationFrame(timer);
+    });
     state.imeSettleTimers = [];
 }
 
@@ -476,7 +693,7 @@ function schedulePanguSpacingCheck(state, options = {}) {
     }
     state.debounceTimer = window.setTimeout(() => {
         state.debounceTimer = null;
-        applyPanguSpacingScan(state, "beforeCursor");
+        applyPanguSpacingScan(state, { imeSettle });
     }, 10);
 
     if (!imeSettle) {
@@ -484,13 +701,11 @@ function schedulePanguSpacingCheck(state, options = {}) {
     }
     state.imeSettleTimers.forEach((timer) => window.clearTimeout(timer));
     state.imeSettleTimers = [];
-    [0, 50, 120].forEach((delay) => {
-        const timer = window.setTimeout(() => {
-            state.imeSettleTimers = state.imeSettleTimers.filter((item) => item !== timer);
-            applyPanguSpacingScan(state, "fullBlock");
-        }, delay);
-        state.imeSettleTimers.push(timer);
+    const timer = window.requestAnimationFrame(() => {
+        state.imeSettleTimers = state.imeSettleTimers.filter((item) => item !== timer);
+        applyPanguSpacingScan(state, { imeSettle: true });
     });
+    state.imeSettleTimers.push(timer);
 }
 
 function shouldHandlePanguInput(event) {
@@ -601,10 +816,8 @@ function schedulePanguSpacingAfterPaste(plugin, protyle) {
         return;
     }
     watchPanguSpacing(plugin, protyle);
-    [0, 80, 200, 400].forEach((delay) => {
-        window.setTimeout(() => {
-            applyPanguSpacingToProtyle(protyle);
-        }, delay);
+    window.requestAnimationFrame(() => {
+        applyPanguSpacingNearPasteSite(protyle);
     });
 }
 
@@ -1389,11 +1602,7 @@ module.exports = class SlashFilterPlugin extends Plugin {
                 }
             }
             if (detail.protyle) {
-                [80, 200].forEach((delay) => {
-                    window.setTimeout(() => {
-                        schedulePanguSpacingAfterPaste(this, detail.protyle);
-                    }, delay);
-                });
+                schedulePanguSpacingAfterPaste(this, detail.protyle);
             }
         };
         this.eventBus.on("paste", this.pastePanguHandler);
