@@ -1,7 +1,7 @@
 {
   "name": "slash-filter",
   "author": "fyuan",
-  "version": "1.3.0",
+  "version": "1.4.3",
   "minAppVersion": "3.1.27",
   "backends": ["all"],
   "frontends": ["all"],

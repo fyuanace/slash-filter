@@ -36,6 +36,392 @@ function createDefaultImageScaleConfig() {
     };
 }
 
+function createDefaultPanguSpacingConfig() {
+    return {
+        enabled: false,
+    };
+}
+
+const RE_CJK_CHAR = /[\u4E00-\u9FFF\u3400-\u4DBF\uF900-\uFAFF]/;
+const RE_ASCII_CHAR = /[A-Za-z0-9]/;
+const RE_PANGU_SPACING = /([\u4E00-\u9FFF\u3400-\u4DBF\uF900-\uFAFF])([A-Za-z0-9])|([A-Za-z0-9])([\u4E00-\u9FFF\u3400-\u4DBF\uF900-\uFAFF])/g;
+
+function isCjkChar(ch) {
+    return !!ch && RE_CJK_CHAR.test(ch);
+}
+
+function isAsciiChar(ch) {
+    return !!ch && RE_ASCII_CHAR.test(ch);
+}
+
+function needsPanguSpaceBetween(prev, next) {
+    if (!prev || !next || prev === " " || next === " ") {
+        return false;
+    }
+    return (isCjkChar(prev) && isAsciiChar(next)) || (isAsciiChar(prev) && isCjkChar(next));
+}
+
+function addPanguSpacingToText(text) {
+    if (!text) {
+        return text;
+    }
+    return text.replace(RE_PANGU_SPACING, (match, cjkBefore, asciiAfter, asciiBefore, cjkAfter) => {
+        if (cjkBefore && asciiAfter) {
+            return `${cjkBefore} ${asciiAfter}`;
+        }
+        if (asciiBefore && cjkAfter) {
+            return `${asciiBefore} ${cjkAfter}`;
+        }
+        return match;
+    });
+}
+
+function isInSkippableEditableBlock(node) {
+    return !!node?.closest?.(
+        '[data-type="NodeCodeBlock"], .code-block, .hljs, .protyle-action, .protyle-attr, .protyle-title'
+    );
+}
+
+function isIgnorableSpacingChar(ch) {
+    return !ch || ch === ZWSP || ch === "\uFEFF";
+}
+
+function getEditableTextRoot(node) {
+    const anchor = node?.nodeType === Node.TEXT_NODE ? node.parentElement : node;
+    if (!anchor) {
+        return null;
+    }
+    const blockRoot = anchor.closest?.("[data-node-id] div[contenteditable=\"true\"]");
+    if (blockRoot) {
+        return blockRoot;
+    }
+    return anchor.closest?.("[contenteditable=\"true\"]") || null;
+}
+
+function collectMeaningfulCharsBeforeCursor(root, range) {
+    const chars = [];
+    if (!root || !range) {
+        return chars;
+    }
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    while (walker.nextNode()) {
+        const node = walker.currentNode;
+        const text = node.data;
+        for (let i = 0; i < text.length; i++) {
+            let compareResult = 0;
+            try {
+                compareResult = range.comparePoint(node, i);
+            } catch (error) {
+                console.debug("[slash-filter] comparePoint failed", error);
+                return chars;
+            }
+            if (compareResult > 0) {
+                return chars;
+            }
+            if (!isIgnorableSpacingChar(text[i])) {
+                chars.push({ node, offset: i, ch: text[i] });
+            }
+        }
+    }
+    return chars;
+}
+
+function collectMeaningfulCharsInBlock(root) {
+    const chars = [];
+    if (!root) {
+        return chars;
+    }
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    while (walker.nextNode()) {
+        const node = walker.currentNode;
+        const text = node.data;
+        for (let i = 0; i < text.length; i++) {
+            if (!isIgnorableSpacingChar(text[i])) {
+                chars.push({ node, offset: i, ch: text[i] });
+            }
+        }
+    }
+    return chars;
+}
+
+function adjustCursorAfterInsertions(range, toInsert, selection) {
+    if (!toInsert.length || !range || !selection) {
+        return;
+    }
+    let adjust = 0;
+    for (const item of toInsert) {
+        try {
+            if (range.comparePoint(item.node, item.offset) > 0) {
+                adjust += 1;
+            }
+        } catch (error) {
+            if (range.startContainer.nodeType === Node.TEXT_NODE
+                && item.node === range.startContainer
+                && item.offset <= range.startOffset) {
+                adjust += 1;
+            }
+        }
+    }
+    if (adjust === 0) {
+        return;
+    }
+    const cursorNode = range.startContainer;
+    const cursorOffset = range.startOffset;
+    if (cursorNode.nodeType !== Node.TEXT_NODE) {
+        return;
+    }
+    const newRange = document.createRange();
+    newRange.setStart(cursorNode, cursorOffset + adjust);
+    newRange.collapse(true);
+    selection.removeAllRanges();
+    selection.addRange(newRange);
+}
+
+function findPanguInsertions(meaningful, lookback = 100) {
+    if (meaningful.length < 2) {
+        return [];
+    }
+    const scanStart = Math.max(0, meaningful.length - 1 - lookback);
+    const toInsert = [];
+    const seen = new Set();
+    for (let i = scanStart; i < meaningful.length - 1; i++) {
+        const left = meaningful[i];
+        const right = meaningful[i + 1];
+        if (!needsPanguSpaceBetween(left.ch, right.ch)) {
+            continue;
+        }
+        const key = `${right.node}${right.offset}`;
+        if (seen.has(key)) {
+            continue;
+        }
+        seen.add(key);
+        toInsert.push({ node: right.node, offset: right.offset });
+    }
+    return toInsert;
+}
+
+function addPanguSpacingToHtml(html) {
+    if (!html || !html.trim()) {
+        return html;
+    }
+    const template = document.createElement("template");
+    template.innerHTML = html;
+    const container = template.content;
+    const chars = [];
+    const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
+    while (walker.nextNode()) {
+        const node = walker.currentNode;
+        for (let i = 0; i < node.data.length; i++) {
+            if (!isIgnorableSpacingChar(node.data[i])) {
+                chars.push({ node, offset: i, ch: node.data[i] });
+            }
+        }
+    }
+    const toInsert = findPanguInsertions(chars, chars.length);
+    for (let i = toInsert.length - 1; i >= 0; i--) {
+        toInsert[i].node.insertData(toInsert[i].offset, " ");
+    }
+    if (container.childNodes.length === 1 && container.firstElementChild) {
+        return container.firstElementChild.innerHTML;
+    }
+    let result = "";
+    container.childNodes.forEach((node) => {
+        if (node.nodeType === Node.ELEMENT_NODE) {
+            result += node.outerHTML;
+        } else if (node.nodeType === Node.TEXT_NODE) {
+            result += node.textContent;
+        }
+    });
+    return result || html;
+}
+
+function buildPanguPastePayload(detail) {
+    const payload = {};
+    if (typeof detail.textPlain === "string" && detail.textPlain !== "") {
+        payload.textPlain = addPanguSpacingToText(detail.textPlain);
+    }
+    if (typeof detail.textHTML === "string" && detail.textHTML !== "") {
+        payload.textHTML = addPanguSpacingToHtml(detail.textHTML);
+    }
+    return payload;
+}
+
+function applyPanguSpacingScan(state, scanMode = "beforeCursor") {
+    if (state.suppressInput) {
+        state.suppressInput = false;
+        return false;
+    }
+    const selection = window.getSelection();
+    if (!selection || selection.rangeCount === 0 || !selection.isCollapsed) {
+        return false;
+    }
+    const range = selection.getRangeAt(0);
+    const root = getEditableTextRoot(range.startContainer);
+    if (!root || isInSkippableEditableBlock(root)) {
+        return false;
+    }
+    const meaningful = scanMode === "fullBlock"
+        ? collectMeaningfulCharsInBlock(root)
+        : collectMeaningfulCharsBeforeCursor(root, range);
+    const toInsert = findPanguInsertions(meaningful);
+    if (toInsert.length === 0) {
+        return false;
+    }
+    state.suppressInput = true;
+    for (let i = toInsert.length - 1; i >= 0; i--) {
+        toInsert[i].node.insertData(toInsert[i].offset, " ");
+    }
+    adjustCursorAfterInsertions(range, toInsert, selection);
+    return true;
+}
+
+function clearPanguSpacingTimers(state) {
+    if (state.debounceTimer) {
+        window.clearTimeout(state.debounceTimer);
+        state.debounceTimer = null;
+    }
+    state.imeSettleTimers.forEach((timer) => window.clearTimeout(timer));
+    state.imeSettleTimers = [];
+}
+
+function schedulePanguSpacingCheck(state, options = {}) {
+    const { imeSettle = false } = options;
+    if (state.debounceTimer) {
+        window.clearTimeout(state.debounceTimer);
+    }
+    state.debounceTimer = window.setTimeout(() => {
+        state.debounceTimer = null;
+        applyPanguSpacingScan(state, "beforeCursor");
+    }, 10);
+
+    if (!imeSettle) {
+        return;
+    }
+    state.imeSettleTimers.forEach((timer) => window.clearTimeout(timer));
+    state.imeSettleTimers = [];
+    [0, 50, 120].forEach((delay) => {
+        const timer = window.setTimeout(() => {
+            state.imeSettleTimers = state.imeSettleTimers.filter((item) => item !== timer);
+            applyPanguSpacingScan(state, "fullBlock");
+        }, delay);
+        state.imeSettleTimers.push(timer);
+    });
+}
+
+function shouldHandlePanguInput(event) {
+    if (!event?.inputType) {
+        return true;
+    }
+    return event.inputType.startsWith("insert");
+}
+
+function createPanguSpacingState() {
+    return {
+        composing: false,
+        justEndedComposition: false,
+        suppressInput: false,
+        debounceTimer: null,
+        imeSettleTimers: [],
+    };
+}
+
+function bindPanguSpacingHandlers(wysiwyg, state) {
+    const onCompositionStart = () => {
+        state.composing = true;
+        state.justEndedComposition = false;
+    };
+    const onCompositionEnd = () => {
+        state.composing = false;
+        state.justEndedComposition = true;
+        schedulePanguSpacingCheck(state, { imeSettle: true });
+        window.setTimeout(() => {
+            state.justEndedComposition = false;
+        }, 200);
+    };
+    const onInput = (event) => {
+        if (!shouldHandlePanguInput(event)) {
+            return;
+        }
+        if (state.composing) {
+            return;
+        }
+        const imeSettle = state.justEndedComposition
+            || event.inputType === "insertCompositionText"
+            || event.inputType === "insertFromComposition";
+        schedulePanguSpacingCheck(state, { imeSettle });
+    };
+    wysiwyg.addEventListener("compositionstart", onCompositionStart, true);
+    wysiwyg.addEventListener("compositionend", onCompositionEnd, true);
+    wysiwyg.addEventListener("input", onInput, true);
+    return { onCompositionStart, onCompositionEnd, onInput, state };
+}
+
+function unbindPanguSpacingHandlers(wysiwyg, handlers) {
+    if (!wysiwyg || !handlers) {
+        return;
+    }
+    if (handlers.state) {
+        clearPanguSpacingTimers(handlers.state);
+    }
+    wysiwyg.removeEventListener("compositionstart", handlers.onCompositionStart, true);
+    wysiwyg.removeEventListener("compositionend", handlers.onCompositionEnd, true);
+    wysiwyg.removeEventListener("input", handlers.onInput, true);
+}
+
+function watchPanguSpacing(plugin, protyle) {
+    if (!plugin.config.panguSpacing?.enabled) {
+        return;
+    }
+    const wysiwyg = protyle?.wysiwyg?.element;
+    if (!wysiwyg || plugin.panguSpacingWatchers.has(wysiwyg)) {
+        return;
+    }
+    const state = createPanguSpacingState();
+    const handlers = bindPanguSpacingHandlers(wysiwyg, state);
+    plugin.panguSpacingWatchers.set(wysiwyg, { handlers, state });
+}
+
+function unwatchPanguSpacing(plugin, wysiwyg) {
+    const entry = plugin.panguSpacingWatchers.get(wysiwyg);
+    if (!entry) {
+        return;
+    }
+    unbindPanguSpacingHandlers(wysiwyg, entry.handlers);
+    plugin.panguSpacingWatchers.delete(wysiwyg);
+}
+
+function watchAllPanguSpacing(plugin) {
+    if (!plugin.config.panguSpacing?.enabled) {
+        return;
+    }
+    getAllEditor().forEach(({ protyle }) => watchPanguSpacing(plugin, protyle));
+}
+
+function unwatchAllPanguSpacing(plugin) {
+    [...plugin.panguSpacingWatchers.keys()].forEach((wysiwyg) => {
+        unwatchPanguSpacing(plugin, wysiwyg);
+    });
+}
+
+function syncPanguSpacingWatchers(plugin) {
+    if (plugin.config.panguSpacing?.enabled) {
+        watchAllPanguSpacing(plugin);
+        return;
+    }
+    unwatchAllPanguSpacing(plugin);
+}
+
+function schedulePanguSpacingAfterPaste(plugin, protyle) {
+    if (!plugin.config.panguSpacing?.enabled || !protyle?.wysiwyg?.element) {
+        return;
+    }
+    watchPanguSpacing(plugin, protyle);
+    const entry = plugin.panguSpacingWatchers.get(protyle.wysiwyg.element);
+    if (entry?.state) {
+        schedulePanguSpacingCheck(entry.state, { imeSettle: true });
+    }
+}
+
 function tryGetSiyuanAppZoom() {
     const storageZoom = window.siyuan?.storage?.[SIYUAN_LOCAL_ZOOM_KEY];
     if (Number.isFinite(storageZoom) && storageZoom > 0) {
@@ -637,6 +1023,7 @@ function createDefaultConfig() {
     return {
         disabled: {},
         imageScale: createDefaultImageScaleConfig(),
+        panguSpacing: createDefaultPanguSpacingConfig(),
     };
 }
 
@@ -747,11 +1134,13 @@ function scheduleSlashHintHook(plugin) {
 function patchAllEditors(plugin) {
     scheduleSlashHintHook(plugin);
     watchAllEditorLayouts(plugin);
+    syncPanguSpacingWatchers(plugin);
 }
 
 module.exports = class SlashFilterPlugin extends Plugin {
     slashHandler = null;
     pasteHandler = null;
+    pastePanguHandler = null;
     protyleLoadHandler = null;
     bazaarObserver = null;
     topBarEntry = null;
@@ -762,7 +1151,9 @@ module.exports = class SlashFilterPlugin extends Plugin {
     imageDpiManualModeEl = null;
     imageManualDpiEl = null;
     imageScaleCenterEl = null;
+    panguSpacingEnableEl = null;
     protyleLayoutWatchers = new Map();
+    panguSpacingWatchers = new Map();
     layoutRefreshTimer = null;
     windowResizeHandler = null;
 
@@ -794,12 +1185,32 @@ module.exports = class SlashFilterPlugin extends Plugin {
 
         this.pasteHandler = (event) => {
             const detail = event.detail ?? event;
-            if (!this.config.imageScale?.enabled || !detail?.protyle) {
-                return;
+            if (detail?.protyle && this.config.imageScale?.enabled) {
+                scheduleImageScaleForProtyle(this, detail.protyle);
             }
-            scheduleImageScaleForProtyle(this, detail.protyle);
         };
         this.eventBus.on("paste", this.pasteHandler);
+
+        this.pastePanguHandler = (event) => {
+            const detail = event.detail ?? event;
+            if (!this.config.panguSpacing?.enabled || !detail) {
+                return;
+            }
+            if (typeof detail.resolve === "function") {
+                const payload = buildPanguPastePayload(detail);
+                if (Object.keys(payload).length > 0) {
+                    detail.resolve(payload);
+                }
+            }
+            if (detail.protyle) {
+                [80, 200].forEach((delay) => {
+                    window.setTimeout(() => {
+                        schedulePanguSpacingAfterPaste(this, detail.protyle);
+                    }, delay);
+                });
+            }
+        };
+        this.eventBus.on("paste", this.pastePanguHandler);
 
         this.protyleLoadHandler = () => patchAllEditors(this);
         this.eventBus.on("loaded-protyle-dynamic", this.protyleLoadHandler);
@@ -839,6 +1250,10 @@ module.exports = class SlashFilterPlugin extends Plugin {
             this.eventBus.off("paste", this.pasteHandler);
             this.pasteHandler = null;
         }
+        if (this.pastePanguHandler) {
+            this.eventBus.off("paste", this.pastePanguHandler);
+            this.pastePanguHandler = null;
+        }
         if (this.protyleLoadHandler) {
             this.eventBus.off("loaded-protyle-dynamic", this.protyleLoadHandler);
             this.eventBus.off("loaded-protyle-static", this.protyleLoadHandler);
@@ -849,6 +1264,7 @@ module.exports = class SlashFilterPlugin extends Plugin {
             this.windowResizeHandler = null;
         }
         unwatchAllProtyleLayouts(this);
+        unwatchAllPanguSpacing(this);
         setImageCenterCssEnabled(false);
     }
 
@@ -897,9 +1313,14 @@ module.exports = class SlashFilterPlugin extends Plugin {
                     ...createDefaultImageScaleConfig(),
                     ...(data.imageScale || {}),
                 },
+                panguSpacing: {
+                    ...createDefaultPanguSpacingConfig(),
+                    ...(data.panguSpacing || {}),
+                },
             };
             this.data[STORAGE_NAME] = this.config;
             this.applyImageCenterStyle();
+            syncPanguSpacingWatchers(this);
             if (this.config.imageScale?.enabled) {
                 scheduleLayoutRefresh(this);
             }
@@ -914,7 +1335,7 @@ module.exports = class SlashFilterPlugin extends Plugin {
         return this.loadData(STORAGE_NAME).then((data) => {
             const hasNewConfig = data
                 && typeof data === "object"
-                && (Object.keys(data.disabled || {}).length > 0 || data.imageScale);
+                && (Object.keys(data.disabled || {}).length > 0 || data.imageScale || data.panguSpacing);
             if (hasNewConfig) {
                 this.applyConfig(data);
                 return;
@@ -956,6 +1377,7 @@ module.exports = class SlashFilterPlugin extends Plugin {
         this.config = {
             disabled,
             imageScale: { ...(this.config.imageScale || createDefaultImageScaleConfig()) },
+            panguSpacing: { ...(this.config.panguSpacing || createDefaultPanguSpacingConfig()) },
         };
         this.settingToggleEls.forEach((input, key) => {
             input.checked = enabled;
@@ -1042,6 +1464,9 @@ module.exports = class SlashFilterPlugin extends Plugin {
         if (this.imageManualDpiEl) {
             this.config.imageScale.manualDpi = Math.max(1, Number(this.imageManualDpiEl.value) || SCREEN_DPI);
         }
+        if (this.panguSpacingEnableEl) {
+            this.config.panguSpacing.enabled = this.panguSpacingEnableEl.checked;
+        }
     }
 
     updateImageScaleControlState() {
@@ -1064,6 +1489,7 @@ module.exports = class SlashFilterPlugin extends Plugin {
     saveConfig() {
         this.syncSettingFormToConfig();
         this.applyImageCenterStyle();
+        syncPanguSpacingWatchers(this);
         this.data[STORAGE_NAME] = this.config;
         scheduleLayoutRefresh(this);
         return this.saveData(STORAGE_NAME, this.config);
@@ -1075,7 +1501,9 @@ module.exports = class SlashFilterPlugin extends Plugin {
         this.imageDpiManualModeEl = null;
         this.imageManualDpiEl = null;
         this.imageScaleCenterEl = null;
+        this.panguSpacingEnableEl = null;
         const imageScale = this.config.imageScale || createDefaultImageScaleConfig();
+        const panguSpacing = this.config.panguSpacing || createDefaultPanguSpacingConfig();
         const dpiAvailable = canUseImageScale(imageScale);
 
         this.setting.addItem({
@@ -1139,6 +1567,19 @@ module.exports = class SlashFilterPlugin extends Plugin {
                 input.type = "checkbox";
                 input.checked = imageScale.center === true;
                 this.imageScaleCenterEl = input;
+                return input;
+            },
+        });
+        this.setting.addItem({
+            title: this.i18n.panguSpacingEnable,
+            direction: "row",
+            description: this.i18n.panguSpacingEnableDesc,
+            createActionElement: () => {
+                const input = document.createElement("input");
+                input.className = "b3-switch";
+                input.type = "checkbox";
+                input.checked = panguSpacing.enabled === true;
+                this.panguSpacingEnableEl = input;
                 return input;
             },
         });

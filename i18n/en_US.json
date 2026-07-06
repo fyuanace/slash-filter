@@ -19,5 +19,7 @@
   "imageScaleCenterDesc": "Injects global CSS: .p:has(span.img) { margin-left: auto; margin-right: auto; } without changing block attributes.",
   "autoDpiLabel": "System DPI: ${dpi} (${percent}%).",
   "autoDpiCompensatedLabel": "System DPI: ${dpi} (${percent}%). Siyuan UI zoom ${appZoomPercent}% excluded (devicePixelRatio ${rawPercent}%).",
-  "autoDpiUnavailable": "Cannot read DPI; enable Manual DPI instead."
+  "autoDpiUnavailable": "Cannot read DPI; enable Manual DPI instead.",
+  "panguSpacingEnable": "Auto space between CJK and Latin",
+  "panguSpacingEnableDesc": "Insert a space between Chinese and English/numbers while typing; copy-paste is handled too (including HTML). Skipped during IME composition, code blocks, and title blocks."
 }
