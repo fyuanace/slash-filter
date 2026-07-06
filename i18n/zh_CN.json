@@ -21,5 +21,5 @@
   "autoDpiCompensatedLabel": "当前系统 DPI：${dpi}（${percent}%）。已扣除思源界面缩放 ${appZoomPercent}%（devicePixelRatio ${rawPercent}%）。",
   "autoDpiUnavailable": "无法读取 DPI，可改用手动指定 DPI。",
   "panguSpacingEnable": "中英文自动空格",
-  "panguSpacingEnableDesc": "输入时在中文与英文/数字之间自动插入空格；复制粘贴同样处理（含富文本 HTML）。IME 组词过程中不干预，代码块与标题块不生效。"
+  "panguSpacingEnableDesc": "输入时实时在 DOM 中补空格；复制粘贴统一在渲染前处理 textPlain / textHTML / siyuanHTML。行内代码两侧的空格加在代码标记外侧，不进入代码块。IME 组词、代码块、标题块不干预。"
 }

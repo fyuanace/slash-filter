@@ -21,5 +21,5 @@
   "autoDpiCompensatedLabel": "System DPI: ${dpi} (${percent}%). Siyuan UI zoom ${appZoomPercent}% excluded (devicePixelRatio ${rawPercent}%).",
   "autoDpiUnavailable": "Cannot read DPI; enable Manual DPI instead.",
   "panguSpacingEnable": "Auto space between CJK and Latin",
-  "panguSpacingEnableDesc": "Insert a space between Chinese and English/numbers while typing; copy-paste is handled too (including HTML). Skipped during IME composition, code blocks, and title blocks."
+  "panguSpacingEnableDesc": "Real-time spacing in the DOM while typing; paste is normalized via textPlain, textHTML, and siyuanHTML before render. Spaces around inline code stay outside the code mark. Skips IME composition, code blocks, and title blocks."
 }

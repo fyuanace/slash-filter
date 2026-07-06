@@ -76,12 +76,6 @@ function addPanguSpacingToText(text) {
     });
 }
 
-function isInSkippableEditableBlock(node) {
-    return !!node?.closest?.(
-        '[data-type="NodeCodeBlock"], .code-block, .hljs, .protyle-action, .protyle-attr, .protyle-title'
-    );
-}
-
 function isIgnorableSpacingChar(ch) {
     return !ch || ch === ZWSP || ch === "\uFEFF";
 }
@@ -96,52 +90,6 @@ function getEditableTextRoot(node) {
         return blockRoot;
     }
     return anchor.closest?.("[contenteditable=\"true\"]") || null;
-}
-
-function collectMeaningfulCharsBeforeCursor(root, range) {
-    const chars = [];
-    if (!root || !range) {
-        return chars;
-    }
-    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-    while (walker.nextNode()) {
-        const node = walker.currentNode;
-        const text = node.data;
-        for (let i = 0; i < text.length; i++) {
-            let compareResult = 0;
-            try {
-                compareResult = range.comparePoint(node, i);
-            } catch (error) {
-                console.debug("[slash-filter] comparePoint failed", error);
-                return chars;
-            }
-            if (compareResult > 0) {
-                return chars;
-            }
-            if (!isIgnorableSpacingChar(text[i])) {
-                chars.push({ node, offset: i, ch: text[i] });
-            }
-        }
-    }
-    return chars;
-}
-
-function collectMeaningfulCharsInBlock(root) {
-    const chars = [];
-    if (!root) {
-        return chars;
-    }
-    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-    while (walker.nextNode()) {
-        const node = walker.currentNode;
-        const text = node.data;
-        for (let i = 0; i < text.length; i++) {
-            if (!isIgnorableSpacingChar(text[i])) {
-                chars.push({ node, offset: i, ch: text[i] });
-            }
-        }
-    }
-    return chars;
 }
 
 function adjustCursorAfterInsertions(range, toInsert, selection) {
@@ -177,27 +125,259 @@ function adjustCursorAfterInsertions(range, toInsert, selection) {
     selection.addRange(newRange);
 }
 
-function findPanguInsertions(meaningful, lookback = 100) {
-    if (meaningful.length < 2) {
+function isInsideBlockCode(node) {
+    return !!node?.parentElement?.closest?.(
+        '[data-type="NodeCodeBlock"], .code-block, .hljs'
+    );
+}
+
+function getInlineCodeRoot(node) {
+    if (!node?.parentElement || isInsideBlockCode(node)) {
+        return null;
+    }
+    return node.parentElement.closest('[data-type="code"]');
+}
+
+function isInSkippableEditableBlock(node) {
+    return !!node?.closest?.(
+        '[data-type="NodeCodeBlock"], .code-block, .hljs, .protyle-action, .protyle-attr, .protyle-title'
+    );
+}
+
+function lastMeaningfulChar(text) {
+    for (let i = text.length - 1; i >= 0; i--) {
+        if (!isIgnorableSpacingChar(text[i])) {
+            return text[i];
+        }
+    }
+    return "";
+}
+
+function firstMeaningfulChar(text) {
+    for (let i = 0; i < text.length; i++) {
+        if (!isIgnorableSpacingChar(text[i])) {
+            return text[i];
+        }
+    }
+    return "";
+}
+
+function splitMarkdownInlineCode(text) {
+    const segments = [];
+    let i = 0;
+    while (i < text.length) {
+        if (text[i] === "`") {
+            let j = i + 1;
+            while (j < text.length && text[j] !== "`") {
+                j++;
+            }
+            if (j < text.length) {
+                segments.push({ type: "code", text: text.slice(i, j + 1) });
+                i = j + 1;
+                continue;
+            }
+        }
+        let j = i;
+        while (j < text.length && text[j] !== "`") {
+            j++;
+        }
+        segments.push({ type: "plain", text: text.slice(i, j) });
+        i = j;
+    }
+    return segments;
+}
+
+function addPanguSpacingToMarkdownAware(text) {
+    if (!text) {
+        return text;
+    }
+    const segments = splitMarkdownInlineCode(text);
+    if (segments.length === 1 && segments[0].type === "plain") {
+        return addPanguSpacingToText(segments[0].text);
+    }
+    const processed = segments.map((seg) => (
+        seg.type === "code" ? seg.text : addPanguSpacingToText(seg.text)
+    ));
+    let result = "";
+    for (let i = 0; i < processed.length; i++) {
+        if (i > 0) {
+            const leftCh = lastMeaningfulChar(result);
+            const seg = segments[i];
+            const rightCh = seg.type === "code"
+                ? firstMeaningfulChar(seg.text.slice(1, -1))
+                : firstMeaningfulChar(processed[i]);
+            if (needsPanguSpaceBetween(leftCh, rightCh)) {
+                result += " ";
+            }
+        }
+        result += processed[i];
+    }
+    return result;
+}
+
+function collectMeaningfulCharsInRoot(root, range = null) {
+    const chars = [];
+    if (!root) {
+        return chars;
+    }
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    while (walker.nextNode()) {
+        const node = walker.currentNode;
+        if (isInsideBlockCode(node)) {
+            continue;
+        }
+        const codeRoot = getInlineCodeRoot(node);
+        const text = node.data;
+        for (let i = 0; i < text.length; i++) {
+            if (range) {
+                let compareResult = 0;
+                try {
+                    compareResult = range.comparePoint(node, i);
+                } catch (error) {
+                    console.debug("[slash-filter] comparePoint failed", error);
+                    return chars;
+                }
+                if (compareResult > 0) {
+                    return chars;
+                }
+            }
+            if (!isIgnorableSpacingChar(text[i])) {
+                chars.push({ node, offset: i, ch: text[i], codeRoot });
+            }
+        }
+    }
+    return chars;
+}
+
+function isLastCharInInlineCode(chars, index) {
+    const entry = chars[index];
+    if (!entry.codeRoot) {
+        return false;
+    }
+    for (let j = index + 1; j < chars.length; j++) {
+        if (chars[j].codeRoot === entry.codeRoot) {
+            return false;
+        }
+        return true;
+    }
+    return true;
+}
+
+function isFirstCharInInlineCode(chars, index) {
+    const entry = chars[index];
+    if (!entry.codeRoot) {
+        return false;
+    }
+    for (let j = index - 1; j >= 0; j--) {
+        if (chars[j].codeRoot === entry.codeRoot) {
+            return false;
+        }
+        return true;
+    }
+    return true;
+}
+
+function findPanguInsertionActions(chars, lookback = 100) {
+    if (chars.length < 2) {
         return [];
     }
-    const scanStart = Math.max(0, meaningful.length - 1 - lookback);
-    const toInsert = [];
-    const seen = new Set();
-    for (let i = scanStart; i < meaningful.length - 1; i++) {
-        const left = meaningful[i];
-        const right = meaningful[i + 1];
+    const scanStart = Math.max(0, chars.length - 1 - lookback);
+    const actions = [];
+    const seenText = new Set();
+    const seenBefore = new Set();
+    const seenAfter = new Set();
+
+    for (let i = scanStart; i < chars.length - 1; i++) {
+        const left = chars[i];
+        const right = chars[i + 1];
         if (!needsPanguSpaceBetween(left.ch, right.ch)) {
             continue;
         }
-        const key = `${right.node}${right.offset}`;
-        if (seen.has(key)) {
+
+        if (!left.codeRoot && right.codeRoot && isFirstCharInInlineCode(chars, i + 1)) {
+            const key = right.codeRoot;
+            if (!seenBefore.has(key)) {
+                seenBefore.add(key);
+                actions.push({ type: "beforeElement", element: right.codeRoot });
+            }
             continue;
         }
-        seen.add(key);
-        toInsert.push({ node: right.node, offset: right.offset });
+
+        if (left.codeRoot && !right.codeRoot && isLastCharInInlineCode(chars, i)) {
+            const key = left.codeRoot;
+            if (!seenAfter.has(key)) {
+                seenAfter.add(key);
+                actions.push({ type: "afterElement", element: left.codeRoot });
+            }
+            continue;
+        }
+
+        if (left.codeRoot && right.codeRoot && left.codeRoot !== right.codeRoot) {
+            if (!seenAfter.has(left.codeRoot)) {
+                seenAfter.add(left.codeRoot);
+                actions.push({ type: "afterElement", element: left.codeRoot });
+            }
+            continue;
+        }
+
+        if (left.codeRoot && right.codeRoot) {
+            continue;
+        }
+
+        const key = `${right.node}${right.offset}`;
+        if (!seenText.has(key)) {
+            seenText.add(key);
+            actions.push({ type: "text", node: right.node, offset: right.offset });
+        }
     }
-    return toInsert;
+    return actions;
+}
+
+function elementHasAdjacentSpace(el, side) {
+    const sibling = side === "before" ? el.previousSibling : el.nextSibling;
+    if (!sibling) {
+        return false;
+    }
+    if (sibling.nodeType === Node.TEXT_NODE) {
+        const text = sibling.data;
+        return side === "before" ? /\s$/.test(text) : /^\s/.test(text);
+    }
+    return false;
+}
+
+function applyPanguInsertionActions(actions, range, selection) {
+    if (!actions.length) {
+        return false;
+    }
+    const textActions = actions.filter((a) => a.type === "text");
+    for (let i = textActions.length - 1; i >= 0; i--) {
+        textActions[i].node.insertData(textActions[i].offset, " ");
+    }
+    actions.filter((a) => a.type === "beforeElement").forEach((a) => {
+        if (!a.element?.parentNode || elementHasAdjacentSpace(a.element, "before")) {
+            return;
+        }
+        a.element.parentNode.insertBefore(document.createTextNode(" "), a.element);
+    });
+    actions.filter((a) => a.type === "afterElement").forEach((a) => {
+        if (!a.element?.parentNode || elementHasAdjacentSpace(a.element, "after")) {
+            return;
+        }
+        a.element.parentNode.insertBefore(document.createTextNode(" "), a.element.nextSibling);
+    });
+    if (range && selection) {
+        adjustCursorAfterInsertions(range, textActions, selection);
+    }
+    return true;
+}
+
+function processPanguSpacingInRoot(root) {
+    if (!root) {
+        return;
+    }
+    const chars = collectMeaningfulCharsInRoot(root);
+    const actions = findPanguInsertionActions(chars, chars.length);
+    applyPanguInsertionActions(actions, null, null);
 }
 
 function addPanguSpacingToHtml(html) {
@@ -207,19 +387,11 @@ function addPanguSpacingToHtml(html) {
     const template = document.createElement("template");
     template.innerHTML = html;
     const container = template.content;
-    const chars = [];
-    const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
-    while (walker.nextNode()) {
-        const node = walker.currentNode;
-        for (let i = 0; i < node.data.length; i++) {
-            if (!isIgnorableSpacingChar(node.data[i])) {
-                chars.push({ node, offset: i, ch: node.data[i] });
-            }
-        }
-    }
-    const toInsert = findPanguInsertions(chars, chars.length);
-    for (let i = toInsert.length - 1; i >= 0; i--) {
-        toInsert[i].node.insertData(toInsert[i].offset, " ");
+    const blockRoots = container.querySelectorAll('[data-node-id] div[contenteditable="true"]');
+    if (blockRoots.length > 0) {
+        blockRoots.forEach((root) => processPanguSpacingInRoot(root));
+    } else {
+        processPanguSpacingInRoot(container);
     }
     if (container.childNodes.length === 1 && container.firstElementChild) {
         return container.firstElementChild.innerHTML;
@@ -237,8 +409,11 @@ function addPanguSpacingToHtml(html) {
 
 function buildPanguPastePayload(detail) {
     const payload = {};
+    if (typeof detail.siyuanHTML === "string" && detail.siyuanHTML !== "") {
+        payload.siyuanHTML = addPanguSpacingToHtml(detail.siyuanHTML);
+    }
     if (typeof detail.textPlain === "string" && detail.textPlain !== "") {
-        payload.textPlain = addPanguSpacingToText(detail.textPlain);
+        payload.textPlain = addPanguSpacingToMarkdownAware(detail.textPlain);
     }
     if (typeof detail.textHTML === "string" && detail.textHTML !== "") {
         payload.textHTML = addPanguSpacingToHtml(detail.textHTML);
@@ -261,18 +436,28 @@ function applyPanguSpacingScan(state, scanMode = "beforeCursor") {
         return false;
     }
     const meaningful = scanMode === "fullBlock"
-        ? collectMeaningfulCharsInBlock(root)
-        : collectMeaningfulCharsBeforeCursor(root, range);
-    const toInsert = findPanguInsertions(meaningful);
-    if (toInsert.length === 0) {
+        ? collectMeaningfulCharsInRoot(root)
+        : collectMeaningfulCharsInRoot(root, range);
+    const lookback = scanMode === "fullBlock" ? meaningful.length : 100;
+    const actions = findPanguInsertionActions(meaningful, lookback);
+    if (!actions.length) {
         return false;
     }
     state.suppressInput = true;
-    for (let i = toInsert.length - 1; i >= 0; i--) {
-        toInsert[i].node.insertData(toInsert[i].offset, " ");
+    return applyPanguInsertionActions(actions, range, selection);
+}
+
+function applyPanguSpacingToProtyle(protyle) {
+    const wysiwyg = protyle?.wysiwyg?.element;
+    if (!wysiwyg) {
+        return;
     }
-    adjustCursorAfterInsertions(range, toInsert, selection);
-    return true;
+    wysiwyg.querySelectorAll('[data-node-id] div[contenteditable="true"]').forEach((root) => {
+        if (isInSkippableEditableBlock(root)) {
+            return;
+        }
+        processPanguSpacingInRoot(root);
+    });
 }
 
 function clearPanguSpacingTimers(state) {
@@ -416,10 +601,11 @@ function schedulePanguSpacingAfterPaste(plugin, protyle) {
         return;
     }
     watchPanguSpacing(plugin, protyle);
-    const entry = plugin.panguSpacingWatchers.get(protyle.wysiwyg.element);
-    if (entry?.state) {
-        schedulePanguSpacingCheck(entry.state, { imeSettle: true });
-    }
+    [0, 80, 200, 400].forEach((delay) => {
+        window.setTimeout(() => {
+            applyPanguSpacingToProtyle(protyle);
+        }, delay);
+    });
 }
 
 function tryGetSiyuanAppZoom() {
