@@ -1,5 +1,5 @@
 {
-  "name": "slash-filter",
+  "name": "fhelper",
   "author": "fyuan",
   "version": "1.5.1",
   "minAppVersion": "3.1.27",
@@ -7,13 +7,13 @@
   "frontends": ["all"],
   "main": "index.js",
   "displayName": {
-    "default": "Slash Menu Filter",
-    "zh_CN": "斜杠菜单过滤"
+    "default": "fhelper",
+    "zh_CN": "fhelper"
   },
   "description": {
-    "default": "Toggle each / slash menu item on or off in plugin settings",
-    "zh_CN": "在插件设置中逐项开关斜杠 / 菜单选项，关闭后输入 / 不再显示"
+    "default": "Slash menu filter, image DPI scale, and CJK-Latin auto spacing",
+    "zh_CN": "斜杠菜单过滤、图片 DPI 缩放、中英文自动空格"
   },
-  "keywords": ["slash", "filter", "heading", "斜杠", "过滤", "设置"],
+  "keywords": ["fhelper", "slash", "filter", "pangu", "斜杠", "过滤", "空格"],
   "i18n": ["zh_CN", "en_US"]
 }

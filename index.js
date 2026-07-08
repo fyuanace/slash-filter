@@ -1,11 +1,12 @@
 const { Plugin, Setting, getAllEditor, showMessage } = require("siyuan");
 
-const STORAGE_NAME = "slash-filter-config.json";
-const LEGACY_STORAGE_NAME = "slash-filter-config";
+const STORAGE_NAME = "fhelper-config.json";
+const LEGACY_STORAGE_NAMES = ["slash-filter-config.json", "slash-filter-config"];
 const ZWSP = "\u200b";
 const SCREEN_DPI = 96;
 const SIYUAN_LOCAL_ZOOM_KEY = "local-zoom";
-const IMAGE_CENTER_STYLE_ID = "slash-filter-img-center-css";
+const IMAGE_CENTER_STYLE_ID = "fhelper-img-center-css";
+const LOG_PREFIX = "[fhelper]";
 const IMAGE_CENTER_CSS = `.p:has(span.img) {
     margin-left: auto;
     margin-right: auto;
@@ -272,7 +273,7 @@ function collectMeaningfulCharsBeforeCursor(root, range, maxLookback) {
         try {
             walker.currentNode = node;
         } catch (error) {
-            console.debug("[slash-filter] walker anchor failed", error);
+            console.debug("[fhelper] walker anchor failed", error);
         }
     }
     let prev = node.nodeType === Node.TEXT_NODE ? walker.previousNode() : walker.previousNode();
@@ -321,7 +322,7 @@ function collectMeaningfulCharsAfterCursor(root, range, maxLookahead) {
         try {
             walker.currentNode = node;
         } catch (error) {
-            console.debug("[slash-filter] walker anchor failed", error);
+            console.debug("[fhelper] walker anchor failed", error);
         }
     }
     let next = walker.nextNode();
@@ -836,7 +837,7 @@ function tryGetSiyuanAppZoom() {
             }
         }
     } catch (error) {
-        console.debug("[slash-filter] webFrame zoom unavailable", error);
+        console.debug("[fhelper] webFrame zoom unavailable", error);
     }
     return 1;
 }
@@ -1434,7 +1435,7 @@ function isItemEnabled(item, config) {
     return config?.disabled?.[key] !== true;
 }
 
-let activeSlashFilterPlugin = null;
+let activeFhelperPlugin = null;
 let originalHintGenHTML = null;
 let originalHintRender = null;
 
@@ -1478,7 +1479,7 @@ function cleanupHintSeparatorDOM(element) {
 }
 
 function installSlashHintHook(plugin) {
-    activeSlashFilterPlugin = plugin;
+    activeFhelperPlugin = plugin;
     const hint = getAllEditor()[0]?.protyle?.hint;
     if (!hint) {
         return false;
@@ -1490,8 +1491,8 @@ function installSlashHintHook(plugin) {
 
     if (!originalHintGenHTML) {
         originalHintGenHTML = proto.genHTML;
-        proto.genHTML = function slashFilterGenHTML(data, protyleArg, hide, source) {
-            const currentPlugin = activeSlashFilterPlugin;
+        proto.genHTML = function fhelperGenHTML(data, protyleArg, hide, source) {
+            const currentPlugin = activeFhelperPlugin;
             const slashMenu = source === "hint" && isSlashHintInstance(this) && Array.isArray(data);
             if (slashMenu && currentPlugin) {
                 data.forEach((item) => currentPlugin.registerSlashItemFromMenu(item));
@@ -1506,9 +1507,9 @@ function installSlashHintHook(plugin) {
 
     if (!originalHintRender && proto.render) {
         originalHintRender = proto.render;
-        proto.render = function slashFilterRender(protyle) {
+        proto.render = function fhelperRender(protyle) {
             originalHintRender.call(this, protyle);
-            if (!activeSlashFilterPlugin || !isSlashHintInstance(this) || !this.element) {
+            if (!activeFhelperPlugin || !isSlashHintInstance(this) || !this.element) {
                 return;
             }
             if (this.element.classList.contains("fn__none")) {
@@ -1521,7 +1522,7 @@ function installSlashHintHook(plugin) {
 }
 
 function uninstallSlashHintHook() {
-    activeSlashFilterPlugin = null;
+    activeFhelperPlugin = null;
 }
 
 function scheduleSlashHintHook(plugin) {
@@ -1536,7 +1537,7 @@ function patchAllEditors(plugin) {
     syncPanguSpacingWatchers(plugin);
 }
 
-module.exports = class SlashFilterPlugin extends Plugin {
+module.exports = class FhelperPlugin extends Plugin {
     slashHandler = null;
     pasteHandler = null;
     pastePanguHandler = null;
@@ -1561,7 +1562,7 @@ module.exports = class SlashFilterPlugin extends Plugin {
         this.initSettingPanel();
 
         this.addCommand({
-            langKey: "openSlashFilterSetting",
+            langKey: "openFhelperSetting",
             hotkey: "",
             callback: () => {
                 this.openSetting();
@@ -1665,10 +1666,12 @@ module.exports = class SlashFilterPlugin extends Plugin {
 
     uninstall() {
         this.removeData(STORAGE_NAME).catch((error) => {
-            console.warn("[slash-filter] removeData failed", error);
+            console.warn(`${LOG_PREFIX} removeData failed`, error);
         });
-        this.removeData(LEGACY_STORAGE_NAME).catch((error) => {
-            console.warn("[slash-filter] remove legacy data failed", error);
+        LEGACY_STORAGE_NAMES.forEach((legacyName) => {
+            this.removeData(legacyName).catch((error) => {
+                console.warn(`${LOG_PREFIX} remove legacy data failed`, error);
+            });
         });
     }
 
@@ -1735,20 +1738,30 @@ module.exports = class SlashFilterPlugin extends Plugin {
                 this.applyConfig(data);
                 return;
             }
-            return this.loadData(LEGACY_STORAGE_NAME).then((legacyData) => {
-                if (legacyData && typeof legacyData === "object") {
-                    this.applyConfig(legacyData);
-                    if (Object.keys(legacyData.disabled || {}).length > 0) {
-                        return this.saveData(STORAGE_NAME, legacyData).then(() => {
-                            return this.removeData(LEGACY_STORAGE_NAME);
-                        });
-                    }
-                    return;
+            const tryLegacy = (index = 0) => {
+                if (index >= LEGACY_STORAGE_NAMES.length) {
+                    this.applyConfig(data);
+                    return Promise.resolve();
                 }
-                this.applyConfig(data);
-            });
+                return this.loadData(LEGACY_STORAGE_NAMES[index]).then((legacyData) => {
+                    if (legacyData && typeof legacyData === "object") {
+                        this.applyConfig(legacyData);
+                        const shouldMigrate = Object.keys(legacyData.disabled || {}).length > 0
+                            || legacyData.imageScale
+                            || legacyData.panguSpacing;
+                        if (shouldMigrate) {
+                            return this.saveData(STORAGE_NAME, this.config).then(() => {
+                                return this.removeData(LEGACY_STORAGE_NAMES[index]);
+                            });
+                        }
+                        return;
+                    }
+                    return tryLegacy(index + 1);
+                });
+            };
+            return tryLegacy();
         }).catch((error) => {
-            console.warn("[slash-filter] loadData failed", error);
+            console.warn(`${LOG_PREFIX} loadData failed`, error);
         });
     }
 
@@ -1785,7 +1798,7 @@ module.exports = class SlashFilterPlugin extends Plugin {
             width: "768px",
             confirmCallback: () => {
                 this.saveConfig().catch((error) => {
-                    console.warn("[slash-filter] saveData failed", error);
+                    console.warn("[fhelper] saveData failed", error);
                     showMessage(this.i18n.saveFailed);
                 });
             },
@@ -1815,7 +1828,7 @@ module.exports = class SlashFilterPlugin extends Plugin {
                 }
                 card.querySelector('[data-type="setting"]')?.classList.remove("fn__none");
             } catch (error) {
-                console.warn("[slash-filter] ensureBazaarSettingButton failed", error);
+                console.warn("[fhelper] ensureBazaarSettingButton failed", error);
             }
         });
     }

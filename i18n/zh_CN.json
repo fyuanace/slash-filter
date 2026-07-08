@@ -1,7 +1,7 @@
 {
   "configPathLabel": "配置文件路径",
-  "topBarTitle": "斜杠菜单过滤设置",
-  "openSlashFilterSetting": "打开斜杠菜单过滤设置",
+  "topBarTitle": "fhelper 设置",
+  "openFhelperSetting": "打开 fhelper 设置",
   "settingHint": "关闭某一项后，输入 / 时将不再显示该选项。保存后立即生效。",
   "settingEmpty": "未找到斜杠菜单项，请先在编辑器中打开文档。",
   "groupBuiltin": "内置",

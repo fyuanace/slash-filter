@@ -1,7 +1,7 @@
 {
   "configPathLabel": "Config file path",
-  "topBarTitle": "Slash Menu Filter Settings",
-  "openSlashFilterSetting": "Open Slash Menu Filter Settings",
+  "topBarTitle": "fhelper Settings",
+  "openFhelperSetting": "Open fhelper Settings",
   "settingHint": "Disabled items will not appear when you type /. Changes apply after saving.",
   "settingEmpty": "No slash menu items found. Open a document in the editor first.",
   "groupBuiltin": "Built-in",
