@@ -1032,11 +1032,11 @@ function handleProtyleDocRefDynamicLoad(plugin, event) {
 }
 
 function handleProtyleDocRefSwitch(plugin, event) {
-    if (!plugin.config.docRefStyle?.enabled) {
-        return;
-    }
     const protyle = getProtyleFromEvent(event);
-    if (!protyle?.wysiwyg?.element) {
+    if (protyle) {
+        ensureChildDocIndexBreadcrumbButton(plugin, protyle);
+    }
+    if (!plugin.config.docRefStyle?.enabled || !protyle?.wysiwyg?.element) {
         return;
     }
     const rootId = getProtyleRootId(protyle);
@@ -1056,6 +1056,642 @@ function handleProtyleDocRefDestroy(plugin, event) {
         unwatchDocRefMutations(plugin, wysiwyg);
     }
     clearDocRefCacheForDoc(plugin, getProtyleRootId(protyle));
+}
+
+const CHILD_DOC_INDEX_DEFAULT_CONCURRENCY = 3;
+const LIST_DOCS_SORT_UNASSIGNED = 256;
+
+// const notebookSortModeCache = new Map();
+
+function createDefaultChildDocIndexConfig() {
+    return {
+        sortBy: "tree",
+        scope: "all",
+        notebookIds: [],
+        selectedNotebookId: "",
+        batchConcurrency: CHILD_DOC_INDEX_DEFAULT_CONCURRENCY,
+    };
+}
+
+function unwrapProtyle(protyle) {
+    if (!protyle) {
+        return null;
+    }
+    if (protyle.block || protyle.wysiwyg) {
+        return protyle;
+    }
+    if (protyle.protyle?.block || protyle.protyle?.wysiwyg) {
+        return protyle.protyle;
+    }
+    return protyle;
+}
+
+function getProtyleDocId(protyle) {
+    const p = unwrapProtyle(protyle);
+    if (!p) {
+        return null;
+    }
+    // Document ID must be rootID. Never fall back to the focused block id —
+    // that is often a paragraph/heading and listDocsByPath would look under the wrong path.
+    const fromTitle = p.title?.element?.getAttribute?.("data-node-id")
+        || p.element?.querySelector?.(".protyle-title")?.getAttribute?.("data-node-id");
+    return p.block?.rootID
+        || fromTitle
+        || p.options?.rootId
+        || null;
+}
+
+function findProtyleByElement(el) {
+    if (!el) {
+        return null;
+    }
+    const breadcrumbRoot = el.closest?.(".protyle-breadcrumb");
+    if (breadcrumbRoot) {
+        const protyleHost = breadcrumbRoot.closest(".protyle");
+        if (protyleHost) {
+            for (const { protyle } of getAllEditor()) {
+                const p = unwrapProtyle(protyle);
+                if (!p?.element) {
+                    continue;
+                }
+                if (p.element === protyleHost || p.element.contains(protyleHost)) {
+                    return p;
+                }
+            }
+        }
+    }
+    const host = el.closest?.(".protyle");
+    if (!host) {
+        return null;
+    }
+    for (const { protyle } of getAllEditor()) {
+        const p = unwrapProtyle(protyle);
+        if (!p?.element) {
+            continue;
+        }
+        if (p.element === host || p.element.contains(el)) {
+            return p;
+        }
+    }
+    return null;
+}
+
+function resolveProtyleDocId(editor) {
+    const p = unwrapProtyle(editor);
+    if (!p) {
+        return null;
+    }
+    let docId = getProtyleDocId(p);
+    if (docId) {
+        return { editor: p, docId };
+    }
+    const titleEl = p.element?.querySelector?.(".protyle-title[data-node-id]");
+    const titleId = titleEl?.getAttribute?.("data-node-id");
+    if (titleId) {
+        return { editor: p, docId: titleId };
+    }
+    return { editor: p, docId: null };
+}
+
+function escapeKramdownSingleQuoted(text) {
+    return String(text ?? "").replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+}
+
+function buildChildDocRefMarkdown(childId, title) {
+    const label = escapeKramdownSingleQuoted((title || "").trim() || childId);
+    return `((${childId} '${label}'))`;
+}
+
+async function runSqlQuery(stmt) {
+    const response = await fetchSyncPost("/api/query/sql", { stmt });
+    return parseSqlQueryRows(response);
+}
+
+function stripDocFileName(name) {
+    const text = String(name || "").trim();
+    return text.replace(/\.sy$/i, "");
+}
+
+function toListDocsFolderPath(storagePath) {
+    let path = String(storagePath || "").trim();
+    if (!path) {
+        return "/";
+    }
+    if (!path.startsWith("/")) {
+        path = `/${path}`;
+    }
+    if (path.toLowerCase().endsWith(".sy")) {
+        path = path.slice(0, -3);
+    }
+    return path || "/";
+}
+
+/*
+function getGlobalFileTreeSortMode() {
+    const raw = window.siyuan?.config?.fileTree?.sort;
+    const parsed = Number(raw);
+    return Number.isFinite(parsed) ? parsed : LIST_DOCS_SORT_UNASSIGNED;
+}
+
+async function fetchNotebookSortMode(notebookId) {
+    if (!notebookId) {
+        return null;
+    }
+    if (notebookSortModeCache.has(notebookId)) {
+        return notebookSortModeCache.get(notebookId);
+    }
+    let mode = null;
+    try {
+        const response = await fetchSyncPost("/api/notebook/getNotebookConf", { notebook: notebookId });
+        const parsed = Number(response?.data?.conf?.sortMode);
+        mode = Number.isFinite(parsed) ? parsed : null;
+    } catch (error) {
+        console.warn(`${LOG_PREFIX} fetchNotebookSortMode failed`, notebookId, error);
+    }
+    notebookSortModeCache.set(notebookId, mode);
+    return mode;
+}
+
+function formatSortModeLabel(mode) {
+    const labels = {
+        0: "名称字母升序",
+        1: "名称字母降序",
+        2: "更新时间升序",
+        3: "更新时间降序",
+        4: "名称自然升序",
+        5: "名称自然降序",
+        6: "自定义排序",
+        7: "引用数升序",
+        8: "引用数降序",
+        9: "创建时间升序",
+        10: "创建时间降序",
+        11: "文件大小升序",
+        12: "文件大小降序",
+        13: "子文档数升序",
+        14: "子文档数降序",
+        15: "使用文档树排序规则",
+        256: "未指定",
+    };
+    if (mode === null || mode === undefined || Number.isNaN(Number(mode))) {
+        return "unknown";
+    }
+    const key = Number(mode);
+    return labels[key] !== undefined ? `${labels[key]} (${key})` : String(key);
+}
+
+function formatChildDocLogList(children) {
+    return (children || []).map((child) => ({
+        id: child.id,
+        title: child.content || child.id,
+    }));
+}
+
+function logChildDocIndexBuild(parentId, context) {
+    console.log(`${LOG_PREFIX} childDocIndex build`, {
+        parentId,
+        globalSort: formatSortModeLabel(context.globalSort),
+        notebookSort: formatSortModeLabel(context.notebookSortMode),
+        apiChildOrder: context.apiChildOrder,
+        createOrder: context.createOrder,
+        skipped: context.skipped,
+    });
+}
+*/
+
+function mapRawFilesToChildren(rawFiles, notebook) {
+    return (rawFiles || [])
+        .map((file) => mapListDocsFileToChild(file, notebook))
+        .filter(Boolean);
+}
+
+async function getDocPathById(docId) {
+    if (!docId) {
+        return null;
+    }
+    try {
+        const response = await fetchSyncPost("/api/filetree/getPathByID", { id: docId });
+        const data = response?.data ?? response;
+        const notebook = data?.notebook || data?.box;
+        const path = data?.path;
+        if (!notebook || !path) {
+            return null;
+        }
+        return { notebook, path };
+    } catch (error) {
+        console.warn(`${LOG_PREFIX} getPathByID failed`, docId, error);
+        return null;
+    }
+}
+
+function mapListDocsFileToChild(file, notebook) {
+    if (!file?.id) {
+        return null;
+    }
+    const title = stripDocFileName(file.name1 || file.name || file.id);
+    const subFileCount = typeof file.subFileCount === "number" ? file.subFileCount : null;
+    return {
+        id: file.id,
+        content: title,
+        hpath: file.path || "",
+        path: file.path || "",
+        created: String(file.ctime || file.hCtime || ""),
+        box: notebook || "",
+        subFileCount,
+        sort: typeof file.sort === "number" ? file.sort : 0,
+    };
+}
+
+async function fetchDocsByPathRaw(notebook, path, options = {}) {
+    if (!notebook) {
+        return [];
+    }
+    const payload = {
+        notebook,
+        path: path || "/",
+        sort: typeof options.sort === "number" ? options.sort : LIST_DOCS_SORT_UNASSIGNED,
+        maxListCount: typeof options.maxListCount === "number" ? options.maxListCount : 0,
+    };
+    const response = await fetchSyncPost("/api/filetree/listDocsByPath", payload);
+    if (response && typeof response.code === "number" && response.code !== 0) {
+        throw new Error(response.msg || "listDocsByPath failed");
+    }
+    return response?.data?.files || response?.files || [];
+}
+
+async function listDocsByPath(notebook, path, options = {}) {
+    const rawFiles = await fetchDocsByPathRaw(notebook, path, options);
+    return (rawFiles || [])
+        .map((file) => mapListDocsFileToChild(file, notebook))
+        .filter(Boolean);
+}
+
+async function queryDirectChildDocs(parentId, config) {
+    if (!parentId) {
+        return { children: [], notebookId: null };
+    }
+    const pathInfo = await getDocPathById(parentId);
+    if (!pathInfo) {
+        console.warn(`${LOG_PREFIX} queryDirectChildDocs: path not found`, parentId);
+        return { children: [], notebookId: null };
+    }
+    const folderPath = toListDocsFolderPath(pathInfo.path);
+    try {
+        const rawFiles = await fetchDocsByPathRaw(pathInfo.notebook, folderPath, { sort: LIST_DOCS_SORT_UNASSIGNED });
+        return {
+            children: mapRawFilesToChildren(rawFiles, pathInfo.notebook),
+            notebookId: pathInfo.notebook,
+        };
+    } catch (error) {
+        console.warn(`${LOG_PREFIX} listDocsByPath failed`, parentId, folderPath, error);
+        try {
+            const rawFiles = await fetchDocsByPathRaw(pathInfo.notebook, pathInfo.path, { sort: LIST_DOCS_SORT_UNASSIGNED });
+            return {
+                children: mapRawFilesToChildren(rawFiles, pathInfo.notebook),
+                notebookId: pathInfo.notebook,
+            };
+        } catch (fallbackError) {
+            console.warn(`${LOG_PREFIX} listDocsByPath fallback failed`, parentId, pathInfo.path, fallbackError);
+            return { children: [], notebookId: pathInfo.notebook };
+        }
+    }
+}
+
+async function queryExistingRefTargets(rootId) {
+    const existing = new Set();
+    if (!rootId) {
+        return existing;
+    }
+    try {
+        const stmt = `SELECT DISTINCT def_block_id FROM refs WHERE root_id = '${escapeSqlId(rootId)}'`;
+        const rows = await runSqlQuery(stmt);
+        rows.forEach((row) => {
+            if (row.def_block_id) {
+                existing.add(row.def_block_id);
+            }
+        });
+        if (existing.size > 0) {
+            return existing;
+        }
+    } catch (error) {
+        console.warn(`${LOG_PREFIX} queryExistingRefTargets refs failed`, error);
+    }
+    try {
+        const stmt = `SELECT markdown, content FROM blocks WHERE root_id = '${escapeSqlId(rootId)}' AND markdown LIKE '%block-ref%'`;
+        const rows = await runSqlQuery(stmt);
+        rows.forEach((row) => {
+            const text = `${row.markdown || ""}\n${row.content || ""}`;
+            const re = /data-id="(\d{14}-[0-9a-z]{7})"/g;
+            let match = re.exec(text);
+            while (match) {
+                existing.add(match[1]);
+                match = re.exec(text);
+            }
+            const mdRe = /\(\((\d{14}-[0-9a-z]{7})\s/g;
+            match = mdRe.exec(text);
+            while (match) {
+                existing.add(match[1]);
+                match = mdRe.exec(text);
+            }
+        });
+    } catch (error) {
+        console.warn(`${LOG_PREFIX} queryExistingRefTargets fallback failed`, error);
+    }
+    return existing;
+}
+
+async function appendChildDocRef(parentId, childId, title) {
+    const response = await fetchSyncPost("/api/block/appendBlock", {
+        dataType: "markdown",
+        data: buildChildDocRefMarkdown(childId, title),
+        parentID: parentId,
+    });
+    if (response && typeof response.code === "number" && response.code !== 0) {
+        throw new Error(response.msg || "appendBlock failed");
+    }
+    return response;
+}
+
+async function syncChildDocIndexForDoc(parentId, config, options = {}) {
+    const result = {
+        parentId,
+        added: 0,
+        skipped: 0,
+        failed: 0,
+        noChildren: false,
+    };
+    if (!parentId) {
+        return result;
+    }
+    if (options.cancelled?.()) {
+        result.cancelled = true;
+        return result;
+    }
+    const queryResult = options.prefetchedChildren
+        ? { children: options.prefetchedChildren, notebookId: options.notebookId || options.prefetchedChildren[0]?.box || null }
+        : await queryDirectChildDocs(parentId, config);
+    const children = queryResult.children || [];
+    if (!children.length) {
+        result.noChildren = true;
+        return result;
+    }
+    const existing = await queryExistingRefTargets(parentId);
+    for (const child of children) {
+        if (options.cancelled?.()) {
+            result.cancelled = true;
+            break;
+        }
+        if (existing.has(child.id)) {
+            result.skipped += 1;
+            continue;
+        }
+        try {
+            await appendChildDocRef(parentId, child.id, child.content);
+            existing.add(child.id);
+            result.added += 1;
+        } catch (error) {
+            console.warn(`${LOG_PREFIX} appendChildDocRef failed`, parentId, child.id, error);
+            result.failed += 1;
+        }
+    }
+    return result;
+}
+
+async function resolveNotebookIdsForIndex(config) {
+    if (config?.scope === "selectedNotebooks" && Array.isArray(config.notebookIds) && config.notebookIds.length > 0) {
+        return [...new Set(config.notebookIds.filter(Boolean))];
+    }
+    const notebooks = await listOpenNotebooks();
+    return notebooks.map((item) => item.id).filter(Boolean);
+}
+
+async function collectDirectChildrenByParentInNotebook(notebook, options = {}) {
+    const childrenByParent = new Map();
+    if (!notebook) {
+        return childrenByParent;
+    }
+    const queue = [{ parentId: null, folderPath: "/" }];
+    const visited = new Set();
+    while (queue.length > 0) {
+        if (options.cancelled?.()) {
+            break;
+        }
+        const { parentId, folderPath } = queue.shift();
+        const key = `${notebook}:${folderPath}`;
+        if (visited.has(key)) {
+            continue;
+        }
+        visited.add(key);
+        let rawFiles = [];
+        try {
+            rawFiles = await fetchDocsByPathRaw(notebook, folderPath, { sort: LIST_DOCS_SORT_UNASSIGNED });
+        } catch (error) {
+            console.warn(`${LOG_PREFIX} collect children failed`, notebook, folderPath, error);
+            continue;
+        }
+        const files = mapRawFilesToChildren(rawFiles, notebook);
+        if (parentId && files.length > 0) {
+            childrenByParent.set(parentId, files);
+        }
+        files.forEach((file) => {
+            // Prefer subFileCount when known; if unknown, still probe one level deeper.
+            if (file.subFileCount === 0) {
+                return;
+            }
+            queue.push({
+                parentId: file.id,
+                folderPath: toListDocsFolderPath(file.path),
+            });
+        });
+    }
+    return childrenByParent;
+}
+
+async function runGlobalChildDocIndex(plugin, callbacks = {}) {
+    const config = callbacks.config
+        || plugin.config.childDocIndex
+        || createDefaultChildDocIndexConfig();
+    const { onProgress, isCancelled } = callbacks;
+    const summary = {
+        parents: 0,
+        added: 0,
+        skipped: 0,
+        failed: 0,
+        cancelled: false,
+    };
+    const notebookIds = await resolveNotebookIdsForIndex(config);
+    const childrenByParent = new Map();
+    for (const notebookId of notebookIds) {
+        if (isCancelled?.()) {
+            summary.cancelled = true;
+            break;
+        }
+        const partial = await collectDirectChildrenByParentInNotebook(notebookId, {
+            config,
+            cancelled: isCancelled,
+        });
+        partial.forEach((children, parentId) => {
+            childrenByParent.set(parentId, children);
+        });
+    }
+    const parentIds = [...childrenByParent.keys()];
+    summary.parents = parentIds.length;
+    for (let index = 0; index < parentIds.length; index += 1) {
+        if (isCancelled?.()) {
+            summary.cancelled = true;
+            break;
+        }
+        const parentId = parentIds[index];
+        const prefetchedChildren = childrenByParent.get(parentId);
+        const result = await syncChildDocIndexForDoc(parentId, config, {
+            prefetchedChildren,
+            notebookId: prefetchedChildren?.[0]?.box || null,
+            cancelled: isCancelled,
+        });
+        summary.added += result.added;
+        summary.skipped += result.skipped;
+        summary.failed += result.failed;
+        if (result.cancelled) {
+            summary.cancelled = true;
+            break;
+        }
+        onProgress?.({
+            current: index + 1,
+            total: parentIds.length,
+            added: summary.added,
+            skipped: summary.skipped,
+            failed: summary.failed,
+        });
+    }
+    return summary;
+}
+
+function formatChildDocIndexMessage(i18n, key, params = {}) {
+    let text = i18n[key] || key;
+    Object.entries(params).forEach(([name, value]) => {
+        text = text.replace(new RegExp(`\\$\\{${name}\\}`, "g"), String(value));
+    });
+    return text;
+}
+
+async function handleChildDocIndexForProtyle(plugin, protyle) {
+    if (plugin.childDocIndexBusy) {
+        return;
+    }
+    plugin.childDocIndexBusy = true;
+    try {
+        const editor = unwrapProtyle(protyle) || findProtyleByElement(protyle?.element);
+        const { editor: resolvedEditor, docId } = resolveProtyleDocId(editor);
+        if (!docId) {
+            console.warn(`${LOG_PREFIX} childDocIndex: cannot resolve doc id`, {
+                hasEditor: !!resolvedEditor,
+                rootID: resolvedEditor?.block?.rootID,
+                blockId: resolvedEditor?.block?.id,
+                titleId: resolvedEditor?.title?.element?.getAttribute?.("data-node-id"),
+            });
+            showMessage(plugin.i18n.childDocIndexNoDoc);
+            return;
+        }
+        const config = plugin.config.childDocIndex || createDefaultChildDocIndexConfig();
+        const result = await syncChildDocIndexForDoc(docId, config);
+        if (result.noChildren) {
+            console.warn(`${LOG_PREFIX} childDocIndex: no children for`, docId);
+            showMessage(plugin.i18n.childDocIndexNoChildren);
+            return;
+        }
+        if (result.added === 0 && result.failed === 0) {
+            showMessage(plugin.i18n.childDocIndexAllExist);
+            return;
+        }
+        if (result.failed > 0) {
+            showMessage(formatChildDocIndexMessage(plugin.i18n, "childDocIndexPartial", {
+                added: result.added,
+                failed: result.failed,
+            }));
+            return;
+        }
+        showMessage(formatChildDocIndexMessage(plugin.i18n, "childDocIndexAdded", { count: result.added }));
+        if (plugin.config.docRefStyle?.enabled && resolvedEditor) {
+            markDocRefDirty(plugin, docId);
+            scheduleRebuildDocRef(plugin, resolvedEditor);
+        }
+    } finally {
+        plugin.childDocIndexBusy = false;
+    }
+}
+
+const CHILD_DOC_INDEX_BREADCRUMB_TYPE = "fhelper-child-doc-index";
+
+async function listOpenNotebooks() {
+    try {
+        const response = await fetchSyncPost("/api/notebook/lsNotebooks", {});
+        const notebooks = response?.data?.notebooks || response?.notebooks || [];
+        return (notebooks || []).filter((item) => item && !item.closed);
+    } catch (error) {
+        console.warn(`${LOG_PREFIX} listOpenNotebooks failed`, error);
+        return [];
+    }
+}
+
+function getBreadcrumbRoot(protyle) {
+    const p = unwrapProtyle(protyle);
+    const bar = p?.breadcrumb?.element;
+    // In SiYuan, breadcrumb.element is the __bar; its parent is .protyle-breadcrumb.
+    let root = bar?.parentElement;
+    if (root?.classList?.contains("protyle-breadcrumb")) {
+        return root;
+    }
+    root = p?.element?.querySelector?.(".protyle-breadcrumb");
+    return root || null;
+}
+
+function onChildDocIndexBreadcrumbClick(plugin, event) {
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+    const btn = event.currentTarget;
+    const editor = findProtyleByElement(btn);
+    handleChildDocIndexForProtyle(plugin, editor).catch((error) => {
+        console.warn(`${LOG_PREFIX} handleChildDocIndexForProtyle failed`, error);
+        showMessage(plugin.i18n.childDocIndexFailed);
+    });
+}
+
+function bindChildDocIndexBreadcrumbButton(plugin, btn) {
+    const handler = (event) => onChildDocIndexBreadcrumbClick(plugin, event);
+    const fresh = btn.cloneNode(true);
+    btn.replaceWith(fresh);
+    fresh.setAttribute("aria-label", plugin.i18n.childDocIndexBreadcrumbTip);
+    fresh.title = plugin.i18n.childDocIndexBreadcrumbTip;
+    fresh.addEventListener("click", handler, true);
+    return fresh;
+}
+
+function ensureChildDocIndexBreadcrumbButton(plugin, protyle) {
+    const root = getBreadcrumbRoot(protyle);
+    if (!root) {
+        return;
+    }
+    let btn = root.querySelector(`[data-type="${CHILD_DOC_INDEX_BREADCRUMB_TYPE}"]`);
+    if (!btn) {
+        btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "block__icon fn__flex-center ariaLabel";
+        btn.setAttribute("data-type", CHILD_DOC_INDEX_BREADCRUMB_TYPE);
+        btn.innerHTML = '<svg><use xlink:href="#iconList"></use></svg>';
+        const lockBtn = root.querySelector('[data-type="readonly"]');
+        if (lockBtn) {
+            root.insertBefore(btn, lockBtn);
+        } else {
+            root.appendChild(btn);
+        }
+    }
+    bindChildDocIndexBreadcrumbButton(plugin, btn);
+}
+
+function patchChildDocIndexBreadcrumbButtons(plugin) {
+    getAllEditor().forEach(({ protyle }) => {
+        ensureChildDocIndexBreadcrumbButton(plugin, protyle);
+    });
 }
 
 function syncDocRefStyleFeature(plugin) {
@@ -2454,6 +3090,7 @@ function createDefaultConfig() {
         imageScale: createDefaultImageScaleConfig(),
         panguSpacing: createDefaultPanguSpacingConfig(),
         docRefStyle: createDefaultDocRefStyleConfig(),
+        childDocIndex: createDefaultChildDocIndexConfig(),
     };
 }
 
@@ -2565,6 +3202,7 @@ function patchAllEditors(plugin) {
     scheduleSlashHintHook(plugin);
     watchAllEditorLayouts(plugin);
     syncPanguSpacingWatchers(plugin);
+    patchChildDocIndexBreadcrumbButtons(plugin);
     if (plugin.config.docRefStyle?.enabled) {
         watchAllDocRefEditors(plugin);
         decorateAllOpenEditors(plugin).catch((error) => {
@@ -2608,6 +3246,28 @@ module.exports = class FhelperPlugin extends Plugin {
     docRefWsPending = null;
     layoutRefreshTimer = null;
     windowResizeHandler = null;
+    childDocIndexProgressDialog = null;
+    childDocIndexCancelFlag = null;
+    childDocIndexNotebookSelectEl = null;
+    childDocIndexBusy = false;
+
+    updateProtyleToolbar(toolbar) {
+        toolbar.push("|");
+        toolbar.push({
+            name: "fhelper-child-doc-index",
+            icon: "iconList",
+            hotkey: "",
+            tipPosition: "n",
+            tip: this.i18n.childDocIndexToolbarTip,
+            click: (protyle) => {
+                handleChildDocIndexForProtyle(this, protyle).catch((error) => {
+                    console.warn(`${LOG_PREFIX} handleChildDocIndexForProtyle failed`, error);
+                    showMessage(this.i18n.childDocIndexFailed);
+                });
+            },
+        });
+        return toolbar;
+    }
 
     onload() {
         this.data[STORAGE_NAME] = createDefaultConfig();
@@ -2617,6 +3277,17 @@ module.exports = class FhelperPlugin extends Plugin {
             hotkey: "",
             callback: () => {
                 this.openSetting();
+            },
+        });
+
+        this.addCommand({
+            langKey: "childDocIndexCurrentDoc",
+            hotkey: "",
+            editorCallback: (protyle) => {
+                handleChildDocIndexForProtyle(this, protyle).catch((error) => {
+                    console.warn(`${LOG_PREFIX} handleChildDocIndexForProtyle failed`, error);
+                    showMessage(this.i18n.childDocIndexFailed);
+                });
             },
         });
 
@@ -2705,6 +3376,9 @@ module.exports = class FhelperPlugin extends Plugin {
 
     onunload() {
         uninstallSlashHintHook();
+        this.childDocIndexProgressDialog?.destroy();
+        this.childDocIndexProgressDialog = null;
+        this.childDocIndexCancelFlag = null;
         if (this.bazaarObserver) {
             this.bazaarObserver.disconnect();
             this.bazaarObserver = null;
@@ -2811,6 +3485,11 @@ module.exports = class FhelperPlugin extends Plugin {
                     ...createDefaultDocRefStyleConfig(),
                     ...(data.docRefStyle || {}),
                 },
+                childDocIndex: {
+                    ...createDefaultChildDocIndexConfig(),
+                    ...(data.childDocIndex || {}),
+                    sortBy: "tree",
+                },
             };
             this.data[STORAGE_NAME] = this.config;
             this.applyImageCenterStyle();
@@ -2833,7 +3512,8 @@ module.exports = class FhelperPlugin extends Plugin {
                 && (Object.keys(data.disabled || {}).length > 0
                     || data.imageScale
                     || data.panguSpacing
-                    || data.docRefStyle);
+                    || data.docRefStyle
+                    || data.childDocIndex);
             if (hasNewConfig) {
                 this.applyConfig(data);
                 return;
@@ -2888,6 +3568,7 @@ module.exports = class FhelperPlugin extends Plugin {
             imageScale: { ...(this.config.imageScale || createDefaultImageScaleConfig()) },
             panguSpacing: { ...(this.config.panguSpacing || createDefaultPanguSpacingConfig()) },
             docRefStyle: { ...(this.config.docRefStyle || createDefaultDocRefStyleConfig()) },
+            childDocIndex: { ...(this.config.childDocIndex || createDefaultChildDocIndexConfig()) },
         };
         this.settingToggleEls.forEach((input) => {
             input.checked = enabled;
@@ -2905,6 +3586,146 @@ module.exports = class FhelperPlugin extends Plugin {
             callback: () => {
                 this.openSetting();
             },
+        });
+    }
+
+    confirmAndRunGlobalChildDocIndex() {
+        const confirmed = window.confirm(this.i18n.childDocIndexGlobalConfirm);
+        if (!confirmed) {
+            return;
+        }
+        this.runGlobalChildDocIndexWithProgress({
+            scope: "all",
+            notebookIds: [],
+        });
+    }
+
+    confirmAndRunNotebookChildDocIndex() {
+        const notebookId = this.childDocIndexNotebookSelectEl?.value || "";
+        if (!notebookId) {
+            showMessage(this.i18n.childDocIndexNotebookRequired);
+            return;
+        }
+        const notebookName = this.childDocIndexNotebookSelectEl?.selectedOptions?.[0]?.textContent
+            || notebookId;
+        const confirmed = window.confirm(formatChildDocIndexMessage(this.i18n, "childDocIndexNotebookConfirm", {
+            name: notebookName,
+        }));
+        if (!confirmed) {
+            return;
+        }
+        this.config.childDocIndex = {
+            ...(this.config.childDocIndex || createDefaultChildDocIndexConfig()),
+            selectedNotebookId: notebookId,
+        };
+        this.data[STORAGE_NAME] = this.config;
+        this.saveData(STORAGE_NAME, this.config).catch((error) => {
+            console.warn(`${LOG_PREFIX} save notebook selection failed`, error);
+        });
+        this.runGlobalChildDocIndexWithProgress({
+            scope: "selectedNotebooks",
+            notebookIds: [notebookId],
+        });
+    }
+
+    runGlobalChildDocIndexWithProgress(overrideConfig = null) {
+        if (this.childDocIndexProgressDialog) {
+            this.childDocIndexProgressDialog.destroy();
+            this.childDocIndexProgressDialog = null;
+        }
+        this.childDocIndexCancelFlag = { cancelled: false };
+        const cancelFlag = this.childDocIndexCancelFlag;
+        const statusEl = document.createElement("div");
+        statusEl.className = "fn__flex-column";
+        statusEl.style.gap = "12px";
+        statusEl.style.padding = "8px 4px";
+        const progressText = document.createElement("div");
+        progressText.textContent = this.i18n.childDocIndexGlobalRunning;
+        const detailText = document.createElement("div");
+        detailText.className = "b3-label__text";
+        detailText.textContent = "";
+        statusEl.appendChild(progressText);
+        statusEl.appendChild(detailText);
+        const footer = document.createElement("div");
+        footer.className = "fn__flex";
+        footer.style.justifyContent = "flex-end";
+        const cancelBtn = document.createElement("button");
+        cancelBtn.className = "b3-button b3-button--cancel";
+        cancelBtn.textContent = this.i18n.childDocIndexGlobalCancel;
+        cancelBtn.addEventListener("click", () => {
+            cancelFlag.cancelled = true;
+            cancelBtn.disabled = true;
+            progressText.textContent = this.i18n.childDocIndexGlobalCancelling;
+        });
+        footer.appendChild(cancelBtn);
+        statusEl.appendChild(footer);
+        this.childDocIndexProgressDialog = new Dialog({
+            title: this.i18n.childDocIndexGlobalProgressTitle,
+            content: "",
+            width: "520px",
+            height: "220px",
+            destroyCallback: () => {
+                this.childDocIndexProgressDialog = null;
+                this.childDocIndexCancelFlag = null;
+            },
+        });
+        const body = this.childDocIndexProgressDialog.element.querySelector(".b3-dialog__body");
+        body?.appendChild(statusEl);
+        const runtimeConfig = {
+            ...(this.config.childDocIndex || createDefaultChildDocIndexConfig()),
+            ...(overrideConfig || {}),
+        };
+        runGlobalChildDocIndex(this, {
+            config: runtimeConfig,
+            isCancelled: () => cancelFlag.cancelled,
+            onProgress: ({ current, total, added, skipped, failed }) => {
+                progressText.textContent = formatChildDocIndexMessage(this.i18n, "childDocIndexGlobalProgress", {
+                    current,
+                    total,
+                });
+                detailText.textContent = formatChildDocIndexMessage(this.i18n, "childDocIndexGlobalDetail", {
+                    added,
+                    skipped,
+                    failed,
+                });
+            },
+        }).then((summary) => {
+            cancelBtn.remove();
+            if (summary.cancelled) {
+                progressText.textContent = formatChildDocIndexMessage(this.i18n, "childDocIndexGlobalDoneCancelled", {
+                    parents: summary.parents,
+                    added: summary.added,
+                    skipped: summary.skipped,
+                    failed: summary.failed,
+                });
+            } else {
+                progressText.textContent = formatChildDocIndexMessage(this.i18n, "childDocIndexGlobalDone", {
+                    parents: summary.parents,
+                    added: summary.added,
+                    skipped: summary.skipped,
+                    failed: summary.failed,
+                });
+            }
+            detailText.textContent = "";
+            const closeBtn = document.createElement("button");
+            closeBtn.className = "b3-button b3-button--text";
+            closeBtn.textContent = this.i18n.confirm;
+            closeBtn.addEventListener("click", () => {
+                this.childDocIndexProgressDialog?.destroy();
+            });
+            footer.appendChild(closeBtn);
+        }).catch((error) => {
+            console.warn(`${LOG_PREFIX} runGlobalChildDocIndex failed`, error);
+            progressText.textContent = this.i18n.childDocIndexFailed;
+            detailText.textContent = String(error?.message || error || "");
+            cancelBtn.remove();
+            const closeBtn = document.createElement("button");
+            closeBtn.className = "b3-button b3-button--text";
+            closeBtn.textContent = this.i18n.confirm;
+            closeBtn.addEventListener("click", () => {
+                this.childDocIndexProgressDialog?.destroy();
+            });
+            footer.appendChild(closeBtn);
         });
     }
 
@@ -2961,6 +3782,52 @@ module.exports = class FhelperPlugin extends Plugin {
         if (this.docRefStyleEnableEl) {
             this.config.docRefStyle.enabled = this.docRefStyleEnableEl.checked;
         }
+        if (this.childDocIndexNotebookSelectEl) {
+            this.config.childDocIndex = {
+                ...(this.config.childDocIndex || createDefaultChildDocIndexConfig()),
+                selectedNotebookId: this.childDocIndexNotebookSelectEl.value || "",
+            };
+        }
+    }
+
+    populateChildDocIndexNotebookSelect(selectEl) {
+        if (!selectEl) {
+            return;
+        }
+        selectEl.innerHTML = "";
+        const loadingOpt = document.createElement("option");
+        loadingOpt.value = "";
+        loadingOpt.textContent = this.i18n.childDocIndexNotebookLoading;
+        selectEl.appendChild(loadingOpt);
+        listOpenNotebooks().then((notebooks) => {
+            if (!selectEl.isConnected) {
+                return;
+            }
+            selectEl.innerHTML = "";
+            const placeholder = document.createElement("option");
+            placeholder.value = "";
+            placeholder.textContent = this.i18n.childDocIndexNotebookPlaceholder;
+            selectEl.appendChild(placeholder);
+            notebooks.forEach((notebook) => {
+                const opt = document.createElement("option");
+                opt.value = notebook.id;
+                opt.textContent = notebook.name || notebook.id;
+                selectEl.appendChild(opt);
+            });
+            const saved = this.config.childDocIndex?.selectedNotebookId;
+            if (saved && [...selectEl.options].some((opt) => opt.value === saved)) {
+                selectEl.value = saved;
+            }
+        }).catch((error) => {
+            console.warn(`${LOG_PREFIX} populateChildDocIndexNotebookSelect failed`, error);
+            if (selectEl.isConnected) {
+                selectEl.innerHTML = "";
+                const errOpt = document.createElement("option");
+                errOpt.value = "";
+                errOpt.textContent = this.i18n.childDocIndexNotebookLoadFailed;
+                selectEl.appendChild(errOpt);
+            }
+        });
     }
 
     updateImageScaleControlState() {
@@ -3063,6 +3930,48 @@ module.exports = class FhelperPlugin extends Plugin {
             control: this.docRefStyleEnableEl,
         }));
         panel.appendChild(panguSection);
+
+        const childDocIndexSection = this.createSettingSection(this.i18n.sectionChildDocIndex);
+        const globalIndexBtn = document.createElement("button");
+        globalIndexBtn.type = "button";
+        globalIndexBtn.className = "b3-button b3-button--outline";
+        globalIndexBtn.textContent = this.i18n.childDocIndexGlobalBtn;
+        globalIndexBtn.addEventListener("click", () => {
+            this.confirmAndRunGlobalChildDocIndex();
+        });
+        childDocIndexSection.appendChild(this.createSettingRow({
+            title: this.i18n.childDocIndexGlobalTitle,
+            description: this.i18n.childDocIndexGlobalDesc,
+            control: globalIndexBtn,
+        }));
+
+        const notebookControls = document.createElement("div");
+        notebookControls.className = "fn__flex";
+        notebookControls.style.gap = "8px";
+        notebookControls.style.alignItems = "center";
+        notebookControls.style.flexWrap = "wrap";
+        notebookControls.style.justifyContent = "flex-end";
+        const notebookSelect = document.createElement("select");
+        notebookSelect.className = "b3-select";
+        notebookSelect.style.minWidth = "180px";
+        notebookSelect.style.maxWidth = "280px";
+        this.childDocIndexNotebookSelectEl = notebookSelect;
+        this.populateChildDocIndexNotebookSelect(notebookSelect);
+        const notebookIndexBtn = document.createElement("button");
+        notebookIndexBtn.type = "button";
+        notebookIndexBtn.className = "b3-button b3-button--outline";
+        notebookIndexBtn.textContent = this.i18n.childDocIndexNotebookBtn;
+        notebookIndexBtn.addEventListener("click", () => {
+            this.confirmAndRunNotebookChildDocIndex();
+        });
+        notebookControls.appendChild(notebookSelect);
+        notebookControls.appendChild(notebookIndexBtn);
+        childDocIndexSection.appendChild(this.createSettingRow({
+            title: this.i18n.childDocIndexNotebookTitle,
+            description: this.i18n.childDocIndexNotebookDesc,
+            control: notebookControls,
+        }));
+        panel.appendChild(childDocIndexSection);
 
         const aboutSection = this.createSettingSection(this.i18n.sectionAbout);
         aboutSection.appendChild(this.createSettingRow({
@@ -3359,6 +4268,7 @@ module.exports = class FhelperPlugin extends Plugin {
         this.imageScaleCenterEl = null;
         this.panguSpacingEnableEl = null;
         this.docRefStyleEnableEl = null;
+        this.childDocIndexNotebookSelectEl = null;
         this.slashSearchEl = null;
         this.slashListEl = null;
         this.slashEmptyEl = null;
