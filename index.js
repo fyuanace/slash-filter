@@ -19,23 +19,36 @@ const IMAGE_CENTER_CSS = `.p:has(span.img) {
     margin-left: auto;
     margin-right: auto;
 }`;
+const IMAGE_SCALE_RETRY_DELAYS = [100, 400, 1000, 2500];
+const NEW_REF_RETRY_DELAYS = [100, 300, 800, 1500];
+const DOC_REF_REBUILD_DEBOUNCE_MS = 150;
+const DOC_REF_OUTLINE_SCOPES = [".sy__outline", '[data-type="sidebar-outline"]'];
+const IMAGE_AUTO_WIDTH = "calc(100% - 8px)";
+
+function docRefScopeSelector(suffix) {
+    return [".protyle-wysiwyg", ...DOC_REF_OUTLINE_SCOPES]
+        .map((scope) => `${scope} ${suffix}`)
+        .join(",\n");
+}
+
 const DOC_REF_CSS = `
-.protyle-wysiwyg span[data-type~="block-ref"].${DOC_REF_CLASS},
-.protyle-wysiwyg span[data-type~="block-ref"].${DOC_REF_BROKEN_CLASS} {
+${docRefScopeSelector(`span[data-type~="block-ref"].${DOC_REF_CLASS}`)},
+${docRefScopeSelector(`span[data-type~="block-ref"].${DOC_REF_BROKEN_CLASS}`)} {
     text-decoration-skip-ink: none;
 }
-.protyle-wysiwyg span[data-type~="block-ref"].${DOC_REF_CLASS} {
+${docRefScopeSelector(`span[data-type~="block-ref"].${DOC_REF_CLASS}`)} {
     text-decoration: underline;
     text-underline-offset: 0.18em;
     cursor: pointer;
+    font-weight: bold;
 }
-.protyle-wysiwyg span[data-type~="block-ref"].${DOC_REF_BROKEN_CLASS} {
+${docRefScopeSelector(`span[data-type~="block-ref"].${DOC_REF_BROKEN_CLASS}`)} {
     text-decoration: line-through;
     opacity: 0.72;
     cursor: pointer;
 }
-.protyle-wysiwyg span[data-type~="block-ref"].${DOC_REF_CLASS}::before,
-.protyle-wysiwyg span[data-type~="block-ref"].${DOC_REF_BROKEN_CLASS}::before {
+${docRefScopeSelector(`span[data-type~="block-ref"].${DOC_REF_CLASS}::before`)},
+${docRefScopeSelector(`span[data-type~="block-ref"].${DOC_REF_BROKEN_CLASS}::before`)} {
     content: "${DOC_REF_DEFAULT_ICON}";
     display: inline-block;
     margin-right: 0.25em;
@@ -43,12 +56,12 @@ const DOC_REF_CSS = `
     line-height: 1;
     pointer-events: none;
 }
-.protyle-wysiwyg span[data-type~="block-ref"].${DOC_REF_CLASS}[${DOC_REF_ATTR_ICON}]::before,
-.protyle-wysiwyg span[data-type~="block-ref"].${DOC_REF_BROKEN_CLASS}[${DOC_REF_ATTR_ICON}]::before {
+${docRefScopeSelector(`span[data-type~="block-ref"].${DOC_REF_CLASS}[${DOC_REF_ATTR_ICON}]::before`)},
+${docRefScopeSelector(`span[data-type~="block-ref"].${DOC_REF_BROKEN_CLASS}[${DOC_REF_ATTR_ICON}]::before`)} {
     content: attr(${DOC_REF_ATTR_ICON});
 }
-.protyle-wysiwyg span[data-type~="block-ref"].${DOC_REF_CLASS}[${DOC_REF_ATTR_ICON_IMG}]::before,
-.protyle-wysiwyg span[data-type~="block-ref"].${DOC_REF_BROKEN_CLASS}[${DOC_REF_ATTR_ICON_IMG}]::before {
+${docRefScopeSelector(`span[data-type~="block-ref"].${DOC_REF_CLASS}[${DOC_REF_ATTR_ICON_IMG}]::before`)},
+${docRefScopeSelector(`span[data-type~="block-ref"].${DOC_REF_BROKEN_CLASS}[${DOC_REF_ATTR_ICON_IMG}]::before`)} {
     content: "";
     width: 1em;
     height: 1em;
@@ -56,10 +69,6 @@ const DOC_REF_CSS = `
     background-image: var(--fhelper-icon-url);
 }
 `;
-const IMAGE_SCALE_RETRY_DELAYS = [100, 400, 1000, 2500];
-const NEW_REF_RETRY_DELAYS = [100, 300, 800, 1500];
-const DOC_REF_REBUILD_DEBOUNCE_MS = 150;
-const IMAGE_AUTO_WIDTH = "calc(100% - 8px)";
 
 function createDefaultDocRefStyleConfig() {
     return {
@@ -452,6 +461,7 @@ async function rebuildDocRefCacheAndDecorate(plugin, protyle) {
     plugin.docRefDirtyDocs.delete(rootId);
     const refs = collectBlockRefElements(wysiwyg);
     if (refs.length === 0) {
+        scheduleDecorateOutlineDocRefs(plugin);
         return;
     }
     const ids = [...new Set(refs.map((el) => el.getAttribute("data-id")).filter(Boolean))];
@@ -463,6 +473,7 @@ async function rebuildDocRefCacheAndDecorate(plugin, protyle) {
             scheduleNewRefRetry(plugin, rootId, id);
         }
     });
+    scheduleDecorateOutlineDocRefs(plugin);
 }
 
 function scheduleRebuildDocRef(plugin, protyle) {
@@ -671,8 +682,89 @@ async function handleNewBlockRefs(plugin, protyle, refElements) {
     });
 }
 
+function getOutlineDocRefRoots() {
+    return document.querySelectorAll(DOC_REF_OUTLINE_SCOPES.join(", "));
+}
+
+function collectOutlineBlockRefElements() {
+    const refs = [];
+    getOutlineDocRefRoots().forEach((root) => {
+        collectBlockRefElements(root).forEach((el) => refs.push(el));
+    });
+    return refs;
+}
+
+function scheduleDecorateOutlineDocRefs(plugin) {
+    if (!plugin.config.docRefStyle?.enabled) {
+        return;
+    }
+    if (plugin.outlineDocRefTimer) {
+        window.clearTimeout(plugin.outlineDocRefTimer);
+    }
+    plugin.outlineDocRefTimer = window.setTimeout(() => {
+        plugin.outlineDocRefTimer = null;
+        decorateOutlineDocRefs(plugin).catch((error) => {
+            console.warn(`${LOG_PREFIX} decorateOutlineDocRefs failed`, error);
+        });
+    }, DOC_REF_REBUILD_DEBOUNCE_MS);
+}
+
+function ensureOutlineDocRefWatch(plugin) {
+    if (!plugin.config.docRefStyle?.enabled) {
+        return;
+    }
+    if (!plugin.outlineDocRefObservers) {
+        plugin.outlineDocRefObservers = new Map();
+    }
+    getOutlineDocRefRoots().forEach((root) => {
+        if (plugin.outlineDocRefObservers.has(root)) {
+            return;
+        }
+        const observer = new MutationObserver(() => {
+            scheduleDecorateOutlineDocRefs(plugin);
+        });
+        observer.observe(root, { childList: true, subtree: true });
+        plugin.outlineDocRefObservers.set(root, observer);
+    });
+}
+
+function unwatchOutlineDocRefs(plugin) {
+    plugin.outlineDocRefObservers?.forEach((observer) => observer.disconnect());
+    plugin.outlineDocRefObservers?.clear();
+    if (plugin.outlineDocRefTimer) {
+        window.clearTimeout(plugin.outlineDocRefTimer);
+        plugin.outlineDocRefTimer = null;
+    }
+}
+
+async function decorateOutlineDocRefs(plugin) {
+    if (!plugin.config.docRefStyle?.enabled) {
+        return;
+    }
+    ensureOutlineDocRefWatch(plugin);
+    const refs = collectOutlineBlockRefElements();
+    if (refs.length === 0) {
+        return;
+    }
+    const ids = [...new Set(refs.map((el) => el.getAttribute("data-id")).filter(Boolean))];
+    const metaMap = await queryBlockMetaByIds(ids);
+    refs.forEach((el) => {
+        const id = el.getAttribute("data-id");
+        const meta = metaMap.get(id);
+        if (meta) {
+            applyDocRefDecoration(el, meta);
+        }
+    });
+}
+
 function undecorateAllDocRefs() {
-    document.querySelectorAll(`span[data-type~="block-ref"].${DOC_REF_CLASS}, span[data-type~="block-ref"].${DOC_REF_BROKEN_CLASS}`)
+    const selector = [".protyle-wysiwyg", ...DOC_REF_OUTLINE_SCOPES]
+        .map((scope) => (
+            `${scope} span[data-type~="block-ref"].${DOC_REF_CLASS}, `
+            + `${scope} span[data-type~="block-ref"].${DOC_REF_BROKEN_CLASS}`
+        ))
+        .join(", ");
+    document.querySelectorAll(selector)
         .forEach((el) => clearDocRefDecoration(el));
 }
 
@@ -684,6 +776,7 @@ async function decorateAllOpenEditors(plugin) {
         watchDocRefMutations(plugin, protyle);
         await rebuildDocRefCacheAndDecorate(plugin, protyle);
     }
+    scheduleDecorateOutlineDocRefs(plugin);
 }
 
 function reapplyDocRefIfClassLost(plugin, rootId, refEl) {
@@ -932,6 +1025,7 @@ async function refreshTargetMetaInOpenDocs(plugin, targetIds, options = {}) {
         await populateDocRefCache(plugin, rootId, ids);
         applyRefsFromDocCache(plugin, rootId, refs);
     }
+    scheduleDecorateOutlineDocRefs(plugin);
 }
 
 async function flushDocRefWsUpdate(plugin) {
@@ -1700,6 +1794,7 @@ function syncDocRefStyleFeature(plugin) {
     if (!enabled) {
         clearAllDocRefRetries(plugin);
         unwatchAllDocRefMutations(plugin);
+        unwatchOutlineDocRefs(plugin);
         undecorateAllDocRefs();
         plugin.docRefByDoc.clear();
         plugin.docRefDirtyDocs.clear();
@@ -1715,9 +1810,11 @@ function syncDocRefStyleFeature(plugin) {
         return;
     }
     watchAllDocRefEditors(plugin);
+    ensureOutlineDocRefWatch(plugin);
     decorateAllOpenEditors(plugin).catch((error) => {
         console.warn(`${LOG_PREFIX} decorateAllOpenEditors failed`, error);
     });
+    scheduleDecorateOutlineDocRefs(plugin);
 }
 
 const RE_CJK_CHAR = /[\u4E00-\u9FFF\u3400-\u4DBF\uF900-\uFAFF]/;
