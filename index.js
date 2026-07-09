@@ -1,4 +1,4 @@
-const { Plugin, Setting, getAllEditor, showMessage } = require("siyuan");
+const { Plugin, Dialog, getAllEditor, showMessage, fetchSyncPost } = require("siyuan");
 
 const STORAGE_NAME = "fhelper-config.json";
 const LEGACY_STORAGE_NAMES = ["slash-filter-config.json", "slash-filter-config"];
@@ -6,13 +6,66 @@ const ZWSP = "\u200b";
 const SCREEN_DPI = 96;
 const SIYUAN_LOCAL_ZOOM_KEY = "local-zoom";
 const IMAGE_CENTER_STYLE_ID = "fhelper-img-center-css";
+const SETTING_STYLE_ID = "fhelper-setting-css";
+const DOC_REF_STYLE_ID = "fhelper-doc-ref-css";
+const DOC_REF_CLASS = "fhelper-doc-ref";
+const DOC_REF_BROKEN_CLASS = "fhelper-doc-ref-broken";
+const DOC_REF_ICON_CLASS = "fhelper-doc-ref-icon";
+const DOC_REF_ATTR_ICON = "data-fhelper-icon";
+const DOC_REF_ATTR_ICON_IMG = "data-fhelper-icon-img";
+const DOC_REF_DEFAULT_ICON = "📄";
 const LOG_PREFIX = "[fhelper]";
 const IMAGE_CENTER_CSS = `.p:has(span.img) {
     margin-left: auto;
     margin-right: auto;
 }`;
+const DOC_REF_CSS = `
+.protyle-wysiwyg span[data-type~="block-ref"].${DOC_REF_CLASS},
+.protyle-wysiwyg span[data-type~="block-ref"].${DOC_REF_BROKEN_CLASS} {
+    text-decoration-skip-ink: none;
+}
+.protyle-wysiwyg span[data-type~="block-ref"].${DOC_REF_CLASS} {
+    text-decoration: underline;
+    text-underline-offset: 0.18em;
+    cursor: pointer;
+}
+.protyle-wysiwyg span[data-type~="block-ref"].${DOC_REF_BROKEN_CLASS} {
+    text-decoration: line-through;
+    opacity: 0.72;
+    cursor: pointer;
+}
+.protyle-wysiwyg span[data-type~="block-ref"].${DOC_REF_CLASS}::before,
+.protyle-wysiwyg span[data-type~="block-ref"].${DOC_REF_BROKEN_CLASS}::before {
+    content: "${DOC_REF_DEFAULT_ICON}";
+    display: inline-block;
+    margin-right: 0.25em;
+    vertical-align: -0.1em;
+    line-height: 1;
+    pointer-events: none;
+}
+.protyle-wysiwyg span[data-type~="block-ref"].${DOC_REF_CLASS}[${DOC_REF_ATTR_ICON}]::before,
+.protyle-wysiwyg span[data-type~="block-ref"].${DOC_REF_BROKEN_CLASS}[${DOC_REF_ATTR_ICON}]::before {
+    content: attr(${DOC_REF_ATTR_ICON});
+}
+.protyle-wysiwyg span[data-type~="block-ref"].${DOC_REF_CLASS}[${DOC_REF_ATTR_ICON_IMG}]::before,
+.protyle-wysiwyg span[data-type~="block-ref"].${DOC_REF_BROKEN_CLASS}[${DOC_REF_ATTR_ICON_IMG}]::before {
+    content: "";
+    width: 1em;
+    height: 1em;
+    background: center / contain no-repeat;
+    background-image: var(--fhelper-icon-url);
+}
+`;
 const IMAGE_SCALE_RETRY_DELAYS = [100, 400, 1000, 2500];
+const NEW_REF_RETRY_DELAYS = [100, 300, 800, 1500];
+const DOC_REF_REBUILD_DEBOUNCE_MS = 150;
 const IMAGE_AUTO_WIDTH = "calc(100% - 8px)";
+
+function createDefaultDocRefStyleConfig() {
+    return {
+        enabled: false,
+    };
+}
 
 function setImageCenterCssEnabled(enabled) {
     let styleEl = document.getElementById(IMAGE_CENTER_STYLE_ID);
@@ -32,8 +85,6 @@ function createDefaultImageScaleConfig() {
     return {
         enabled: false,
         center: false,
-        dpiMode: "auto",
-        manualDpi: 144,
     };
 }
 
@@ -41,6 +92,996 @@ function createDefaultPanguSpacingConfig() {
     return {
         enabled: false,
     };
+}
+
+function setDocRefStyleCssEnabled(enabled) {
+    let styleEl = document.getElementById(DOC_REF_STYLE_ID);
+    if (enabled) {
+        if (!styleEl) {
+            styleEl = document.createElement("style");
+            styleEl.id = DOC_REF_STYLE_ID;
+            document.head.appendChild(styleEl);
+        }
+        styleEl.textContent = DOC_REF_CSS;
+        return;
+    }
+    styleEl?.remove();
+}
+
+function parseIalMap(ial) {
+    const map = {};
+    if (!ial || typeof ial !== "string") {
+        return map;
+    }
+    const re = /([A-Za-z0-9_\-]+)="([^"]*)"/g;
+    let match = re.exec(ial);
+    while (match) {
+        map[match[1]] = match[2];
+        match = re.exec(ial);
+    }
+    return map;
+}
+
+function unicodeHexToEmoji(hex) {
+    if (!hex || !/^[0-9a-fA-F]+$/.test(hex)) {
+        return null;
+    }
+    try {
+        const points = hex.match(/.{1,8}/g) || [hex];
+        return points.map((part) => String.fromCodePoint(parseInt(part, 16))).join("");
+    } catch (error) {
+        console.debug(`${LOG_PREFIX} unicodeHexToEmoji failed`, error);
+        return null;
+    }
+}
+
+function resolveDocIconDisplay(icon) {
+    const raw = String(icon || "").trim();
+    if (!raw) {
+        return { kind: "emoji", value: DOC_REF_DEFAULT_ICON };
+    }
+    if (raw.includes("/") || raw.includes(".") || raw.startsWith("http") || raw.startsWith("data:")) {
+        const src = raw.startsWith("http") || raw.startsWith("data:") || raw.startsWith("/")
+            ? raw
+            : `/emojis/${raw}`;
+        return { kind: "img", value: src };
+    }
+    const emoji = unicodeHexToEmoji(raw);
+    return { kind: "emoji", value: emoji || DOC_REF_DEFAULT_ICON };
+}
+
+function parseSqlQueryRows(response) {
+    if (Array.isArray(response)) {
+        return response;
+    }
+    if (Array.isArray(response?.data)) {
+        return response.data;
+    }
+    return [];
+}
+
+function createBrokenDocRefMeta() {
+    return { exists: false, isDoc: false, icon: "" };
+}
+
+function escapeSqlId(id) {
+    return String(id || "").replace(/'/g, "''");
+}
+
+async function queryBlockMetaByIds(ids) {
+    const unique = [...new Set((ids || []).filter(Boolean))];
+    const result = new Map();
+    if (unique.length === 0) {
+        return result;
+    }
+    const chunkSize = 200;
+    for (let i = 0; i < unique.length; i += chunkSize) {
+        const chunk = unique.slice(i, i + chunkSize);
+        const inList = chunk.map((id) => `'${escapeSqlId(id)}'`).join(",");
+        const stmt = `SELECT id, type, ial FROM blocks WHERE id IN (${inList})`;
+        try {
+            const response = await fetchSyncPost("/api/query/sql", { stmt });
+            const rows = parseSqlQueryRows(response);
+            const found = new Set();
+            rows.forEach((row) => {
+                const id = row.id;
+                if (!id) {
+                    return;
+                }
+                found.add(id);
+                const ial = parseIalMap(row.ial);
+                result.set(id, {
+                    exists: true,
+                    isDoc: row.type === "d",
+                    icon: ial.icon || "",
+                });
+            });
+            chunk.forEach((id) => {
+                if (!found.has(id)) {
+                    result.set(id, createBrokenDocRefMeta());
+                }
+            });
+        } catch (error) {
+            console.warn(`${LOG_PREFIX} queryBlockMetaByIds failed`, error);
+            chunk.forEach((id) => {
+                if (!result.has(id)) {
+                    result.set(id, createBrokenDocRefMeta());
+                }
+            });
+        }
+    }
+    return result;
+}
+
+function isBlockRefElement(el) {
+    if (!el || el.nodeType !== 1) {
+        return false;
+    }
+    const type = el.getAttribute("data-type") || "";
+    return type.split(/\s+/).includes("block-ref");
+}
+
+function collectBlockRefElements(root) {
+    if (!root) {
+        return [];
+    }
+    const list = [];
+    if (isBlockRefElement(root)) {
+        list.push(root);
+    }
+    root.querySelectorAll?.('span[data-type~="block-ref"]').forEach((el) => list.push(el));
+    return list;
+}
+
+function clearDocRefDecoration(el) {
+    if (!el) {
+        return;
+    }
+    el.classList.remove(DOC_REF_CLASS, DOC_REF_BROKEN_CLASS);
+    el.removeAttribute("contenteditable");
+    el.removeAttribute(DOC_REF_ATTR_ICON);
+    el.removeAttribute(DOC_REF_ATTR_ICON_IMG);
+    el.style.removeProperty("--fhelper-icon-url");
+    el.querySelectorAll?.(`.${DOC_REF_ICON_CLASS}`).forEach((node) => node.remove());
+}
+
+function applyDocRefIconAttrs(el, display) {
+    el.removeAttribute(DOC_REF_ATTR_ICON);
+    el.removeAttribute(DOC_REF_ATTR_ICON_IMG);
+    el.style.removeProperty("--fhelper-icon-url");
+    if (display.kind === "img") {
+        el.setAttribute(DOC_REF_ATTR_ICON_IMG, "");
+        el.style.setProperty("--fhelper-icon-url", `url("${String(display.value).replace(/"/g, '\\"')}")`);
+        return;
+    }
+    el.setAttribute(DOC_REF_ATTR_ICON, display.value);
+}
+
+function applyDocRefDecoration(el, meta) {
+    if (!el || !meta) {
+        return;
+    }
+    clearDocRefDecoration(el);
+    if (!meta.exists) {
+        el.setAttribute("contenteditable", "false");
+        el.classList.add(DOC_REF_BROKEN_CLASS);
+        applyDocRefIconAttrs(el, resolveDocIconDisplay(""));
+        return;
+    }
+    if (!meta.isDoc) {
+        return;
+    }
+    el.setAttribute("contenteditable", "false");
+    el.classList.add(DOC_REF_CLASS);
+    applyDocRefIconAttrs(el, resolveDocIconDisplay(meta.icon));
+}
+
+function getProtyleFromEvent(event) {
+    return event?.detail?.protyle ?? event?.detail ?? event;
+}
+
+function getProtyleRootId(protyle) {
+    if (!protyle) {
+        return null;
+    }
+    return protyle.block?.id
+        || protyle.options?.blockId
+        || protyle.block?.rootID
+        || protyle.element?.dataset?.id
+        || null;
+}
+
+function getProtyleWysiwyg(event) {
+    const protyle = getProtyleFromEvent(event);
+    return protyle?.wysiwyg?.element || null;
+}
+
+function findOpenProtyleByRootId(rootId) {
+    if (!rootId) {
+        return null;
+    }
+    for (const { protyle } of getAllEditor()) {
+        if (getProtyleRootId(protyle) === rootId) {
+            return protyle;
+        }
+    }
+    return null;
+}
+
+function findOpenProtyleContainingBlock(blockId) {
+    if (!blockId) {
+        return null;
+    }
+    for (const { protyle } of getAllEditor()) {
+        const wysiwyg = protyle?.wysiwyg?.element;
+        if (wysiwyg?.querySelector(`[data-node-id="${blockId}"]`)) {
+            return protyle;
+        }
+    }
+    return null;
+}
+
+function getDocRefTargetCache(plugin, rootId) {
+    if (!rootId) {
+        return null;
+    }
+    if (!plugin.docRefByDoc.has(rootId)) {
+        plugin.docRefByDoc.set(rootId, new Map());
+    }
+    return plugin.docRefByDoc.get(rootId);
+}
+
+function clearDocRefCacheForDoc(plugin, rootId, options = {}) {
+    const { keepDirty = false } = options;
+    if (!rootId) {
+        return;
+    }
+    plugin.docRefByDoc.delete(rootId);
+    if (!keepDirty) {
+        plugin.docRefDirtyDocs.delete(rootId);
+    }
+    const timer = plugin.docRefRebuildTimers?.get(rootId);
+    if (timer) {
+        window.clearTimeout(timer);
+        plugin.docRefRebuildTimers.delete(rootId);
+    }
+}
+
+function markDocRefDirty(plugin, rootId) {
+    if (rootId) {
+        plugin.docRefDirtyDocs.add(rootId);
+    }
+}
+
+function getTargetMeta(plugin, rootId, targetId) {
+    return getDocRefTargetCache(plugin, rootId)?.get(targetId) || null;
+}
+
+function setTargetMeta(plugin, rootId, targetId, meta) {
+    const cache = getDocRefTargetCache(plugin, rootId);
+    if (cache) {
+        cache.set(targetId, meta);
+    }
+}
+
+async function resolveDocumentRootId(blockId) {
+    if (!blockId) {
+        return null;
+    }
+    const stmt = `SELECT root_id FROM blocks WHERE id = '${escapeSqlId(blockId)}'`;
+    try {
+        const response = await fetchSyncPost("/api/query/sql", { stmt });
+        const rows = parseSqlQueryRows(response);
+        const rootId = rows[0]?.root_id;
+        return typeof rootId === "string" && rootId ? rootId : null;
+    } catch (error) {
+        console.warn(`${LOG_PREFIX} resolveDocumentRootId failed`, error);
+        return null;
+    }
+}
+
+function extractCreatedocInfo(data) {
+    let newDocId = null;
+    let parentId = null;
+    const walk = (node) => {
+        if (!node || typeof node !== "object") {
+            return;
+        }
+        if (!newDocId && typeof node.id === "string" && /^\d{14}-[0-9a-z]{7}$/i.test(node.id) && node.type === "d") {
+            newDocId = node.id;
+        }
+        if (!newDocId && typeof node.id === "string" && /^\d{14}-[0-9a-z]{7}$/i.test(node.id)) {
+            newDocId = node.id;
+        }
+        const parent = node.parentID || node.parentId;
+        if (!parentId && typeof parent === "string" && /^\d{14}-[0-9a-z]{7}$/i.test(parent)) {
+            parentId = parent;
+        }
+        if (Array.isArray(node)) {
+            node.forEach(walk);
+            return;
+        }
+        Object.values(node).forEach((value) => {
+            if (value && typeof value === "object") {
+                walk(value);
+            }
+        });
+    };
+    walk(data);
+    return { newDocId, parentId };
+}
+
+function applyRefsFromDocCache(plugin, rootId, refs) {
+    (refs || []).forEach((el) => {
+        const id = el.getAttribute("data-id");
+        if (!id) {
+            return;
+        }
+        const meta = getTargetMeta(plugin, rootId, id);
+        if (meta) {
+            applyDocRefDecoration(el, meta);
+        }
+    });
+}
+
+async function populateDocRefCache(plugin, rootId, ids) {
+    const uniqueIds = [...new Set((ids || []).filter(Boolean))];
+    if (uniqueIds.length === 0) {
+        return;
+    }
+    const queried = await queryBlockMetaByIds(uniqueIds);
+    const cache = getDocRefTargetCache(plugin, rootId);
+    queried.forEach((meta, id) => {
+        cache.set(id, meta);
+        if (meta.exists) {
+            clearDocRefRetry(plugin, rootId, id);
+        }
+    });
+}
+
+async function rebuildDocRefCacheAndDecorate(plugin, protyle) {
+    if (!plugin.config.docRefStyle?.enabled || !protyle) {
+        return;
+    }
+    const rootId = getProtyleRootId(protyle);
+    const wysiwyg = protyle?.wysiwyg?.element;
+    if (!rootId || !wysiwyg) {
+        return;
+    }
+    plugin.docRefByDoc.set(rootId, new Map());
+    plugin.docRefDirtyDocs.delete(rootId);
+    const refs = collectBlockRefElements(wysiwyg);
+    if (refs.length === 0) {
+        return;
+    }
+    const ids = [...new Set(refs.map((el) => el.getAttribute("data-id")).filter(Boolean))];
+    await populateDocRefCache(plugin, rootId, ids);
+    applyRefsFromDocCache(plugin, rootId, refs);
+    ids.forEach((id) => {
+        const meta = getTargetMeta(plugin, rootId, id);
+        if (!meta?.exists) {
+            scheduleNewRefRetry(plugin, rootId, id);
+        }
+    });
+}
+
+function scheduleRebuildDocRef(plugin, protyle) {
+    const rootId = getProtyleRootId(protyle);
+    if (!rootId) {
+        return;
+    }
+    if (!plugin.docRefRebuildTimers) {
+        plugin.docRefRebuildTimers = new Map();
+    }
+    const existing = plugin.docRefRebuildTimers.get(rootId);
+    if (existing) {
+        window.clearTimeout(existing);
+    }
+    const timer = window.setTimeout(() => {
+        plugin.docRefRebuildTimers.delete(rootId);
+        rebuildDocRefCacheAndDecorate(plugin, protyle).catch((error) => {
+            console.warn(`${LOG_PREFIX} rebuildDocRefCacheAndDecorate failed`, error);
+        });
+    }, DOC_REF_REBUILD_DEBOUNCE_MS);
+    plugin.docRefRebuildTimers.set(rootId, timer);
+}
+
+async function decorateDynamicRefs(plugin, protyle) {
+    if (!plugin.config.docRefStyle?.enabled || !protyle) {
+        return;
+    }
+    const rootId = getProtyleRootId(protyle);
+    const wysiwyg = protyle?.wysiwyg?.element;
+    if (!rootId || !wysiwyg) {
+        return;
+    }
+    const refs = collectBlockRefElements(wysiwyg);
+    if (refs.length === 0) {
+        return;
+    }
+    const cache = getDocRefTargetCache(plugin, rootId);
+    const missingIds = [...new Set(refs.map((el) => el.getAttribute("data-id")).filter((id) => id && !cache.has(id)))];
+    if (missingIds.length > 0) {
+        await populateDocRefCache(plugin, rootId, missingIds);
+    }
+    applyRefsFromDocCache(plugin, rootId, refs);
+}
+
+function applyDocRefMetaInProtyle(plugin, protyle, targetId, meta) {
+    const rootId = getProtyleRootId(protyle);
+    const wysiwyg = protyle?.wysiwyg?.element;
+    if (!rootId || !wysiwyg) {
+        return;
+    }
+    setTargetMeta(plugin, rootId, targetId, meta);
+    collectBlockRefElements(wysiwyg)
+        .filter((el) => el.getAttribute("data-id") === targetId)
+        .forEach((el) => applyDocRefDecoration(el, meta));
+}
+
+function applyDocRefMetaToOpenRefs(plugin, targetId, meta) {
+    getAllEditor().forEach(({ protyle }) => {
+        const wysiwyg = protyle?.wysiwyg?.element;
+        if (!wysiwyg) {
+            return;
+        }
+        const hasRef = collectBlockRefElements(wysiwyg).some((el) => el.getAttribute("data-id") === targetId);
+        if (hasRef) {
+            applyDocRefMetaInProtyle(plugin, protyle, targetId, meta);
+        }
+    });
+}
+
+function clearDocRefRetry(plugin, rootId, id) {
+    const key = `${rootId}:${id}`;
+    const timers = plugin.docRefRetryTimers?.get(key);
+    if (!timers) {
+        return;
+    }
+    timers.forEach((timer) => window.clearTimeout(timer));
+    plugin.docRefRetryTimers.delete(key);
+}
+
+function clearAllDocRefRetries(plugin) {
+    if (!plugin.docRefRetryTimers) {
+        return;
+    }
+    [...plugin.docRefRetryTimers.keys()].forEach((key) => {
+        const [rootId, id] = key.split(":");
+        clearDocRefRetry(plugin, rootId, id);
+    });
+}
+
+function scheduleNewRefRetry(plugin, rootId, id) {
+    if (!id || !rootId || !plugin.config.docRefStyle?.enabled) {
+        return;
+    }
+    if (!plugin.docRefRetryTimers) {
+        plugin.docRefRetryTimers = new Map();
+    }
+    const key = `${rootId}:${id}`;
+    if (plugin.docRefRetryTimers.has(key)) {
+        return;
+    }
+    const timers = NEW_REF_RETRY_DELAYS.map((delay, index) => window.setTimeout(async () => {
+        if (!plugin.config.docRefStyle?.enabled) {
+            return;
+        }
+        const queried = await queryBlockMetaByIds([id]);
+        const meta = queried.get(id);
+        if (!meta) {
+            return;
+        }
+        setTargetMeta(plugin, rootId, id, meta);
+        const protyle = findOpenProtyleByRootId(rootId);
+        if (protyle) {
+            applyDocRefMetaInProtyle(plugin, protyle, id, meta);
+        }
+        if (meta.exists || index === NEW_REF_RETRY_DELAYS.length - 1) {
+            clearDocRefRetry(plugin, rootId, id);
+        }
+    }, delay));
+    plugin.docRefRetryTimers.set(key, timers);
+}
+
+function reapplyFromDocCache(plugin, protyle) {
+    if (!plugin.config.docRefStyle?.enabled || !protyle) {
+        return;
+    }
+    const rootId = getProtyleRootId(protyle);
+    const wysiwyg = protyle?.wysiwyg?.element;
+    if (!rootId || !wysiwyg) {
+        return;
+    }
+    if (plugin.docRefDirtyDocs.has(rootId)) {
+        scheduleRebuildDocRef(plugin, protyle);
+        return;
+    }
+    collectBlockRefElements(wysiwyg).forEach((el) => {
+        reapplyDocRefIfClassLost(plugin, rootId, el);
+    });
+}
+
+function restoreAllDocRefDecorations(plugin, protyle) {
+    const rootId = getProtyleRootId(protyle);
+    const wysiwyg = protyle?.wysiwyg?.element;
+    if (!rootId || !wysiwyg || !plugin.config.docRefStyle?.enabled) {
+        return;
+    }
+    collectBlockRefElements(wysiwyg).forEach((el) => {
+        reapplyDocRefIfClassLost(plugin, rootId, el);
+    });
+}
+
+function scheduleRestoreDocRefDecorations(plugin, protyle) {
+    if (!plugin.docRefRestoreTimer) {
+        plugin.docRefRestoreTimer = new Map();
+    }
+    const rootId = getProtyleRootId(protyle);
+    if (!rootId) {
+        return;
+    }
+    const existing = plugin.docRefRestoreTimer.get(rootId);
+    if (existing) {
+        window.clearTimeout(existing);
+    }
+    const timer = window.setTimeout(() => {
+        plugin.docRefRestoreTimer.delete(rootId);
+        restoreAllDocRefDecorations(plugin, protyle);
+    }, 50);
+    plugin.docRefRestoreTimer.set(rootId, timer);
+}
+
+async function handleNewBlockRefs(plugin, protyle, refElements) {
+    const refs = (refElements || []).filter((el) => isBlockRefElement(el));
+    if (refs.length === 0 || !protyle) {
+        return;
+    }
+    const rootId = getProtyleRootId(protyle);
+    if (!rootId) {
+        return;
+    }
+    const cache = getDocRefTargetCache(plugin, rootId);
+    const trulyNew = [];
+    refs.forEach((el) => {
+        const id = el.getAttribute("data-id");
+        if (!id) {
+            return;
+        }
+        const meta = cache.get(id);
+        if (meta) {
+            applyDocRefDecoration(el, meta);
+        } else {
+            trulyNew.push({ el, id });
+        }
+    });
+    if (trulyNew.length === 0) {
+        return;
+    }
+    const ids = trulyNew.map((item) => item.id);
+    await populateDocRefCache(plugin, rootId, ids);
+    trulyNew.forEach(({ el, id }) => {
+        const meta = getTargetMeta(plugin, rootId, id);
+        if (meta) {
+            applyDocRefDecoration(el, meta);
+        }
+        if (!meta?.exists) {
+            scheduleNewRefRetry(plugin, rootId, id);
+        }
+    });
+}
+
+function undecorateAllDocRefs() {
+    document.querySelectorAll(`span[data-type~="block-ref"].${DOC_REF_CLASS}, span[data-type~="block-ref"].${DOC_REF_BROKEN_CLASS}`)
+        .forEach((el) => clearDocRefDecoration(el));
+}
+
+async function decorateAllOpenEditors(plugin) {
+    if (!plugin.config.docRefStyle?.enabled) {
+        return;
+    }
+    for (const { protyle } of getAllEditor()) {
+        watchDocRefMutations(plugin, protyle);
+        await rebuildDocRefCacheAndDecorate(plugin, protyle);
+    }
+}
+
+function reapplyDocRefIfClassLost(plugin, rootId, refEl) {
+    if (!isBlockRefElement(refEl)) {
+        return;
+    }
+    const id = refEl.getAttribute("data-id");
+    if (!id) {
+        return;
+    }
+    const meta = getTargetMeta(plugin, rootId, id);
+    if (!meta) {
+        return;
+    }
+    const shouldBeStyled = meta.exists && meta.isDoc;
+    const shouldBeBroken = !meta.exists;
+    const hasStyled = refEl.classList.contains(DOC_REF_CLASS);
+    const hasBroken = refEl.classList.contains(DOC_REF_BROKEN_CLASS);
+    if ((shouldBeStyled && !hasStyled) || (shouldBeBroken && !hasBroken)) {
+        applyDocRefDecoration(refEl, meta);
+    }
+}
+
+function isMutationInsideBlockRef(mutation) {
+    const target = mutation.target;
+    if (!target) {
+        return false;
+    }
+    if (isBlockRefElement(target)) {
+        return mutation.type === "childList";
+    }
+    return !!target.parentElement?.closest?.('span[data-type~="block-ref"]');
+}
+
+function unwatchDocRefMutations(plugin, wysiwyg) {
+    const observer = plugin.docRefObservers.get(wysiwyg);
+    if (!observer) {
+        return;
+    }
+    observer.disconnect();
+    plugin.docRefObservers.delete(wysiwyg);
+}
+
+function watchDocRefMutations(plugin, protyle) {
+    const wysiwyg = protyle?.wysiwyg?.element;
+    if (!wysiwyg || plugin.docRefObservers.has(wysiwyg)) {
+        return;
+    }
+    const observer = new MutationObserver((mutations) => {
+        if (!plugin.config.docRefStyle?.enabled) {
+            return;
+        }
+        let newRefs = [];
+        const rootId = getProtyleRootId(protyle);
+        for (const mutation of mutations) {
+            if (isMutationInsideBlockRef(mutation)) {
+                if (mutation.type === "attributes"
+                    && isBlockRefElement(mutation.target)
+                    && mutation.attributeName === "class") {
+                    reapplyDocRefIfClassLost(plugin, rootId, mutation.target);
+                }
+                continue;
+            }
+            if (mutation.type === "attributes") {
+                if (isBlockRefElement(mutation.target) && mutation.attributeName === "class") {
+                    reapplyDocRefIfClassLost(plugin, rootId, mutation.target);
+                } else if (isBlockRefElement(mutation.target)
+                    && (mutation.attributeName === "data-id" || mutation.attributeName === "data-type")) {
+                    newRefs.push(mutation.target);
+                }
+                continue;
+            }
+            if (mutation.type !== "childList") {
+                continue;
+            }
+            for (const node of mutation.addedNodes) {
+                if (node.nodeType !== 1) {
+                    continue;
+                }
+                if (isBlockRefElement(node)) {
+                    newRefs.push(node);
+                } else {
+                    node.querySelectorAll?.('span[data-type~="block-ref"]').forEach((el) => newRefs.push(el));
+                }
+            }
+        }
+        if (newRefs.length > 0) {
+            handleNewBlockRefs(plugin, protyle, newRefs).catch((error) => {
+                console.warn(`${LOG_PREFIX} handleNewBlockRefs failed`, error);
+            });
+        }
+        scheduleRestoreDocRefDecorations(plugin, protyle);
+    });
+    observer.observe(wysiwyg, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ["data-id", "data-type", "class"],
+    });
+    plugin.docRefObservers.set(wysiwyg, observer);
+}
+
+function unwatchAllDocRefMutations(plugin) {
+    plugin.docRefObservers.forEach((observer) => observer.disconnect());
+    plugin.docRefObservers.clear();
+}
+
+function watchAllDocRefEditors(plugin) {
+    if (!plugin.config.docRefStyle?.enabled) {
+        return;
+    }
+    getAllEditor().forEach(({ protyle }) => {
+        watchDocRefMutations(plugin, protyle);
+    });
+}
+
+function collectActiveDocRefTargetIds(plugin) {
+    const ids = new Set();
+    plugin.docRefByDoc.forEach((cache) => {
+        cache.forEach((_meta, id) => ids.add(id));
+    });
+    getAllEditor().forEach(({ protyle }) => {
+        collectBlockRefElements(protyle?.wysiwyg?.element).forEach((el) => {
+            const id = el.getAttribute("data-id");
+            if (id) {
+                ids.add(id);
+            }
+        });
+    });
+    return ids;
+}
+
+function collectIdsFromWsPayload(data, out = new Set()) {
+    if (!data) {
+        return out;
+    }
+    if (typeof data === "string") {
+        if (/^\d{14}-[0-9a-z]{7}$/i.test(data)) {
+            out.add(data);
+        }
+        return out;
+    }
+    if (Array.isArray(data)) {
+        data.forEach((item) => collectIdsFromWsPayload(item, out));
+        return out;
+    }
+    if (typeof data === "object") {
+        ["id", "rootID", "rootId", "blockID", "blockId", "parentID", "defID"].forEach((key) => {
+            if (typeof data[key] === "string" && /^\d{14}-[0-9a-z]{7}$/i.test(data[key])) {
+                out.add(data[key]);
+            }
+        });
+        Object.values(data).forEach((value) => {
+            if (value && typeof value === "object") {
+                collectIdsFromWsPayload(value, out);
+            }
+        });
+    }
+    return out;
+}
+
+function shouldHandleDocRefWs(cmd) {
+    if (!cmd) {
+        return false;
+    }
+    const key = String(cmd).toLowerCase();
+    return [
+        "transactions",
+        "removedoc",
+        "createdoc",
+        "renamedoc",
+        "movedoc",
+        "movedocs",
+        "setblockattrs",
+        "reloaddocinfo",
+        "undone",
+        "redo",
+    ].some((item) => key.includes(item));
+}
+
+function applyBrokenDocRefFast(plugin, targetIds) {
+    const brokenMeta = createBrokenDocRefMeta();
+    targetIds.forEach((targetId) => {
+        getAllEditor().forEach(({ protyle }) => {
+            const rootId = getProtyleRootId(protyle);
+            const wysiwyg = protyle?.wysiwyg?.element;
+            if (!rootId || !wysiwyg) {
+                return;
+            }
+            const matching = collectBlockRefElements(wysiwyg)
+                .filter((el) => el.getAttribute("data-id") === targetId);
+            if (matching.length === 0) {
+                return;
+            }
+            clearDocRefRetry(plugin, rootId, targetId);
+            setTargetMeta(plugin, rootId, targetId, brokenMeta);
+            matching.forEach((el) => applyDocRefDecoration(el, brokenMeta));
+        });
+    });
+}
+
+async function handleCreatedocSignal(plugin, data) {
+    const { parentId } = extractCreatedocInfo(data);
+    if (!parentId) {
+        return;
+    }
+    let parentRootId = await resolveDocumentRootId(parentId);
+    if (!parentRootId) {
+        const protyle = findOpenProtyleContainingBlock(parentId);
+        parentRootId = getProtyleRootId(protyle);
+    }
+    if (!parentRootId) {
+        return;
+    }
+    const protyle = findOpenProtyleByRootId(parentRootId);
+    clearDocRefCacheForDoc(plugin, parentRootId, { keepDirty: !protyle });
+    if (!protyle) {
+        markDocRefDirty(plugin, parentRootId);
+        return;
+    }
+    scheduleRebuildDocRef(plugin, protyle);
+}
+
+async function refreshTargetMetaInOpenDocs(plugin, targetIds, options = {}) {
+    const { force = false } = options;
+    const uniqueIds = [...new Set((targetIds || []).filter(Boolean))];
+    if (uniqueIds.length === 0) {
+        return;
+    }
+    for (const { protyle } of getAllEditor()) {
+        const rootId = getProtyleRootId(protyle);
+        const wysiwyg = protyle?.wysiwyg?.element;
+        if (!rootId || !wysiwyg) {
+            continue;
+        }
+        const refs = collectBlockRefElements(wysiwyg)
+            .filter((el) => uniqueIds.includes(el.getAttribute("data-id")));
+        if (refs.length === 0) {
+            continue;
+        }
+        const ids = [...new Set(refs.map((el) => el.getAttribute("data-id")).filter(Boolean))];
+        if (force) {
+            const cache = getDocRefTargetCache(plugin, rootId);
+            ids.forEach((id) => cache.delete(id));
+        }
+        await populateDocRefCache(plugin, rootId, ids);
+        applyRefsFromDocCache(plugin, rootId, refs);
+    }
+}
+
+async function flushDocRefWsUpdate(plugin) {
+    const pending = plugin.docRefWsPending;
+    plugin.docRefWsTimer = null;
+    plugin.docRefWsPending = null;
+    if (!pending || pending.ids.size === 0) {
+        return;
+    }
+    const cmdLower = [...pending.cmds].join(" ").toLowerCase();
+    const ids = [...pending.ids];
+    if (cmdLower.includes("removedoc")) {
+        applyBrokenDocRefFast(plugin, ids);
+        return;
+    }
+    if (cmdLower.includes("createdoc")) {
+        await handleCreatedocSignal(plugin, pending.rawData);
+        return;
+    }
+    const activeIds = collectActiveDocRefTargetIds(plugin);
+    const relevantIds = ids.filter((id) => activeIds.has(id));
+    if (relevantIds.length === 0) {
+        return;
+    }
+    const forceRefresh = cmdLower.includes("setblockattrs")
+        || cmdLower.includes("undone")
+        || cmdLower.includes("redo");
+    await refreshTargetMetaInOpenDocs(plugin, relevantIds, { force: forceRefresh });
+}
+
+function scheduleDocRefWsUpdate(plugin, event) {
+    const detail = event.detail ?? event;
+    const cmd = detail?.cmd;
+    if (!shouldHandleDocRefWs(cmd)) {
+        return;
+    }
+    const cmdLower = String(cmd).toLowerCase();
+    const ids = [...collectIdsFromWsPayload(detail?.data)];
+    if (cmdLower.includes("removedoc") && ids.length > 0) {
+        applyBrokenDocRefFast(plugin, ids);
+        return;
+    }
+    if (cmdLower.includes("createdoc")) {
+        handleCreatedocSignal(plugin, detail?.data).catch((error) => {
+            console.warn(`${LOG_PREFIX} handleCreatedocSignal failed`, error);
+        });
+        return;
+    }
+    if (!plugin.docRefWsPending) {
+        plugin.docRefWsPending = { cmds: new Set(), ids: new Set(), rawData: null };
+    }
+    plugin.docRefWsPending.cmds.add(String(cmd));
+    plugin.docRefWsPending.rawData = detail?.data;
+    ids.forEach((id) => plugin.docRefWsPending.ids.add(id));
+    if (plugin.docRefWsTimer) {
+        window.clearTimeout(plugin.docRefWsTimer);
+    }
+    plugin.docRefWsTimer = window.setTimeout(() => {
+        flushDocRefWsUpdate(plugin).catch((error) => {
+            console.warn(`${LOG_PREFIX} flushDocRefWsUpdate failed`, error);
+        });
+    }, 150);
+}
+
+function handleDocRefWsMain(plugin, event) {
+    if (!plugin.config.docRefStyle?.enabled) {
+        return;
+    }
+    scheduleDocRefWsUpdate(plugin, event);
+}
+
+function handleProtyleDocRefStaticLoad(plugin, event) {
+    if (!plugin.config.docRefStyle?.enabled) {
+        return;
+    }
+    const protyle = getProtyleFromEvent(event);
+    if (!protyle?.wysiwyg?.element) {
+        return;
+    }
+    watchDocRefMutations(plugin, protyle);
+    rebuildDocRefCacheAndDecorate(plugin, protyle).catch((error) => {
+        console.warn(`${LOG_PREFIX} rebuildDocRefCacheAndDecorate failed`, error);
+    });
+}
+
+function handleProtyleDocRefDynamicLoad(plugin, event) {
+    if (!plugin.config.docRefStyle?.enabled) {
+        return;
+    }
+    const protyle = getProtyleFromEvent(event);
+    if (!protyle?.wysiwyg?.element) {
+        return;
+    }
+    watchDocRefMutations(plugin, protyle);
+    decorateDynamicRefs(plugin, protyle).catch((error) => {
+        console.warn(`${LOG_PREFIX} decorateDynamicRefs failed`, error);
+    });
+}
+
+function handleProtyleDocRefSwitch(plugin, event) {
+    if (!plugin.config.docRefStyle?.enabled) {
+        return;
+    }
+    const protyle = getProtyleFromEvent(event);
+    if (!protyle?.wysiwyg?.element) {
+        return;
+    }
+    const rootId = getProtyleRootId(protyle);
+    if (plugin.docRefDirtyDocs.has(rootId) || !plugin.docRefByDoc.has(rootId)) {
+        rebuildDocRefCacheAndDecorate(plugin, protyle).catch((error) => {
+            console.warn(`${LOG_PREFIX} rebuildDocRefCacheAndDecorate failed`, error);
+        });
+        return;
+    }
+    reapplyFromDocCache(plugin, protyle);
+}
+
+function handleProtyleDocRefDestroy(plugin, event) {
+    const protyle = getProtyleFromEvent(event);
+    const wysiwyg = protyle?.wysiwyg?.element;
+    if (wysiwyg) {
+        unwatchDocRefMutations(plugin, wysiwyg);
+    }
+    clearDocRefCacheForDoc(plugin, getProtyleRootId(protyle));
+}
+
+function syncDocRefStyleFeature(plugin) {
+    const enabled = plugin.config.docRefStyle?.enabled === true;
+    setDocRefStyleCssEnabled(enabled);
+    if (!enabled) {
+        clearAllDocRefRetries(plugin);
+        unwatchAllDocRefMutations(plugin);
+        undecorateAllDocRefs();
+        plugin.docRefByDoc.clear();
+        plugin.docRefDirtyDocs.clear();
+        plugin.docRefRebuildTimers?.forEach((timer) => window.clearTimeout(timer));
+        plugin.docRefRebuildTimers?.clear();
+        plugin.docRefRestoreTimer?.forEach((timer) => window.clearTimeout(timer));
+        plugin.docRefRestoreTimer?.clear();
+        if (plugin.docRefWsTimer) {
+            window.clearTimeout(plugin.docRefWsTimer);
+            plugin.docRefWsTimer = null;
+        }
+        plugin.docRefWsPending = null;
+        return;
+    }
+    watchAllDocRefEditors(plugin);
+    decorateAllOpenEditors(plugin).catch((error) => {
+        console.warn(`${LOG_PREFIX} decorateAllOpenEditors failed`, error);
+    });
 }
 
 const RE_CJK_CHAR = /[\u4E00-\u9FFF\u3400-\u4DBF\uF900-\uFAFF]/;
@@ -870,24 +1911,12 @@ function getAutoDpi() {
     return getAutoDpiInfo()?.dpi ?? null;
 }
 
-function getEffectiveDpi(imageScale) {
-    if (imageScale?.dpiMode === "manual") {
-        const dpi = Math.round(Number(imageScale.manualDpi));
-        return dpi > 0 ? dpi : null;
-    }
+function getEffectiveDpi() {
     return getAutoDpi();
 }
 
-function canUseImageScale(imageScale) {
-    return getEffectiveDpi(imageScale) !== null;
-}
-
-function getDpiModeDescription(i18n, imageScale) {
-    if (imageScale?.dpiMode === "manual") {
-        const dpi = Math.round(Number(imageScale.manualDpi)) || 0;
-        return i18n.manualDpiActiveLabel.replace("${dpi}", String(dpi > 0 ? dpi : "—"));
-    }
-    return getAutoDpiDescription(i18n);
+function canUseImageScale() {
+    return getEffectiveDpi() !== null;
 }
 
 function getAutoDpiDescription(i18n) {
@@ -1014,7 +2043,7 @@ function refreshAllImagesInProtyle(plugin, protyle) {
     if (!plugin?.config?.imageScale?.enabled || !protyle?.wysiwyg?.element) {
         return;
     }
-    const dpi = getEffectiveDpi(plugin.config.imageScale);
+    const dpi = getEffectiveDpi();
     if (dpi === null) {
         return;
     }
@@ -1424,6 +2453,7 @@ function createDefaultConfig() {
         disabled: {},
         imageScale: createDefaultImageScaleConfig(),
         panguSpacing: createDefaultPanguSpacingConfig(),
+        docRefStyle: createDefaultDocRefStyleConfig(),
     };
 }
 
@@ -1535,31 +2565,52 @@ function patchAllEditors(plugin) {
     scheduleSlashHintHook(plugin);
     watchAllEditorLayouts(plugin);
     syncPanguSpacingWatchers(plugin);
+    if (plugin.config.docRefStyle?.enabled) {
+        watchAllDocRefEditors(plugin);
+        decorateAllOpenEditors(plugin).catch((error) => {
+            console.warn(`${LOG_PREFIX} decorateAllOpenEditors failed`, error);
+        });
+    }
 }
 
 module.exports = class FhelperPlugin extends Plugin {
     slashHandler = null;
     pasteHandler = null;
     pastePanguHandler = null;
-    protyleLoadHandler = null;
+    protyleStaticLoadHandler = null;
+    protyleDynamicLoadHandler = null;
+    protyleDestroyHandler = null;
+    protyleSwitchHandler = null;
     bazaarObserver = null;
     topBarEntry = null;
+    settingDialog = null;
+    settingRoot = null;
+    slashSearchEl = null;
+    slashListEl = null;
+    slashEmptyEl = null;
     config = createDefaultConfig();
     slashCatalog = new Map();
     settingToggleEls = new Map();
     imageScaleEnableEl = null;
-    imageDpiManualModeEl = null;
-    imageManualDpiEl = null;
     imageScaleCenterEl = null;
     panguSpacingEnableEl = null;
+    docRefStyleEnableEl = null;
     protyleLayoutWatchers = new Map();
     panguSpacingWatchers = new Map();
+    docRefByDoc = new Map();
+    docRefDirtyDocs = new Set();
+    docRefRebuildTimers = null;
+    docRefRestoreTimer = null;
+    docRefObservers = new Map();
+    docRefRetryTimers = null;
+    docRefWsHandler = null;
+    docRefWsTimer = null;
+    docRefWsPending = null;
     layoutRefreshTimer = null;
     windowResizeHandler = null;
 
     onload() {
         this.data[STORAGE_NAME] = createDefaultConfig();
-        this.initSettingPanel();
 
         this.addCommand({
             langKey: "openFhelperSetting",
@@ -1570,6 +2621,7 @@ module.exports = class FhelperPlugin extends Plugin {
         });
 
         this.loadSlashConfig();
+        this.ensureSettingStyles();
 
         this.refreshSlashCatalog();
         scheduleSlashHintHook(this);
@@ -1608,9 +2660,27 @@ module.exports = class FhelperPlugin extends Plugin {
         };
         this.eventBus.on("paste", this.pastePanguHandler);
 
-        this.protyleLoadHandler = () => patchAllEditors(this);
-        this.eventBus.on("loaded-protyle-dynamic", this.protyleLoadHandler);
-        this.eventBus.on("loaded-protyle-static", this.protyleLoadHandler);
+        this.protyleStaticLoadHandler = (event) => {
+            patchAllEditors(this);
+            handleProtyleDocRefStaticLoad(this, event);
+        };
+        this.eventBus.on("loaded-protyle-static", this.protyleStaticLoadHandler);
+
+        this.protyleDynamicLoadHandler = (event) => {
+            handleProtyleDocRefDynamicLoad(this, event);
+        };
+        this.eventBus.on("loaded-protyle-dynamic", this.protyleDynamicLoadHandler);
+
+        this.protyleDestroyHandler = (event) => handleProtyleDocRefDestroy(this, event);
+        this.eventBus.on("destroy-protyle", this.protyleDestroyHandler);
+
+        this.protyleSwitchHandler = (event) => handleProtyleDocRefSwitch(this, event);
+        this.eventBus.on("switch-protyle", this.protyleSwitchHandler);
+
+        this.docRefWsHandler = (event) => {
+            handleDocRefWsMain(this, event);
+        };
+        this.eventBus.on("ws-main", this.docRefWsHandler);
 
         this.windowResizeHandler = () => {
             if (!this.config.imageScale?.enabled) {
@@ -1630,6 +2700,7 @@ module.exports = class FhelperPlugin extends Plugin {
         this.registerTopBarEntry();
         this.ensureBazaarSettingButton();
         this.scheduleBazaarSettingButtonFix();
+        syncDocRefStyleFeature(this);
     }
 
     onunload() {
@@ -1650,10 +2721,25 @@ module.exports = class FhelperPlugin extends Plugin {
             this.eventBus.off("paste", this.pastePanguHandler);
             this.pastePanguHandler = null;
         }
-        if (this.protyleLoadHandler) {
-            this.eventBus.off("loaded-protyle-dynamic", this.protyleLoadHandler);
-            this.eventBus.off("loaded-protyle-static", this.protyleLoadHandler);
-            this.protyleLoadHandler = null;
+        if (this.protyleStaticLoadHandler) {
+            this.eventBus.off("loaded-protyle-static", this.protyleStaticLoadHandler);
+            this.protyleStaticLoadHandler = null;
+        }
+        if (this.protyleDynamicLoadHandler) {
+            this.eventBus.off("loaded-protyle-dynamic", this.protyleDynamicLoadHandler);
+            this.protyleDynamicLoadHandler = null;
+        }
+        if (this.protyleDestroyHandler) {
+            this.eventBus.off("destroy-protyle", this.protyleDestroyHandler);
+            this.protyleDestroyHandler = null;
+        }
+        if (this.protyleSwitchHandler) {
+            this.eventBus.off("switch-protyle", this.protyleSwitchHandler);
+            this.protyleSwitchHandler = null;
+        }
+        if (this.docRefWsHandler) {
+            this.eventBus.off("ws-main", this.docRefWsHandler);
+            this.docRefWsHandler = null;
         }
         if (this.windowResizeHandler) {
             window.removeEventListener("resize", this.windowResizeHandler);
@@ -1661,7 +2747,13 @@ module.exports = class FhelperPlugin extends Plugin {
         }
         unwatchAllProtyleLayouts(this);
         unwatchAllPanguSpacing(this);
+        clearAllDocRefRetries(this);
+        this.config.docRefStyle = { enabled: false };
+        syncDocRefStyleFeature(this);
         setImageCenterCssEnabled(false);
+        this.settingDialog?.destroy();
+        this.settingDialog = null;
+        document.getElementById(SETTING_STYLE_ID)?.remove();
     }
 
     uninstall() {
@@ -1715,10 +2807,15 @@ module.exports = class FhelperPlugin extends Plugin {
                     ...createDefaultPanguSpacingConfig(),
                     ...(data.panguSpacing || {}),
                 },
+                docRefStyle: {
+                    ...createDefaultDocRefStyleConfig(),
+                    ...(data.docRefStyle || {}),
+                },
             };
             this.data[STORAGE_NAME] = this.config;
             this.applyImageCenterStyle();
             syncPanguSpacingWatchers(this);
+            syncDocRefStyleFeature(this);
             if (this.config.imageScale?.enabled) {
                 scheduleLayoutRefresh(this);
             }
@@ -1733,7 +2830,10 @@ module.exports = class FhelperPlugin extends Plugin {
         return this.loadData(STORAGE_NAME).then((data) => {
             const hasNewConfig = data
                 && typeof data === "object"
-                && (Object.keys(data.disabled || {}).length > 0 || data.imageScale || data.panguSpacing);
+                && (Object.keys(data.disabled || {}).length > 0
+                    || data.imageScale
+                    || data.panguSpacing
+                    || data.docRefStyle);
             if (hasNewConfig) {
                 this.applyConfig(data);
                 return;
@@ -1748,7 +2848,8 @@ module.exports = class FhelperPlugin extends Plugin {
                         this.applyConfig(legacyData);
                         const shouldMigrate = Object.keys(legacyData.disabled || {}).length > 0
                             || legacyData.imageScale
-                            || legacyData.panguSpacing;
+                            || legacyData.panguSpacing
+                            || legacyData.docRefStyle;
                         if (shouldMigrate) {
                             return this.saveData(STORAGE_NAME, this.config).then(() => {
                                 return this.removeData(LEGACY_STORAGE_NAMES[index]);
@@ -1786,22 +2887,10 @@ module.exports = class FhelperPlugin extends Plugin {
             disabled,
             imageScale: { ...(this.config.imageScale || createDefaultImageScaleConfig()) },
             panguSpacing: { ...(this.config.panguSpacing || createDefaultPanguSpacingConfig()) },
+            docRefStyle: { ...(this.config.docRefStyle || createDefaultDocRefStyleConfig()) },
         };
-        this.settingToggleEls.forEach((input, key) => {
+        this.settingToggleEls.forEach((input) => {
             input.checked = enabled;
-        });
-    }
-
-    initSettingPanel() {
-        this.setting = new Setting({
-            height: "80vh",
-            width: "768px",
-            confirmCallback: () => {
-                this.saveConfig().catch((error) => {
-                    console.warn("[fhelper] saveData failed", error);
-                    showMessage(this.i18n.saveFailed);
-                });
-            },
         });
     }
 
@@ -1828,7 +2917,7 @@ module.exports = class FhelperPlugin extends Plugin {
                 }
                 card.querySelector('[data-type="setting"]')?.classList.remove("fn__none");
             } catch (error) {
-                console.warn("[fhelper] ensureBazaarSettingButton failed", error);
+                console.warn(`${LOG_PREFIX} ensureBazaarSettingButton failed`, error);
             }
         });
     }
@@ -1866,31 +2955,17 @@ module.exports = class FhelperPlugin extends Plugin {
         if (this.imageScaleCenterEl) {
             this.config.imageScale.center = this.imageScaleCenterEl.checked;
         }
-        if (this.imageDpiManualModeEl) {
-            this.config.imageScale.dpiMode = this.imageDpiManualModeEl.checked ? "manual" : "auto";
-        }
-        if (this.imageManualDpiEl) {
-            this.config.imageScale.manualDpi = Math.max(1, Number(this.imageManualDpiEl.value) || SCREEN_DPI);
-        }
         if (this.panguSpacingEnableEl) {
             this.config.panguSpacing.enabled = this.panguSpacingEnableEl.checked;
+        }
+        if (this.docRefStyleEnableEl) {
+            this.config.docRefStyle.enabled = this.docRefStyleEnableEl.checked;
         }
     }
 
     updateImageScaleControlState() {
-        const imageScale = this.config.imageScale || createDefaultImageScaleConfig();
-        if (this.imageDpiManualModeEl) {
-            imageScale.dpiMode = this.imageDpiManualModeEl.checked ? "manual" : "auto";
-        }
-        if (this.imageManualDpiEl) {
-            imageScale.manualDpi = Math.max(1, Number(this.imageManualDpiEl.value) || SCREEN_DPI);
-        }
-        const available = canUseImageScale(imageScale);
         if (this.imageScaleEnableEl) {
-            this.imageScaleEnableEl.disabled = !available;
-        }
-        if (this.imageManualDpiEl) {
-            this.imageManualDpiEl.disabled = imageScale.dpiMode !== "manual";
+            this.imageScaleEnableEl.disabled = !canUseImageScale();
         }
     }
 
@@ -1898,172 +2973,466 @@ module.exports = class FhelperPlugin extends Plugin {
         this.syncSettingFormToConfig();
         this.applyImageCenterStyle();
         syncPanguSpacingWatchers(this);
+        syncDocRefStyleFeature(this);
         this.data[STORAGE_NAME] = this.config;
         scheduleLayoutRefresh(this);
         return this.saveData(STORAGE_NAME, this.config);
     }
 
-    buildSettingItems() {
-        this.settingToggleEls.clear();
-        this.imageScaleEnableEl = null;
-        this.imageDpiManualModeEl = null;
-        this.imageManualDpiEl = null;
-        this.imageScaleCenterEl = null;
-        this.panguSpacingEnableEl = null;
+    createSettingSwitch(checked, disabled = false) {
+        const input = document.createElement("input");
+        input.className = "b3-switch fn__flex-center";
+        input.type = "checkbox";
+        input.checked = checked;
+        input.disabled = disabled;
+        return input;
+    }
+
+    createSettingRow({ title, description = "", control = null }) {
+        const row = document.createElement("div");
+        row.className = "fhelper-setting__row";
+        const text = document.createElement("div");
+        text.className = "fhelper-setting__text";
+        const titleEl = document.createElement("div");
+        titleEl.className = "fhelper-setting__title";
+        titleEl.textContent = title;
+        text.appendChild(titleEl);
+        if (description) {
+            const descEl = document.createElement("div");
+            descEl.className = "fhelper-setting__desc";
+            descEl.textContent = description;
+            text.appendChild(descEl);
+        }
+        row.appendChild(text);
+        if (control) {
+            const action = document.createElement("div");
+            action.className = "fhelper-setting__action";
+            action.appendChild(control);
+            row.appendChild(action);
+        }
+        return row;
+    }
+
+    createSettingSection(title) {
+        const section = document.createElement("div");
+        section.className = "fhelper-setting__section";
+        const heading = document.createElement("div");
+        heading.className = "fhelper-setting__section-title";
+        heading.textContent = title;
+        section.appendChild(heading);
+        return section;
+    }
+
+    buildGeneralTab() {
+        const panel = document.createElement("div");
+        panel.className = "fhelper-setting__panel";
+        panel.dataset.tab = "general";
+
         const imageScale = this.config.imageScale || createDefaultImageScaleConfig();
         const panguSpacing = this.config.panguSpacing || createDefaultPanguSpacingConfig();
-        const dpiAvailable = canUseImageScale(imageScale);
+        const docRefStyle = this.config.docRefStyle || createDefaultDocRefStyleConfig();
+        const dpiAvailable = canUseImageScale();
 
-        this.setting.addItem({
+        const imageSection = this.createSettingSection(this.i18n.sectionImage);
+        this.imageScaleEnableEl = this.createSettingSwitch(imageScale.enabled === true, !dpiAvailable);
+        imageSection.appendChild(this.createSettingRow({
+            title: this.i18n.imageScaleEnable,
+            description: `${this.i18n.imageScaleEnableDesc}\n${getAutoDpiDescription(this.i18n)}`,
+            control: this.imageScaleEnableEl,
+        }));
+
+        this.imageScaleCenterEl = this.createSettingSwitch(imageScale.center === true);
+        imageSection.appendChild(this.createSettingRow({
+            title: this.i18n.imageScaleCenter,
+            description: this.i18n.imageScaleCenterDesc,
+            control: this.imageScaleCenterEl,
+        }));
+        panel.appendChild(imageSection);
+
+        const panguSection = this.createSettingSection(this.i18n.sectionPangu);
+        this.panguSpacingEnableEl = this.createSettingSwitch(panguSpacing.enabled === true);
+        panguSection.appendChild(this.createSettingRow({
+            title: this.i18n.panguSpacingEnable,
+            description: this.i18n.panguSpacingEnableDesc,
+            control: this.panguSpacingEnableEl,
+        }));
+        this.docRefStyleEnableEl = this.createSettingSwitch(docRefStyle.enabled === true);
+        panguSection.appendChild(this.createSettingRow({
+            title: this.i18n.docRefStyleEnable,
+            description: this.i18n.docRefStyleEnableDesc,
+            control: this.docRefStyleEnableEl,
+        }));
+        panel.appendChild(panguSection);
+
+        const aboutSection = this.createSettingSection(this.i18n.sectionAbout);
+        aboutSection.appendChild(this.createSettingRow({
             title: this.i18n.configPathLabel,
             description: this.getStoragePathDisplay(),
-        });
-        this.setting.addItem({
-            title: this.i18n.imageScaleEnable,
-            direction: "row",
-            description: this.i18n.imageScaleEnableDesc,
-            createActionElement: () => {
-                const input = document.createElement("input");
-                input.className = "b3-switch";
-                input.type = "checkbox";
-                input.checked = imageScale.enabled === true;
-                input.disabled = !dpiAvailable;
-                this.imageScaleEnableEl = input;
-                return input;
-            },
-        });
-        this.setting.addItem({
-            title: this.i18n.dpiManualMode,
-            direction: "row",
-            description: getDpiModeDescription(this.i18n, imageScale),
-            createActionElement: () => {
-                const input = document.createElement("input");
-                input.className = "b3-switch";
-                input.type = "checkbox";
-                input.checked = imageScale.dpiMode === "manual";
-                input.disabled = imageScale.dpiMode !== "manual" && getAutoDpi() === null;
-                input.addEventListener("change", () => this.updateImageScaleControlState());
-                this.imageDpiManualModeEl = input;
-                return input;
-            },
-        });
-        this.setting.addItem({
-            title: this.i18n.manualDpi,
-            direction: "row",
-            description: this.i18n.manualDpiDesc,
-            createActionElement: () => {
-                const input = document.createElement("input");
-                input.className = "b3-text-field fn__flex-center fn__size200";
-                input.type = "number";
-                input.min = "1";
-                input.max = "1200";
-                input.step = "1";
-                input.value = String(imageScale.manualDpi || 144);
-                input.disabled = imageScale.dpiMode !== "manual";
-                input.addEventListener("input", () => this.updateImageScaleControlState());
-                this.imageManualDpiEl = input;
-                return input;
-            },
-        });
-        this.setting.addItem({
-            title: this.i18n.imageScaleCenter,
-            direction: "row",
-            description: this.i18n.imageScaleCenterDesc,
-            createActionElement: () => {
-                const input = document.createElement("input");
-                input.className = "b3-switch";
-                input.type = "checkbox";
-                input.checked = imageScale.center === true;
-                this.imageScaleCenterEl = input;
-                return input;
-            },
-        });
-        this.setting.addItem({
-            title: this.i18n.panguSpacingEnable,
-            direction: "row",
-            description: this.i18n.panguSpacingEnableDesc,
-            createActionElement: () => {
-                const input = document.createElement("input");
-                input.className = "b3-switch";
-                input.type = "checkbox";
-                input.checked = panguSpacing.enabled === true;
-                this.panguSpacingEnableEl = input;
-                return input;
-            },
-        });
-        this.setting.addItem({
-            title: this.i18n.settingHint,
-            description: "",
-        });
+        }));
+        panel.appendChild(aboutSection);
 
-        const enableAllBtn = document.createElement("button");
-        enableAllBtn.className = "b3-button b3-button--outline fn__flex-center fn__size200";
-        enableAllBtn.textContent = this.i18n.enableAll;
-        enableAllBtn.addEventListener("click", () => this.setAllSlashItemsEnabled(true));
+        return panel;
+    }
 
-        const disableAllBtn = document.createElement("button");
-        disableAllBtn.className = "b3-button b3-button--outline fn__flex-center fn__size200";
-        disableAllBtn.textContent = this.i18n.disableAll;
-        disableAllBtn.addEventListener("click", () => this.setAllSlashItemsEnabled(false));
-
-        this.setting.addItem({
-            title: "",
-            direction: "row",
-            actionElement: enableAllBtn,
-        });
-        this.setting.addItem({
-            title: "",
-            direction: "row",
-            actionElement: disableAllBtn,
-        });
-
-        const entries = [...this.slashCatalog.values()].sort((a, b) => {
+    getSortedSlashEntries() {
+        return [...this.slashCatalog.values()].sort((a, b) => {
             if (a.order !== b.order) {
                 return a.order - b.order;
             }
             return a.label.localeCompare(b.label, "zh-CN");
         });
+    }
 
+    filterSlashList(keyword = "") {
+        const query = String(keyword || "").trim().toLowerCase();
+        let visibleCount = 0;
+        this.slashListEl?.querySelectorAll("[data-slash-item]").forEach((row) => {
+            const haystack = row.dataset.searchText || "";
+            const matched = !query || haystack.includes(query);
+            row.classList.toggle("fn__none", !matched);
+            if (matched) {
+                visibleCount += 1;
+            }
+        });
+        this.slashListEl?.querySelectorAll("[data-slash-group]").forEach((group) => {
+            const hasVisible = [...group.querySelectorAll("[data-slash-item]")]
+                .some((row) => !row.classList.contains("fn__none"));
+            group.classList.toggle("fn__none", !hasVisible);
+        });
+        if (this.slashEmptyEl) {
+            this.slashEmptyEl.classList.toggle("fn__none", visibleCount > 0 || this.slashCatalog.size === 0);
+            if (this.slashCatalog.size > 0) {
+                this.slashEmptyEl.textContent = this.i18n.settingEmptySearch;
+            }
+        }
+    }
+
+    buildSlashTab() {
+        const panel = document.createElement("div");
+        panel.className = "fhelper-setting__panel fn__none";
+        panel.dataset.tab = "slash";
+
+        const toolbar = document.createElement("div");
+        toolbar.className = "fhelper-setting__toolbar";
+
+        const search = document.createElement("input");
+        search.className = "b3-text-field fhelper-setting__search";
+        search.type = "search";
+        search.placeholder = this.i18n.slashSearchPlaceholder;
+        search.addEventListener("input", () => this.filterSlashList(search.value));
+        this.slashSearchEl = search;
+        toolbar.appendChild(search);
+
+        const actions = document.createElement("div");
+        actions.className = "fhelper-setting__toolbar-actions";
+
+        const enableAllBtn = document.createElement("button");
+        enableAllBtn.className = "b3-button b3-button--outline";
+        enableAllBtn.textContent = this.i18n.enableAll;
+        enableAllBtn.addEventListener("click", () => this.setAllSlashItemsEnabled(true));
+
+        const disableAllBtn = document.createElement("button");
+        disableAllBtn.className = "b3-button b3-button--outline";
+        disableAllBtn.textContent = this.i18n.disableAll;
+        disableAllBtn.addEventListener("click", () => this.setAllSlashItemsEnabled(false));
+
+        actions.appendChild(enableAllBtn);
+        actions.appendChild(disableAllBtn);
+        toolbar.appendChild(actions);
+        panel.appendChild(toolbar);
+
+        const hint = document.createElement("div");
+        hint.className = "fhelper-setting__hint";
+        hint.textContent = this.i18n.settingHint;
+        panel.appendChild(hint);
+
+        const list = document.createElement("div");
+        list.className = "fhelper-setting__list";
+        this.slashListEl = list;
+
+        const empty = document.createElement("div");
+        empty.className = "fhelper-setting__empty";
+        empty.textContent = this.i18n.settingEmpty;
+        this.slashEmptyEl = empty;
+
+        const entries = this.getSortedSlashEntries();
         if (entries.length === 0) {
-            this.setting.addItem({
-                title: this.i18n.settingEmpty,
-            });
-            return;
+            empty.classList.remove("fn__none");
+            list.appendChild(empty);
+            panel.appendChild(list);
+            return panel;
         }
 
+        empty.classList.add("fn__none");
+        list.appendChild(empty);
+
         let currentGroup = null;
+        let groupEl = null;
         for (const entry of entries) {
             const displayGroup = entry.group === "内置" ? this.i18n.groupBuiltin : entry.group;
             if (displayGroup !== currentGroup) {
                 currentGroup = displayGroup;
-                this.setting.addItem({
-                    title: currentGroup,
-                    description: "",
-                });
+                groupEl = document.createElement("div");
+                groupEl.className = "fhelper-setting__group";
+                groupEl.dataset.slashGroup = displayGroup;
+                const groupTitle = document.createElement("div");
+                groupTitle.className = "fhelper-setting__group-title";
+                groupTitle.textContent = displayGroup;
+                groupEl.appendChild(groupTitle);
+                list.appendChild(groupEl);
             }
             const key = entry.key;
-            this.setting.addItem({
+            const switchEl = this.createSettingSwitch(this.isSlashItemEnabled(key));
+            this.settingToggleEls.set(key, switchEl);
+            const row = this.createSettingRow({
                 title: entry.label,
-                direction: "row",
                 description: entry.filterText
                     ? `${this.i18n.filterKeywords}: ${entry.filterText}`
                     : "",
-                createActionElement: () => {
-                    const input = document.createElement("input");
-                    input.className = "b3-switch";
-                    input.type = "checkbox";
-                    input.checked = this.isSlashItemEnabled(key);
-                    this.settingToggleEls.set(key, input);
-                    return input;
-                },
+                control: switchEl,
             });
+            row.dataset.slashItem = key;
+            row.dataset.searchText = `${entry.label} ${entry.filterText || ""} ${displayGroup}`.toLowerCase();
+            groupEl.appendChild(row);
         }
+
+        panel.appendChild(list);
+        return panel;
+    }
+
+    ensureSettingStyles() {
+        if (document.getElementById(SETTING_STYLE_ID)) {
+            return;
+        }
+        const style = document.createElement("style");
+        style.id = SETTING_STYLE_ID;
+        style.textContent = `
+.fhelper-setting {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    min-height: 0;
+}
+.fhelper-setting__tabs {
+    display: flex;
+    gap: 4px;
+    padding: 12px 16px 0;
+    border-bottom: 1px solid var(--b3-border-color);
+}
+.fhelper-setting__tab {
+    appearance: none;
+    border: 0;
+    background: transparent;
+    color: var(--b3-theme-on-surface);
+    padding: 8px 14px;
+    border-radius: 8px 8px 0 0;
+    cursor: pointer;
+    font-size: 14px;
+    opacity: 0.72;
+}
+.fhelper-setting__tab:hover {
+    opacity: 1;
+    background: var(--b3-list-hover);
+}
+.fhelper-setting__tab.is-active {
+    opacity: 1;
+    color: var(--b3-theme-primary);
+    box-shadow: inset 0 -2px 0 var(--b3-theme-primary);
+}
+.fhelper-setting__body {
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+    padding: 12px 16px 8px;
+}
+.fhelper-setting__panel {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+.fhelper-setting__section,
+.fhelper-setting__group {
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+    border: 1px solid var(--b3-border-color);
+    border-radius: 10px;
+    overflow: hidden;
+    background: var(--b3-theme-surface);
+}
+.fhelper-setting__section-title,
+.fhelper-setting__group-title {
+    padding: 10px 14px;
+    font-weight: 600;
+    font-size: 13px;
+    color: var(--b3-theme-on-surface);
+    background: var(--b3-theme-background);
+    border-bottom: 1px solid var(--b3-border-color);
+}
+.fhelper-setting__row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 12px 14px;
+}
+.fhelper-setting__row + .fhelper-setting__row {
+    border-top: 1px solid var(--b3-border-color);
+}
+.fhelper-setting__text {
+    min-width: 0;
+    flex: 1;
+}
+.fhelper-setting__title {
+    font-size: 14px;
+    color: var(--b3-theme-on-background);
+    line-height: 1.4;
+}
+.fhelper-setting__desc {
+    margin-top: 4px;
+    font-size: 12px;
+    color: var(--b3-theme-on-surface);
+    opacity: 0.8;
+    line-height: 1.45;
+    word-break: break-word;
+}
+.fhelper-setting__action {
+    flex-shrink: 0;
+}
+.fhelper-setting__toolbar {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    flex-wrap: wrap;
+}
+.fhelper-setting__search {
+    flex: 1;
+    min-width: 180px;
+}
+.fhelper-setting__toolbar-actions {
+    display: flex;
+    gap: 8px;
+    flex-shrink: 0;
+}
+.fhelper-setting__hint {
+    font-size: 12px;
+    color: var(--b3-theme-on-surface);
+    opacity: 0.8;
+}
+.fhelper-setting__list {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+.fhelper-setting__empty {
+    padding: 28px 12px;
+    text-align: center;
+    color: var(--b3-theme-on-surface);
+    opacity: 0.7;
+}
+.fhelper-setting__footer {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    padding: 12px 16px;
+    border-top: 1px solid var(--b3-border-color);
+}
+`;
+        document.head.appendChild(style);
+    }
+
+    switchSettingTab(tabName) {
+        this.settingRoot?.querySelectorAll("[data-tab-btn]").forEach((btn) => {
+            btn.classList.toggle("is-active", btn.dataset.tabBtn === tabName);
+        });
+        this.settingRoot?.querySelectorAll("[data-tab]").forEach((panel) => {
+            panel.classList.toggle("fn__none", panel.dataset.tab !== tabName);
+        });
+        if (tabName === "slash") {
+            this.slashSearchEl?.focus();
+        }
+    }
+
+    buildSettingDialogContent() {
+        this.settingToggleEls.clear();
+        this.imageScaleEnableEl = null;
+        this.imageScaleCenterEl = null;
+        this.panguSpacingEnableEl = null;
+        this.docRefStyleEnableEl = null;
+        this.slashSearchEl = null;
+        this.slashListEl = null;
+        this.slashEmptyEl = null;
+
+        const root = document.createElement("div");
+        root.className = "fhelper-setting";
+        this.settingRoot = root;
+
+        const tabs = document.createElement("div");
+        tabs.className = "fhelper-setting__tabs";
+        [
+            { id: "general", label: this.i18n.tabGeneral },
+            { id: "slash", label: this.i18n.tabSlash },
+        ].forEach(({ id, label }, index) => {
+            const btn = document.createElement("button");
+            btn.type = "button";
+            btn.className = `fhelper-setting__tab${index === 0 ? " is-active" : ""}`;
+            btn.dataset.tabBtn = id;
+            btn.textContent = label;
+            btn.addEventListener("click", () => this.switchSettingTab(id));
+            tabs.appendChild(btn);
+        });
+        root.appendChild(tabs);
+
+        const body = document.createElement("div");
+        body.className = "fhelper-setting__body";
+        body.appendChild(this.buildGeneralTab());
+        body.appendChild(this.buildSlashTab());
+        root.appendChild(body);
+
+        const footer = document.createElement("div");
+        footer.className = "fhelper-setting__footer";
+        const cancelBtn = document.createElement("button");
+        cancelBtn.className = "b3-button b3-button--cancel";
+        cancelBtn.textContent = this.i18n.cancel;
+        cancelBtn.addEventListener("click", () => this.settingDialog?.destroy());
+        const confirmBtn = document.createElement("button");
+        confirmBtn.className = "b3-button b3-button--text";
+        confirmBtn.textContent = this.i18n.confirm;
+        confirmBtn.addEventListener("click", () => {
+            this.saveConfig().then(() => {
+                this.settingDialog?.destroy();
+            }).catch((error) => {
+                console.warn(`${LOG_PREFIX} saveData failed`, error);
+                showMessage(this.i18n.saveFailed);
+            });
+        });
+        footer.appendChild(cancelBtn);
+        footer.appendChild(confirmBtn);
+        root.appendChild(footer);
+
+        return root;
     }
 
     openSetting() {
         this.refreshSlashCatalog();
-        this.initSettingPanel();
-        this.buildSettingItems();
-        this.setting.open(this.displayName);
+        this.ensureSettingStyles();
+        if (this.settingDialog) {
+            this.settingDialog.destroy();
+            this.settingDialog = null;
+        }
+        const content = this.buildSettingDialogContent();
+        this.settingDialog = new Dialog({
+            title: this.i18n.topBarTitle,
+            content: `<div class="fhelper-setting-mount" style="height:100%;"></div>`,
+            width: "780px",
+            height: "80vh",
+            destroyCallback: () => {
+                this.settingDialog = null;
+                this.settingRoot = null;
+            },
+        });
+        const mount = this.settingDialog.element.querySelector(".fhelper-setting-mount");
+        mount?.appendChild(content);
+        this.switchSettingTab("general");
     }
 };

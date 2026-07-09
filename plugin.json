@@ -1,7 +1,7 @@
 {
   "name": "fhelper",
   "author": "fyuan",
-  "version": "1.5.1",
+  "version": "1.8.2",
   "minAppVersion": "3.1.27",
   "backends": ["all"],
   "frontends": ["all"],
@@ -11,9 +11,9 @@
     "zh_CN": "fhelper"
   },
   "description": {
-    "default": "Slash menu filter, image DPI scale, and CJK-Latin auto spacing",
-    "zh_CN": "斜杠菜单过滤、图片 DPI 缩放、中英文自动空格"
+    "default": "Slash menu filter, image DPI scale, CJK-Latin spacing, and document ref styling",
+    "zh_CN": "斜杠菜单过滤、图片 DPI 缩放、中英文自动空格、文档引用美化"
   },
-  "keywords": ["fhelper", "slash", "filter", "pangu", "斜杠", "过滤", "空格"],
+  "keywords": ["fhelper", "slash", "filter", "pangu", "doc-ref", "斜杠", "过滤", "空格", "引用"],
   "i18n": ["zh_CN", "en_US"]
 }
