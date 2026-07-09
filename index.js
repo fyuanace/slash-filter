@@ -40,7 +40,6 @@ ${docRefScopeSelector(`span[data-type~="block-ref"].${DOC_REF_CLASS}`)} {
     text-decoration: underline;
     text-underline-offset: 0.18em;
     cursor: pointer;
-    font-weight: bold;
 }
 ${docRefScopeSelector(`span[data-type~="block-ref"].${DOC_REF_BROKEN_CLASS}`)} {
     text-decoration: line-through;
