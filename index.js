@@ -1993,9 +1993,16 @@ const PANGU_LOOKBACK_CHARS = 120;
 const PANGU_IME_LOOKBACK_CHARS = 200;
 const PANGU_PASTE_RADIUS_CHARS = 400;
 
+function isInsideImageLikeInline(node) {
+    return !!node?.parentElement?.closest?.('.img, [data-type~="img"]');
+}
+
 const PANGU_TEXT_WALKER_FILTER = {
     acceptNode(node) {
-        return isInsideBlockCode(node) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;
+        if (isInsideBlockCode(node) || isInsideImageLikeInline(node)) {
+            return NodeFilter.FILTER_REJECT;
+        }
+        return NodeFilter.FILTER_ACCEPT;
     },
 };
 
@@ -2268,6 +2275,44 @@ function processPanguSpacingInRoot(root, range = null) {
     applyPanguInsertionActions(actions, null, null);
 }
 
+function shouldKeepPanguHtmlRootOuter(el) {
+    if (!el || el.nodeType !== Node.ELEMENT_NODE) {
+        return false;
+    }
+    if (el.hasAttribute("data-node-id")) {
+        return true;
+    }
+    const tag = el.tagName;
+    if (tag === "IMG" || tag === "BR" || tag === "HR" || tag === "INPUT" || tag === "VIDEO" || tag === "AUDIO" || tag === "IFRAME") {
+        return true;
+    }
+    const dataType = el.getAttribute("data-type") || "";
+    if (dataType.includes("img") || el.classList?.contains("img")) {
+        return true;
+    }
+    return false;
+}
+
+function serializePanguHtmlContainer(container, originalHtml) {
+    if (container.childNodes.length === 1 && container.firstElementChild) {
+        const el = container.firstElementChild;
+        // Keep block roots / void media nodes; unwrapping them breaks image paste.
+        if (shouldKeepPanguHtmlRootOuter(el)) {
+            return el.outerHTML;
+        }
+        return el.innerHTML;
+    }
+    let result = "";
+    container.childNodes.forEach((node) => {
+        if (node.nodeType === Node.ELEMENT_NODE) {
+            result += node.outerHTML;
+        } else if (node.nodeType === Node.TEXT_NODE) {
+            result += node.textContent;
+        }
+    });
+    return result || originalHtml;
+}
+
 function addPanguSpacingToHtml(html) {
     if (!html || !html.trim()) {
         return html;
@@ -2281,30 +2326,64 @@ function addPanguSpacingToHtml(html) {
     } else {
         processPanguSpacingInRoot(container);
     }
-    if (container.childNodes.length === 1 && container.firstElementChild) {
-        return container.firstElementChild.innerHTML;
+    return serializePanguHtmlContainer(container, html);
+}
+
+function isBinaryClipboardPaste(detail) {
+    if (!detail) {
+        return false;
     }
-    let result = "";
-    container.childNodes.forEach((node) => {
-        if (node.nodeType === Node.ELEMENT_NODE) {
-            result += node.outerHTML;
-        } else if (node.nodeType === Node.TEXT_NODE) {
-            result += node.textContent;
-        }
-    });
-    return result || html;
+    if (detail.files && detail.files.length > 0) {
+        return true;
+    }
+    if (detail.localFiles && detail.localFiles.length > 0) {
+        return true;
+    }
+    return false;
+}
+
+function clipboardHtmlContainsImage(html) {
+    if (typeof html !== "string" || html === "") {
+        return false;
+    }
+    // Native <img>, SiYuan span.img / data-type=img (internal multi-block copy).
+    return /<img\b/i.test(html)
+        || /data-type=["'][^"']*\bimg\b/i.test(html)
+        || /class=["'][^"']*\bimg\b/i.test(html);
+}
+
+function shouldSkipPanguPasteRewrite(detail) {
+    // Any image-bearing paste must keep SiYuan's native path (files upload or siyuanHTML blocks).
+    // Rewriting HTML here can drop images when text blocks are copied together with images.
+    if (isBinaryClipboardPaste(detail)) {
+        return true;
+    }
+    return clipboardHtmlContainsImage(detail?.siyuanHTML)
+        || clipboardHtmlContainsImage(detail?.textHTML);
 }
 
 function buildPanguPastePayload(detail) {
+    if (shouldSkipPanguPasteRewrite(detail)) {
+        return {};
+    }
     const payload = {};
     if (typeof detail.siyuanHTML === "string" && detail.siyuanHTML !== "") {
-        payload.siyuanHTML = addPanguSpacingToHtml(detail.siyuanHTML);
+        const next = addPanguSpacingToHtml(detail.siyuanHTML);
+        if (next && next !== detail.siyuanHTML) {
+            payload.siyuanHTML = next;
+        }
     }
     if (typeof detail.textPlain === "string" && detail.textPlain !== "") {
-        payload.textPlain = addPanguSpacingToMarkdownAware(detail.textPlain);
+        const next = addPanguSpacingToMarkdownAware(detail.textPlain);
+        if (next && next !== detail.textPlain) {
+            payload.textPlain = next;
+        }
     }
     if (typeof detail.textHTML === "string" && detail.textHTML !== "") {
-        payload.textHTML = addPanguSpacingToHtml(detail.textHTML);
+        const next = addPanguSpacingToHtml(detail.textHTML);
+        if (next && next !== detail.textHTML) {
+            payload.textHTML = next;
+        }
     }
     return payload;
 }
