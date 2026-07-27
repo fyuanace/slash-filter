@@ -1916,11 +1916,133 @@ async function handleGatherReferencedDocsForProtyle(plugin, protyle) {
     }
 }
 
+async function queryReferencedDocIds(rootId) {
+    const ids = new Set();
+    if (!rootId) {
+        return ids;
+    }
+    const stmt = `
+SELECT DISTINCT
+  CASE WHEN b.type = 'd' THEN b.id ELSE b.root_id END AS id
+FROM refs r
+JOIN blocks b ON b.id = r.def_block_id
+WHERE r.root_id = '${escapeSqlId(rootId)}'
+`.replace(/\s+/g, " ").trim();
+    try {
+        const rows = await runSqlQuery(stmt);
+        (rows || []).forEach((row) => {
+            if (row?.id) {
+                ids.add(row.id);
+            }
+        });
+    } catch (error) {
+        console.warn(`${LOG_PREFIX} queryReferencedDocIds failed`, error);
+    }
+    return ids;
+}
+
+async function queryUnreferencedChildDocs(parentId) {
+    if (!parentId) {
+        return [];
+    }
+    const { children } = await queryDirectChildDocs(parentId, createDefaultChildDocIndexConfig());
+    if (!children.length) {
+        return [];
+    }
+    const referenced = await queryReferencedDocIds(parentId);
+    return children.filter((child) => child?.id && !referenced.has(child.id));
+}
+
+async function removeDocById(docId) {
+    const response = await fetchSyncPost("/api/filetree/removeDocByID", { id: docId });
+    if (response && typeof response.code === "number" && response.code !== 0) {
+        throw new Error(response.msg || "removeDocByID failed");
+    }
+    return response;
+}
+
+async function handleDeleteUnreferencedChildrenForProtyle(plugin, protyle) {
+    if (plugin.deleteUnrefBusy) {
+        return;
+    }
+    plugin.deleteUnrefBusy = true;
+    try {
+        const editor = unwrapProtyle(protyle) || findProtyleByElement(protyle?.element);
+        const { docId } = resolveProtyleDocId(editor);
+        if (!docId) {
+            showMessage(plugin.i18n.childDocIndexNoDoc);
+            return;
+        }
+        const candidates = await queryUnreferencedChildDocs(docId);
+        if (!candidates.length) {
+            showMessage(plugin.i18n.deleteUnrefNone);
+            return;
+        }
+        const withSubtree = candidates.filter((item) => (item.subFileCount || 0) > 0).length;
+        const preview = candidates
+            .slice(0, 8)
+            .map((item) => {
+                const sub = (item.subFileCount || 0) > 0
+                    ? formatChildDocIndexMessage(plugin.i18n, "deleteUnrefHasChildren", {
+                        count: item.subFileCount,
+                    })
+                    : "";
+                return `· ${item.content || item.id}${sub}`;
+            })
+            .join("\n");
+        const extra = candidates.length > 8
+            ? formatChildDocIndexMessage(plugin.i18n, "deleteUnrefConfirmMore", {
+                count: candidates.length - 8,
+            })
+            : "";
+        const confirmed = window.confirm(
+            formatChildDocIndexMessage(plugin.i18n, "deleteUnrefConfirm", {
+                count: candidates.length,
+                subtreeHint: withSubtree > 0
+                    ? formatChildDocIndexMessage(plugin.i18n, "deleteUnrefSubtreeHint", {
+                        count: withSubtree,
+                    })
+                    : "",
+                list: `${preview}${extra ? `\n${extra}` : ""}`,
+            }),
+        );
+        if (!confirmed) {
+            return;
+        }
+        let deleted = 0;
+        let failed = 0;
+        for (const child of candidates) {
+            try {
+                await removeDocById(child.id);
+                deleted += 1;
+            } catch (error) {
+                failed += 1;
+                console.warn(`${LOG_PREFIX} removeDocByID failed`, child.id, error);
+            }
+        }
+        if (failed > 0) {
+            showMessage(formatChildDocIndexMessage(plugin.i18n, "deleteUnrefPartial", {
+                deleted,
+                failed,
+            }));
+            return;
+        }
+        showMessage(formatChildDocIndexMessage(plugin.i18n, "deleteUnrefDone", { count: deleted }));
+    } catch (error) {
+        console.warn(`${LOG_PREFIX} deleteUnreferencedChildren failed`, error);
+        showMessage(plugin.i18n.deleteUnrefFailed);
+    } finally {
+        plugin.deleteUnrefBusy = false;
+    }
+}
+
 const BREADCRUMB_BTN_CHILD_INDEX = "fhelper-child-doc-index";
 const BREADCRUMB_BTN_LOCATE = "fhelper-locate-in-tree";
 const BREADCRUMB_BTN_GATHER = "fhelper-gather-refs";
+const BREADCRUMB_BTN_DELETE_UNREF = "fhelper-delete-unref-children";
 const FHELPER_ICON_CHILD_INDEX = "iconFhelperChildIndex";
 const FHELPER_ICON_GATHER_REFS = "iconFhelperGatherRefs";
+const FHELPER_ICON_DELETE_UNREF = "iconFhelperDeleteUnref";
 
 const BREADCRUMB_DOC_ACTIONS = [
     {
@@ -1943,6 +2065,13 @@ const BREADCRUMB_DOC_ACTIONS = [
         tipKey: "gatherRefsBreadcrumbTip",
         run: (plugin, editor) => handleGatherReferencedDocsForProtyle(plugin, editor),
         failKey: "gatherRefsFailed",
+    },
+    {
+        type: BREADCRUMB_BTN_DELETE_UNREF,
+        iconHref: `#${FHELPER_ICON_DELETE_UNREF}`,
+        tipKey: "deleteUnrefBreadcrumbTip",
+        run: (plugin, editor) => handleDeleteUnreferencedChildrenForProtyle(plugin, editor),
+        failKey: "deleteUnrefFailed",
     },
 ];
 
@@ -3660,6 +3789,7 @@ module.exports = class FhelperPlugin extends Plugin {
     childDocIndexNotebookSelectEl = null;
     childDocIndexBusy = false;
     gatherRefsBusy = false;
+    deleteUnrefBusy = false;
     breadcrumbMoreHandler = null;
 
     updateProtyleToolbar(toolbar) {
@@ -3703,6 +3833,19 @@ module.exports = class FhelperPlugin extends Plugin {
                 });
             },
         });
+        toolbar.push({
+            name: "fhelper-delete-unref-children",
+            icon: FHELPER_ICON_DELETE_UNREF,
+            hotkey: "",
+            tipPosition: "n",
+            tip: this.i18n.deleteUnrefToolbarTip,
+            click: (protyle) => {
+                handleDeleteUnreferencedChildrenForProtyle(this, protyle).catch((error) => {
+                    console.warn(`${LOG_PREFIX} handleDeleteUnreferencedChildrenForProtyle failed`, error);
+                    showMessage(this.i18n.deleteUnrefFailed);
+                });
+            },
+        });
         return toolbar;
     }
 
@@ -3717,6 +3860,11 @@ module.exports = class FhelperPlugin extends Plugin {
 <symbol id="${FHELPER_ICON_GATHER_REFS}" viewBox="0 0 32 32">
   <path d="M6 4.5h11v7H6zm0 11h8v7H6zm14-5.5h6.5v17H20z" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"></path>
   <path d="M17 8h4v2.2h-4zM14 19h4v2.2h-4z" fill="currentColor"></path>
+</symbol>
+<symbol id="${FHELPER_ICON_DELETE_UNREF}" viewBox="0 0 32 32">
+  <path d="M7 6h18v2.4H7zm3.2 4.2h11.6v16.2H10.2z" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"></path>
+  <path d="M13 13.2v9M19 13.2v9M12.2 6V4.2h7.6V6" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"></path>
+  <path d="M22.5 20.5l5 5M27.5 20.5l-5 5" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"></path>
 </symbol>
 `);
 
@@ -3757,6 +3905,17 @@ module.exports = class FhelperPlugin extends Plugin {
                 handleGatherReferencedDocsForProtyle(this, protyle).catch((error) => {
                     console.warn(`${LOG_PREFIX} handleGatherReferencedDocsForProtyle failed`, error);
                     showMessage(this.i18n.gatherRefsFailed);
+                });
+            },
+        });
+
+        this.addCommand({
+            langKey: "deleteUnrefCurrentDoc",
+            hotkey: "",
+            editorCallback: (protyle) => {
+                handleDeleteUnreferencedChildrenForProtyle(this, protyle).catch((error) => {
+                    console.warn(`${LOG_PREFIX} handleDeleteUnreferencedChildrenForProtyle failed`, error);
+                    showMessage(this.i18n.deleteUnrefFailed);
                 });
             },
         });
@@ -3862,6 +4021,17 @@ module.exports = class FhelperPlugin extends Plugin {
                     handleGatherReferencedDocsForProtyle(this, protyle).catch((error) => {
                         console.warn(`${LOG_PREFIX} breadcrumbmore gather failed`, error);
                         showMessage(this.i18n.gatherRefsFailed);
+                    });
+                },
+            });
+            topMenu.addItem({
+                id: "fhelper-delete-unref-children",
+                icon: FHELPER_ICON_DELETE_UNREF,
+                label: this.i18n.deleteUnrefMenuLabel,
+                click: () => {
+                    handleDeleteUnreferencedChildrenForProtyle(this, protyle).catch((error) => {
+                        console.warn(`${LOG_PREFIX} breadcrumbmore delete unref failed`, error);
+                        showMessage(this.i18n.deleteUnrefFailed);
                     });
                 },
             });
