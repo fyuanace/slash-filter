@@ -1,6 +1,7 @@
 const {
     Plugin,
     Dialog,
+    Menu,
     getAllEditor,
     showMessage,
     fetchSyncPost,
@@ -1317,8 +1318,9 @@ async function buildChildNavTree(docId, mode) {
             roots.push(node);
         }
     });
+    // Nested mode: default all collapsed; user expands via twisty / context menu.
     roots.forEach((node) => {
-        node.open = node.children.length > 0;
+        node.open = false;
         node.subFileCount = node.children.length;
     });
     return roots;
@@ -1846,16 +1848,82 @@ function collectChildNavOpenIds(nodes, out = new Set()) {
     return out;
 }
 
-function applyChildNavOpenIds(nodes, openIds, depth = 0) {
+function setChildNavOpenAll(nodes, open) {
+    (nodes || []).forEach((node) => {
+        node.open = !!(open && node.children?.length);
+        if (node.children?.length) {
+            setChildNavOpenAll(node.children, open);
+        }
+    });
+}
+
+function applyChildNavOpenIds(nodes, openIds) {
     (nodes || []).forEach((node) => {
         if (openIds && openIds.size > 0) {
             node.open = openIds.has(node.id);
         } else {
-            node.open = depth < 1 && node.children.length > 0;
+            // Nested default: all collapsed.
+            node.open = false;
         }
         if (node.children?.length) {
-            applyChildNavOpenIds(node.children, openIds, depth + 1);
+            applyChildNavOpenIds(node.children, openIds);
         }
+    });
+}
+
+function bindChildNavContextMenu(host, plugin, docId, tree) {
+    const shell = host.querySelector(".fhelper-child-nav__shell") || host;
+    shell.addEventListener("contextmenu", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const i18n = plugin?.i18n || {};
+        const menu = typeof Menu === "function"
+            ? new Menu("fhelper-child-nav")
+            : null;
+        if (!menu?.addItem) {
+            return;
+        }
+        const repaint = (nextTree) => {
+            host._fhelperTree = nextTree;
+            host.dataset.treeSig = childNavTreeSignature(nextTree);
+            paintChildNavHost(host, plugin, docId, nextTree, "");
+        };
+        menu.addItem({
+            id: "fhelper-child-nav-expand",
+            icon: "iconExpand",
+            label: i18n.childNavExpandAll || "全部展开",
+            click: () => {
+                const t = host._fhelperTree || tree || [];
+                setChildNavOpenAll(t, true);
+                repaint(t);
+            },
+        });
+        menu.addItem({
+            id: "fhelper-child-nav-collapse",
+            icon: "iconContract",
+            label: i18n.childNavCollapseAll || "全部折叠",
+            click: () => {
+                const t = host._fhelperTree || tree || [];
+                setChildNavOpenAll(t, false);
+                repaint(t);
+            },
+        });
+        menu.addItem({
+            id: "fhelper-child-nav-refresh",
+            icon: "iconRefresh",
+            label: i18n.childNavRefresh || "刷新",
+            click: () => {
+                host._fhelperFetchedAt = 0;
+                childNavTreeCache.delete(docId);
+                refreshChildNavHost(plugin, host, docId, { silent: true }).catch((error) => {
+                    console.warn(`${LOG_PREFIX} child-nav context refresh failed`, docId, error);
+                });
+            },
+        });
+        menu.open({
+            x: event.clientX,
+            y: event.clientY,
+        });
     });
 }
 
@@ -1909,6 +1977,7 @@ function paintChildNavHost(host, plugin, docId, tree, errorText) {
     host.dataset.loading = "";
     host.style.minHeight = "";
     setCachedChildNavTree(docId, mode, tree, host.offsetHeight || 0);
+    bindChildNavContextMenu(host, plugin, docId, tree);
 }
 
 async function refreshChildNavHost(plugin, host, docId, options = {}) {
