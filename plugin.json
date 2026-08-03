@@ -1,7 +1,7 @@
 {
   "name": "fhelper",
   "author": "fyuan",
-  "version": "1.15.6",
+  "version": "1.15.8",
   "minAppVersion": "3.1.27",
   "backends": ["all"],
   "frontends": ["all"],

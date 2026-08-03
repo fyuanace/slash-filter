@@ -32,7 +32,7 @@
   "docRefStyleEnable": "Document ref styling",
   "docRefStyleEnableDesc": "Underline + document icon for document-block refs; strikethrough + default icon when missing. Per-document cache: cleared on close, rebuilt on open; parent doc refreshes after new sub-doc.",
   "childDocWidgetEnable": "Enable child doc nav inject",
-  "childDocWidgetEnableDesc": "Injects a child-doc list below the title (not saved as a document block). Updates on open/switch; refreshes after create/delete/move. Leaving via the nav records it as the back anchor so mouse-back returns to the nav view.",
+  "childDocWidgetEnableDesc": "Injects a child-doc list below the title (not saved as a document block). Reserves space on open to reduce flicker; refreshes after create/delete/move. Leaving via the nav records it as the back anchor so mouse-back returns to the nav view.",
   "childDocWidgetMode": "List mode",
   "childDocWidgetModeDesc": "Direct shows one level; nested recursively lists the full subtree.",
   "childDocWidgetModeDirect": "Direct children only",

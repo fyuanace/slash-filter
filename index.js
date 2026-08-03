@@ -1195,7 +1195,10 @@ function setChildDocIndexDomGate(enabled) {
 const CHILD_NAV_HOST_CLASS = "fhelper-child-nav";
 const CHILD_NAV_LEGACY_ATTR = "custom-fhelper-child-nav";
 const CHILD_NAV_SRC_MARK = "/plugins/fhelper/child-nav/";
-const CHILD_NAV_MOUNT_DEBOUNCE_MS = 120;
+/** Debounce only SQL refresh; shell is primed synchronously to avoid layout flash. */
+const CHILD_NAV_MOUNT_DEBOUNCE_MS = 32;
+/** docId → { tree, mode, at, hostHeight } for instant paint on reopen. */
+const childNavTreeCache = new Map();
 
 function createDefaultChildDocWidgetConfig() {
     return {
@@ -1321,17 +1324,6 @@ async function buildChildNavTree(docId, mode) {
     return roots;
 }
 
-function countChildNavNodes(nodes) {
-    let n = 0;
-    (nodes || []).forEach((node) => {
-        n += 1;
-        if (node.children?.length) {
-            n += countChildNavNodes(node.children);
-        }
-    });
-    return n;
-}
-
 function removeChildNavHost(host) {
     if (host?.parentElement) {
         host.remove();
@@ -1452,16 +1444,138 @@ function ensureChildNavHost(protyle, docId) {
         }
     }
     if (host.dataset.docId && host.dataset.docId !== docId) {
+        // Keep previous height briefly so switching docs doesn't collapse then expand.
+        const prevH = host.offsetHeight;
+        if (prevH > 0) {
+            host.style.minHeight = `${prevH}px`;
+        }
         host.innerHTML = "";
         host._fhelperTree = null;
         host._fhelperFetchedAt = 0;
         host.dataset.treeSig = "";
         host.dataset.paintedDocId = "";
+        host.dataset.loading = "1";
     }
     host.dataset.docId = docId;
     delete host.dataset.position;
     syncChildNavHostLayout(host, p);
     return host;
+}
+
+function getCachedChildNavTree(docId, mode) {
+    const hit = childNavTreeCache.get(docId);
+    if (!hit || hit.mode !== mode || !Array.isArray(hit.tree)) {
+        return null;
+    }
+    return hit;
+}
+
+function setCachedChildNavTree(docId, mode, tree, hostHeight) {
+    if (!docId) {
+        return;
+    }
+    childNavTreeCache.set(docId, {
+        tree,
+        mode,
+        at: Date.now(),
+        hostHeight: hostHeight > 0 ? hostHeight : (childNavTreeCache.get(docId)?.hostHeight || 0),
+    });
+}
+
+function paintChildNavSkeleton(host, plugin, docId) {
+    if (!host) {
+        return;
+    }
+    const mode = getChildNavMode(plugin);
+    const cached = getCachedChildNavTree(docId, mode);
+    if (cached?.hostHeight > 0) {
+        host.style.minHeight = `${cached.hostHeight}px`;
+    }
+    const shell = document.createElement("div");
+    shell.className = "fhelper-child-nav__shell";
+    const treeEl = document.createElement("div");
+    treeEl.className = "fhelper-child-nav__tree";
+    treeEl.innerHTML = '<div class="fhelper-child-nav__empty">加载中…</div>';
+    shell.appendChild(treeEl);
+    host.innerHTML = "";
+    host.appendChild(shell);
+    host.dataset.loading = "1";
+}
+
+/**
+ * Insert host + paint cache/skeleton immediately (before SQL), so the page
+ * does not first render without nav then jump when the panel appears.
+ */
+function primeChildNavHost(plugin, protyle) {
+    const p = unwrapProtyle(protyle);
+    if (!p || !plugin?.config?.childDocWidget?.enabled) {
+        return null;
+    }
+    const docId = getProtyleDocId(p);
+    if (!docId) {
+        return null;
+    }
+    const host = ensureChildNavHost(p, docId);
+    if (!host) {
+        return null;
+    }
+    syncChildNavHostLayout(host, p);
+    const mode = getChildNavMode(plugin);
+    const hasContent = host.dataset.paintedDocId === docId
+        && !!host.querySelector(".fhelper-child-nav__shell")
+        && host.dataset.loading !== "1";
+    if (hasContent) {
+        return host;
+    }
+    const cached = getCachedChildNavTree(docId, mode);
+    if (cached) {
+        const tree = JSON.parse(JSON.stringify(cached.tree));
+        applyChildNavOpenIds(tree, collectChildNavOpenIds(host._fhelperTree || cached.tree));
+        paintChildNavHost(host, plugin, docId, tree, "");
+        host.style.minHeight = "";
+        host.dataset.loading = "";
+        return host;
+    }
+    paintChildNavSkeleton(host, plugin, docId);
+    return host;
+}
+
+function prefetchChildNavTree(plugin, docId) {
+    if (!plugin?.config?.childDocWidget?.enabled || !docId) {
+        return;
+    }
+    const mode = getChildNavMode(plugin);
+    if (getCachedChildNavTree(docId, mode)) {
+        return;
+    }
+    buildChildNavTree(docId, mode).then((tree) => {
+        setCachedChildNavTree(docId, mode, tree, 0);
+    }).catch((error) => {
+        console.warn(`${LOG_PREFIX} prefetchChildNavTree failed`, docId, error);
+    });
+}
+
+/** After openTab, prime nav as soon as the target protyle exists (often before loaded-protyle-static). */
+function armChildNavPrimeForDoc(plugin, docId) {
+    if (!plugin?.config?.childDocWidget?.enabled || !docId) {
+        return;
+    }
+    let tries = 0;
+    const tick = () => {
+        tries += 1;
+        for (const { protyle } of getAllEditor()) {
+            const p = unwrapProtyle(protyle);
+            if (getProtyleDocId(p) === docId && p?.element && !p.element.classList.contains("fn__none")) {
+                primeChildNavHost(plugin, p);
+                scheduleMountChildNav(plugin, p);
+                return;
+            }
+        }
+        if (tries < 45) {
+            window.setTimeout(tick, 16);
+        }
+    };
+    tick();
 }
 
 function findActiveProtyleForChildNav() {
@@ -1651,6 +1765,8 @@ function openChildNavDoc(id, fromProtyle) {
     const source = unwrapProtyle(fromProtyle) || findActiveProtyleForChildNav();
     // Treat the nav panel as the return anchor (no caret jump).
     pushChildNavReturnAnchor(source);
+    // Prefetch target doc's child tree so the next page can paint without waiting.
+    prefetchChildNavTree(plugin, id);
 
     if (plugin?.app && typeof openTab === "function") {
         try {
@@ -1664,6 +1780,7 @@ function openChildNavDoc(id, fromProtyle) {
                     ],
                 },
             });
+            armChildNavPrimeForDoc(plugin, id);
             return;
         } catch (error) {
             console.warn(`${LOG_PREFIX} openTab failed`, id, error);
@@ -1754,17 +1871,10 @@ function childNavTreeSignature(nodes) {
 
 function paintChildNavHost(host, plugin, docId, tree, errorText) {
     const mode = getChildNavMode(plugin);
-    const count = countChildNavNodes(tree);
     host.innerHTML = "";
 
     const shell = document.createElement("div");
     shell.className = "fhelper-child-nav__shell";
-
-    const head = document.createElement("div");
-    head.className = "fhelper-child-nav__head";
-    head.innerHTML = `<div class="fhelper-child-nav__title"><span>子文档</span><span class="fhelper-child-nav__badge">${count}</span></div>`
-        + `<div class="fhelper-child-nav__meta">${mode === "nested" ? "嵌套子文档" : "直接子文档"}</div>`;
-    shell.appendChild(head);
 
     const treeEl = document.createElement("div");
     treeEl.className = "fhelper-child-nav__tree";
@@ -1796,6 +1906,9 @@ function paintChildNavHost(host, plugin, docId, tree, errorText) {
     host._fhelperTree = tree;
     host.dataset.treeSig = childNavTreeSignature(tree);
     host.dataset.paintedDocId = docId;
+    host.dataset.loading = "";
+    host.style.minHeight = "";
+    setCachedChildNavTree(docId, mode, tree, host.offsetHeight || 0);
 }
 
 async function refreshChildNavHost(plugin, host, docId, options = {}) {
@@ -1803,26 +1916,31 @@ async function refreshChildNavHost(plugin, host, docId, options = {}) {
         return;
     }
     const silent = options.silent === true;
+    const mode = getChildNavMode(plugin);
     const hasContent = host.dataset.paintedDocId === docId
-        && !!host.querySelector(".fhelper-child-nav__shell");
+        && !!host.querySelector(".fhelper-child-nav__shell")
+        && host.dataset.loading !== "1";
     // Keep current UI while fetching — avoids flash on tab switch.
     if (!silent && !hasContent) {
-        paintChildNavHost(host, plugin, docId, [], "");
-        const loading = host.querySelector(".fhelper-child-nav__tree");
-        if (loading) {
-            loading.innerHTML = '<div class="fhelper-child-nav__empty">加载中…</div>';
+        const cached = getCachedChildNavTree(docId, mode);
+        if (cached) {
+            paintChildNavHost(host, plugin, docId, JSON.parse(JSON.stringify(cached.tree)), "");
+        } else {
+            paintChildNavSkeleton(host, plugin, docId);
         }
     }
     try {
-        const tree = await buildChildNavTree(docId, getChildNavMode(plugin));
+        const tree = await buildChildNavTree(docId, mode);
         if (host.dataset.docId !== docId || !host.isConnected) {
             return;
         }
         const prevOpen = collectChildNavOpenIds(host._fhelperTree || []);
         applyChildNavOpenIds(tree, prevOpen);
         const nextSig = childNavTreeSignature(tree);
-        if (hasContent && host.dataset.treeSig === nextSig) {
+        const painted = host.dataset.paintedDocId === docId && host.dataset.loading !== "1";
+        if (painted && host.dataset.treeSig === nextSig) {
             host._fhelperFetchedAt = Date.now();
+            setCachedChildNavTree(docId, mode, tree, host.offsetHeight || 0);
             return;
         }
         paintChildNavHost(host, plugin, docId, tree, "");
@@ -1877,13 +1995,14 @@ async function mountChildNavForProtyle(plugin, protyle) {
             console.warn(`${LOG_PREFIX} cleanupLegacyChildNavBlocks failed`, docId, error);
         });
     }
-    const host = ensureChildNavHost(p, docId);
+    const host = primeChildNavHost(plugin, p) || ensureChildNavHost(p, docId);
     if (!host) {
         return;
     }
     syncChildNavHostLayout(host, p);
     const hasContent = host.dataset.paintedDocId === docId
-        && !!host.querySelector(".fhelper-child-nav__shell");
+        && !!host.querySelector(".fhelper-child-nav__shell")
+        && host.dataset.loading !== "1";
     // Switch-back: reuse existing panel; skip refetch if freshly painted.
     if (hasContent && host._fhelperFetchedAt && (Date.now() - host._fhelperFetchedAt) < 4000) {
         return;
@@ -1896,6 +2015,8 @@ function scheduleMountChildNav(plugin, protyle) {
         return;
     }
     const p = unwrapProtyle(protyle);
+    // Reserve space / paint cache immediately — do not wait for debounce or SQL.
+    primeChildNavHost(plugin, p);
     const docId = getProtyleDocId(p) || "_";
     if (!plugin.childNavMountTimers) {
         plugin.childNavMountTimers = new Map();
@@ -5935,6 +6056,8 @@ module.exports = class FhelperPlugin extends Plugin {
 .fhelper-child-nav {
     margin: 4px 0 10px;
     user-select: none;
+    /* Avoid a second visual pop when skeleton → tree swaps. */
+    contain: layout;
 }
 .fhelper-child-nav__shell {
     padding: 8px 10px;
