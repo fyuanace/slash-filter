@@ -1098,6 +1098,7 @@ function scheduleDocRefWsUpdate(plugin, event) {
 }
 
 function handleDocRefWsMain(plugin, event) {
+    scheduleChildNavWsRefresh(plugin, event);
     if (!plugin.config.docRefStyle?.enabled) {
         return;
     }
@@ -1105,6 +1106,7 @@ function handleDocRefWsMain(plugin, event) {
 }
 
 function handleProtyleDocRefStaticLoad(plugin, event) {
+    handleProtyleChildNavStaticLoad(plugin, event);
     if (!plugin.config.docRefStyle?.enabled) {
         return;
     }
@@ -1135,8 +1137,9 @@ function handleProtyleDocRefDynamicLoad(plugin, event) {
 function handleProtyleDocRefSwitch(plugin, event) {
     const protyle = getProtyleFromEvent(event);
     if (protyle) {
-        ensureChildDocIndexBreadcrumbButton(plugin, protyle);
+        ensureDocActionBreadcrumbButtons(plugin, protyle);
     }
+    handleProtyleChildNavSwitch(plugin, event);
     if (!plugin.config.docRefStyle?.enabled || !protyle?.wysiwyg?.element) {
         return;
     }
@@ -1157,6 +1160,8 @@ function handleProtyleDocRefDestroy(plugin, event) {
         unwatchDocRefMutations(plugin, wysiwyg);
     }
     clearDocRefCacheForDoc(plugin, getProtyleRootId(protyle));
+    const p = unwrapProtyle(protyle);
+    p?.element?.querySelectorAll?.(`.${CHILD_NAV_HOST_CLASS}`)?.forEach(removeChildNavHost);
 }
 
 const CHILD_DOC_INDEX_DEFAULT_CONCURRENCY = 3;
@@ -1174,6 +1179,557 @@ function createDefaultChildDocIndexConfig() {
     };
 }
 
+const CHILD_NAV_HOST_CLASS = "fhelper-child-nav";
+const CHILD_NAV_LEGACY_ATTR = "custom-fhelper-child-nav";
+const CHILD_NAV_SRC_MARK = "/plugins/fhelper/child-nav/";
+const CHILD_NAV_MOUNT_DEBOUNCE_MS = 120;
+
+function createDefaultChildDocWidgetConfig() {
+    return {
+        enabled: false,
+        mode: "direct",
+    };
+}
+
+function normalizeChildNavMode(mode) {
+    return mode === "nested" ? "nested" : "direct";
+}
+
+function getChildNavMode(plugin) {
+    return normalizeChildNavMode(plugin?.config?.childDocWidget?.mode);
+}
+
+function sleepMs(ms) {
+    return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+async function getDocPathBySql(docId) {
+    if (!docId) {
+        return null;
+    }
+    try {
+        const rows = await runSqlQuery(
+            `SELECT id, box, path FROM blocks WHERE id = '${escapeSqlId(docId)}' AND type = 'd' LIMIT 1`,
+        );
+        const row = rows?.[0];
+        if (!row?.box || !row?.path) {
+            return null;
+        }
+        return { notebook: row.box, path: row.path };
+    } catch (error) {
+        console.warn(`${LOG_PREFIX} getDocPathBySql failed`, docId, error);
+        return null;
+    }
+}
+
+/** Parent doc storage path: `/a/b/c.sy` -> `/a/b.sy`; `/a.sy` -> null */
+function getParentDocStoragePath(docPath) {
+    const normalized = String(docPath || "");
+    if (!/\.sy$/i.test(normalized)) {
+        return null;
+    }
+    const withoutExt = normalized.replace(/\.sy$/i, "");
+    const idx = withoutExt.lastIndexOf("/");
+    if (idx <= 0) {
+        return null;
+    }
+    return `${withoutExt.slice(0, idx)}.sy`;
+}
+
+function toChildNavNode(row) {
+    const title = String(row?.content || "").trim()
+        || stripDocFileName(row?.path)
+        || row?.id;
+    return {
+        id: row.id,
+        title,
+        path: row.path || "",
+        subFileCount: 0,
+        open: false,
+        children: [],
+    };
+}
+
+/**
+ * List child docs via SQL only — never call listDocsByPath here.
+ * Missing on-disk folders would otherwise toast "open ... file not found".
+ */
+async function queryChildNavDescendants(notebook, parentDocPath) {
+    const folder = toListDocsFolderPath(parentDocPath);
+    const prefix = folder === "/" ? "/" : `${folder}/`;
+    try {
+        const rows = await runSqlQuery(
+            `SELECT id, content, path FROM blocks WHERE type = 'd' AND box = '${escapeSqlId(notebook)}' AND path LIKE '${escapeSqlId(prefix)}%' ORDER BY path ASC LIMIT 2000`,
+        );
+        return Array.isArray(rows) ? rows : [];
+    } catch (error) {
+        console.warn(`${LOG_PREFIX} queryChildNavDescendants failed`, notebook, parentDocPath, error);
+        return [];
+    }
+}
+
+async function buildChildNavTree(docId, mode) {
+    const pathInfo = await getDocPathBySql(docId);
+    if (!pathInfo) {
+        return [];
+    }
+    const rows = await queryChildNavDescendants(pathInfo.notebook, pathInfo.path);
+    const nested = normalizeChildNavMode(mode) === "nested";
+
+    if (!nested) {
+        return rows
+            .filter((row) => getParentDocStoragePath(row.path) === pathInfo.path)
+            .map(toChildNavNode);
+    }
+
+    const byPath = new Map();
+    rows.forEach((row) => {
+        if (row?.path && row?.id) {
+            byPath.set(row.path, toChildNavNode(row));
+        }
+    });
+    const roots = [];
+    byPath.forEach((node) => {
+        const parentPath = getParentDocStoragePath(node.path);
+        const parent = parentPath ? byPath.get(parentPath) : null;
+        if (parent) {
+            parent.children.push(node);
+            parent.subFileCount = parent.children.length;
+            return;
+        }
+        if (parentPath === pathInfo.path) {
+            roots.push(node);
+        }
+    });
+    roots.forEach((node) => {
+        node.open = node.children.length > 0;
+        node.subFileCount = node.children.length;
+    });
+    return roots;
+}
+
+function countChildNavNodes(nodes) {
+    let n = 0;
+    (nodes || []).forEach((node) => {
+        n += 1;
+        if (node.children?.length) {
+            n += countChildNavNodes(node.children);
+        }
+    });
+    return n;
+}
+
+function removeChildNavHost(host) {
+    if (host?.parentElement) {
+        host.remove();
+    }
+}
+
+function removeAllChildNavHosts(root = document) {
+    root.querySelectorAll?.(`.${CHILD_NAV_HOST_CLASS}`)?.forEach((el) => removeChildNavHost(el));
+}
+
+function findChildNavInsertAnchor(protyle) {
+    const p = unwrapProtyle(protyle);
+    if (!p) {
+        return null;
+    }
+    const title = p.title?.element
+        || p.element?.querySelector?.(".protyle-title");
+    const wysiwyg = p.wysiwyg?.element;
+    const parent = title?.parentElement || wysiwyg?.parentElement;
+    if (!parent) {
+        return null;
+    }
+    return { parent, before: wysiwyg || title?.nextElementSibling || null, title, wysiwyg };
+}
+
+/** Match editor title/wysiwyg horizontal layout (fixed vs adaptive width). */
+function syncChildNavHostLayout(host, protyle) {
+    const p = unwrapProtyle(protyle);
+    const ref = p?.wysiwyg?.element || p?.title?.element;
+    if (!host || !ref) {
+        return;
+    }
+    const cs = window.getComputedStyle(ref);
+    host.style.boxSizing = "border-box";
+    host.style.width = "100%";
+    host.style.maxWidth = cs.maxWidth && cs.maxWidth !== "none" ? cs.maxWidth : "";
+    host.style.paddingLeft = cs.paddingLeft;
+    host.style.paddingRight = cs.paddingRight;
+    host.style.marginLeft = cs.marginLeft;
+    host.style.marginRight = cs.marginRight;
+    const realWidth = parseInt(ref.getAttribute("data-realwidth") || "", 10);
+    if (Number.isFinite(realWidth) && realWidth > 0) {
+        // data-realwidth is content width; keep same side padding as the editor.
+        host.style.maxWidth = `calc(${realWidth}px + ${cs.paddingLeft} + ${cs.paddingRight})`;
+        if (!cs.marginLeft || cs.marginLeft === "0px") {
+            host.style.marginLeft = "auto";
+            host.style.marginRight = "auto";
+        }
+    }
+}
+
+function syncAllChildNavHostLayouts(plugin) {
+    getAllEditor().forEach(({ protyle }) => {
+        const p = unwrapProtyle(protyle);
+        const host = p?.element?.querySelector?.(`.${CHILD_NAV_HOST_CLASS}`);
+        if (host) {
+            syncChildNavHostLayout(host, p);
+        }
+    });
+}
+
+function ensureChildNavHost(protyle, docId) {
+    const anchor = findChildNavInsertAnchor(protyle);
+    if (!anchor) {
+        return null;
+    }
+    const { parent, before } = anchor;
+    let host = parent.querySelector(`:scope > .${CHILD_NAV_HOST_CLASS}`);
+    if (!host) {
+        host = document.createElement("div");
+        host.className = CHILD_NAV_HOST_CLASS;
+        host.contentEditable = "false";
+        host.setAttribute("spellcheck", "false");
+        if (before && before.parentElement === parent) {
+            parent.insertBefore(host, before);
+        } else if (anchor.title?.nextSibling) {
+            parent.insertBefore(host, anchor.title.nextSibling);
+        } else {
+            parent.appendChild(host);
+        }
+    }
+    if (host.dataset.docId && host.dataset.docId !== docId) {
+        host.innerHTML = "";
+        host._fhelperTree = null;
+        host._fhelperFetchedAt = 0;
+        host.dataset.treeSig = "";
+        host.dataset.paintedDocId = "";
+    }
+    host.dataset.docId = docId;
+    syncChildNavHostLayout(host, protyle);
+    return host;
+}
+
+function openChildNavDoc(id) {
+    if (!id) {
+        return;
+    }
+    try {
+        window.open(`siyuan://blocks/${id}`);
+    } catch (error) {
+        console.warn(`${LOG_PREFIX} openChildNavDoc failed`, id, error);
+    }
+}
+
+function renderChildNavNodeEl(node, onToggle) {
+    const wrap = document.createElement("div");
+    wrap.className = "fhelper-child-nav__node";
+
+    const row = document.createElement("div");
+    row.className = "fhelper-child-nav__row";
+
+    const twist = document.createElement("button");
+    twist.type = "button";
+    twist.className = "fhelper-child-nav__twist"
+        + (node.children?.length ? "" : " is-placeholder")
+        + (node.open ? " is-open" : "");
+    twist.innerHTML = '<svg viewBox="0 0 16 16" fill="currentColor"><path d="M6 3l5 5-5 5z"/></svg>';
+    if (node.children?.length) {
+        twist.addEventListener("click", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            onToggle(node);
+        });
+    }
+
+    const icon = document.createElement("span");
+    icon.className = "fhelper-child-nav__icon";
+    icon.textContent = node.subFileCount > 0 ? "📂" : "📄";
+
+    const label = document.createElement("span");
+    label.className = "fhelper-child-nav__label";
+    label.textContent = node.title;
+    label.title = node.title;
+
+    row.appendChild(twist);
+    row.appendChild(icon);
+    row.appendChild(label);
+    row.addEventListener("click", () => openChildNavDoc(node.id));
+    wrap.appendChild(row);
+
+    if (node.children?.length && node.open) {
+        const kids = document.createElement("div");
+        kids.className = "fhelper-child-nav__children";
+        node.children.forEach((child) => kids.appendChild(renderChildNavNodeEl(child, onToggle)));
+        wrap.appendChild(kids);
+    }
+    return wrap;
+}
+
+function collectChildNavOpenIds(nodes, out = new Set()) {
+    (nodes || []).forEach((node) => {
+        if (node.open) {
+            out.add(node.id);
+        }
+        if (node.children?.length) {
+            collectChildNavOpenIds(node.children, out);
+        }
+    });
+    return out;
+}
+
+function applyChildNavOpenIds(nodes, openIds, depth = 0) {
+    (nodes || []).forEach((node) => {
+        if (openIds && openIds.size > 0) {
+            node.open = openIds.has(node.id);
+        } else {
+            node.open = depth < 1 && node.children.length > 0;
+        }
+        if (node.children?.length) {
+            applyChildNavOpenIds(node.children, openIds, depth + 1);
+        }
+    });
+}
+
+function childNavTreeSignature(nodes) {
+    const walk = (list) => (list || []).map((node) => [
+        node.id,
+        node.title,
+        node.open ? 1 : 0,
+        walk(node.children),
+    ]);
+    return JSON.stringify(walk(nodes));
+}
+
+function paintChildNavHost(host, plugin, docId, tree, errorText) {
+    const mode = getChildNavMode(plugin);
+    const count = countChildNavNodes(tree);
+    host.innerHTML = "";
+
+    const shell = document.createElement("div");
+    shell.className = "fhelper-child-nav__shell";
+
+    const head = document.createElement("div");
+    head.className = "fhelper-child-nav__head";
+    head.innerHTML = `<div class="fhelper-child-nav__title"><span>子文档</span><span class="fhelper-child-nav__badge">${count}</span></div>`
+        + `<div class="fhelper-child-nav__meta">${mode === "nested" ? "嵌套子文档" : "直接子文档"}</div>`;
+    shell.appendChild(head);
+
+    const treeEl = document.createElement("div");
+    treeEl.className = "fhelper-child-nav__tree";
+    if (errorText) {
+        const err = document.createElement("div");
+        err.className = "fhelper-child-nav__error";
+        err.textContent = errorText;
+        treeEl.appendChild(err);
+    } else if (!tree.length) {
+        const empty = document.createElement("div");
+        empty.className = "fhelper-child-nav__empty";
+        empty.textContent = "暂无子文档";
+        treeEl.appendChild(empty);
+    } else {
+        const onToggle = (node) => {
+            node.open = !node.open;
+            host._fhelperTree = tree;
+            host.dataset.treeSig = childNavTreeSignature(tree);
+            paintChildNavHost(host, plugin, docId, tree, "");
+        };
+        tree.forEach((node) => treeEl.appendChild(renderChildNavNodeEl(node, onToggle)));
+    }
+    shell.appendChild(treeEl);
+    host.appendChild(shell);
+    host._fhelperTree = tree;
+    host.dataset.treeSig = childNavTreeSignature(tree);
+    host.dataset.paintedDocId = docId;
+}
+
+async function refreshChildNavHost(plugin, host, docId, options = {}) {
+    if (!host || !docId) {
+        return;
+    }
+    const silent = options.silent === true;
+    const hasContent = host.dataset.paintedDocId === docId
+        && !!host.querySelector(".fhelper-child-nav__shell");
+    // Keep current UI while fetching — avoids flash on tab switch.
+    if (!silent && !hasContent) {
+        paintChildNavHost(host, plugin, docId, [], "");
+        const loading = host.querySelector(".fhelper-child-nav__tree");
+        if (loading) {
+            loading.innerHTML = '<div class="fhelper-child-nav__empty">加载中…</div>';
+        }
+    }
+    try {
+        const tree = await buildChildNavTree(docId, getChildNavMode(plugin));
+        if (host.dataset.docId !== docId || !host.isConnected) {
+            return;
+        }
+        const prevOpen = collectChildNavOpenIds(host._fhelperTree || []);
+        applyChildNavOpenIds(tree, prevOpen);
+        const nextSig = childNavTreeSignature(tree);
+        if (hasContent && host.dataset.treeSig === nextSig) {
+            host._fhelperFetchedAt = Date.now();
+            return;
+        }
+        paintChildNavHost(host, plugin, docId, tree, "");
+        host._fhelperFetchedAt = Date.now();
+    } catch (error) {
+        console.warn(`${LOG_PREFIX} refreshChildNavHost failed`, docId, error);
+        if (host.isConnected && !hasContent) {
+            paintChildNavHost(host, plugin, docId, [], error?.message || String(error));
+        }
+    }
+}
+
+async function cleanupLegacyChildNavBlocks(docId) {
+    if (!docId) {
+        return;
+    }
+    let ids = [];
+    try {
+        const rows = await runSqlQuery(
+            `SELECT id FROM blocks WHERE root_id = '${escapeSqlId(docId)}' AND (ial LIKE '%${CHILD_NAV_LEGACY_ATTR}%' OR markdown LIKE '%${CHILD_NAV_SRC_MARK}%') LIMIT 50`,
+        );
+        ids = (rows || []).map((row) => row.id).filter(Boolean);
+    } catch (error) {
+        console.warn(`${LOG_PREFIX} cleanupLegacyChildNavBlocks sql failed`, error);
+        return;
+    }
+    for (const id of ids) {
+        try {
+            await fetchSyncPost("/api/block/deleteBlock", { id });
+        } catch (error) {
+            console.warn(`${LOG_PREFIX} cleanup legacy child-nav block failed`, id, error);
+        }
+    }
+}
+
+async function mountChildNavForProtyle(plugin, protyle) {
+    const p = unwrapProtyle(protyle);
+    if (!p) {
+        return;
+    }
+    const docId = getProtyleDocId(p);
+    if (!plugin?.config?.childDocWidget?.enabled || !docId) {
+        const anchor = findChildNavInsertAnchor(p);
+        anchor?.parent?.querySelectorAll?.(`:scope > .${CHILD_NAV_HOST_CLASS}`)?.forEach(removeChildNavHost);
+        return;
+    }
+    if (!plugin.childNavCleanupDocs) {
+        plugin.childNavCleanupDocs = new Set();
+    }
+    if (!plugin.childNavCleanupDocs.has(docId)) {
+        plugin.childNavCleanupDocs.add(docId);
+        cleanupLegacyChildNavBlocks(docId).catch((error) => {
+            console.warn(`${LOG_PREFIX} cleanupLegacyChildNavBlocks failed`, docId, error);
+        });
+    }
+    const host = ensureChildNavHost(p, docId);
+    if (!host) {
+        return;
+    }
+    syncChildNavHostLayout(host, p);
+    const hasContent = host.dataset.paintedDocId === docId
+        && !!host.querySelector(".fhelper-child-nav__shell");
+    // Switch-back: reuse existing panel; skip refetch if freshly painted.
+    if (hasContent && host._fhelperFetchedAt && (Date.now() - host._fhelperFetchedAt) < 4000) {
+        return;
+    }
+    await refreshChildNavHost(plugin, host, docId, { silent: hasContent });
+}
+
+function scheduleMountChildNav(plugin, protyle) {
+    if (!plugin) {
+        return;
+    }
+    const p = unwrapProtyle(protyle);
+    const docId = getProtyleDocId(p) || "_";
+    if (!plugin.childNavMountTimers) {
+        plugin.childNavMountTimers = new Map();
+    }
+    const prev = plugin.childNavMountTimers.get(docId);
+    if (prev) {
+        window.clearTimeout(prev);
+    }
+    const timer = window.setTimeout(() => {
+        plugin.childNavMountTimers.delete(docId);
+        mountChildNavForProtyle(plugin, p).catch((error) => {
+            console.warn(`${LOG_PREFIX} mountChildNavForProtyle failed`, docId, error);
+        });
+    }, CHILD_NAV_MOUNT_DEBOUNCE_MS);
+    plugin.childNavMountTimers.set(docId, timer);
+}
+
+function syncAllChildNavPanels(plugin) {
+    if (!plugin?.config?.childDocWidget?.enabled) {
+        removeAllChildNavHosts();
+        return;
+    }
+    getAllEditor().forEach(({ protyle }) => scheduleMountChildNav(plugin, protyle));
+}
+
+function refreshOpenChildNavWidgets(plugin, docId = null) {
+    document.querySelectorAll(`.${CHILD_NAV_HOST_CLASS}`).forEach((host) => {
+        const hostDocId = host.dataset.docId;
+        if (docId && hostDocId && hostDocId !== docId) {
+            return;
+        }
+        if (!hostDocId) {
+            return;
+        }
+        // Force refresh after doc tree changes, but keep UI until data arrives.
+        host._fhelperFetchedAt = 0;
+        refreshChildNavHost(plugin, host, hostDocId, { silent: true }).catch((error) => {
+            console.warn(`${LOG_PREFIX} refreshOpenChildNavWidgets failed`, hostDocId, error);
+        });
+    });
+}
+
+function shouldHandleChildNavWs(cmd) {
+    if (!cmd) {
+        return false;
+    }
+    const key = String(cmd).toLowerCase();
+    return [
+        "createdoc",
+        "removedoc",
+        "movedoc",
+        "movedocs",
+        "renamedoc",
+        "reloadfiletree",
+    ].some((item) => key.includes(item));
+}
+
+function scheduleChildNavWsRefresh(plugin, event) {
+    if (!plugin.config.childDocWidget?.enabled) {
+        return;
+    }
+    const detail = event.detail ?? event;
+    if (!shouldHandleChildNavWs(detail?.cmd)) {
+        return;
+    }
+    if (plugin.childNavWsTimer) {
+        window.clearTimeout(plugin.childNavWsTimer);
+    }
+    plugin.childNavWsTimer = window.setTimeout(() => {
+        plugin.childNavWsTimer = null;
+        refreshOpenChildNavWidgets(plugin);
+    }, 220);
+}
+
+function handleProtyleChildNavStaticLoad(plugin, event) {
+    scheduleMountChildNav(plugin, getProtyleFromEvent(event));
+}
+
+function handleProtyleChildNavSwitch(plugin, event) {
+    scheduleMountChildNav(plugin, getProtyleFromEvent(event));
+}
+
+// Compatibility aliases used by settings/config save paths.
+function scheduleEnsureChildNavWidget(plugin, protyle) {
+    scheduleMountChildNav(plugin, protyle);
+}
 function unwrapProtyle(protyle) {
     if (!protyle) {
         return null;
@@ -3248,6 +3804,7 @@ function scheduleLayoutRefresh(plugin) {
     window.clearTimeout(plugin.layoutRefreshTimer);
     plugin.layoutRefreshTimer = window.setTimeout(() => {
         getAllEditor().forEach(({ protyle }) => refreshAllImagesInProtyle(plugin, protyle));
+        syncAllChildNavHostLayouts(plugin);
     }, 150);
 }
 
@@ -3629,6 +4186,7 @@ function createDefaultConfig() {
         panguSpacing: createDefaultPanguSpacingConfig(),
         docRefStyle: createDefaultDocRefStyleConfig(),
         childDocIndex: createDefaultChildDocIndexConfig(),
+        childDocWidget: createDefaultChildDocWidgetConfig(),
     };
 }
 
@@ -3771,6 +4329,8 @@ module.exports = class FhelperPlugin extends Plugin {
     imageScaleCenterEl = null;
     panguSpacingEnableEl = null;
     docRefStyleEnableEl = null;
+    childDocWidgetEnableEl = null;
+    childDocWidgetModeEl = null;
     protyleLayoutWatchers = new Map();
     panguSpacingWatchers = new Map();
     docRefByDoc = new Map();
@@ -3782,6 +4342,9 @@ module.exports = class FhelperPlugin extends Plugin {
     docRefWsHandler = null;
     docRefWsTimer = null;
     docRefWsPending = null;
+    childNavWsTimer = null;
+    childNavMountTimers = null;
+    childNavCleanupDocs = null;
     layoutRefreshTimer = null;
     windowResizeHandler = null;
     childDocIndexProgressDialog = null;
@@ -4100,6 +4663,17 @@ module.exports = class FhelperPlugin extends Plugin {
             this.eventBus.off("ws-main", this.docRefWsHandler);
             this.docRefWsHandler = null;
         }
+        if (this.childNavWsTimer) {
+            window.clearTimeout(this.childNavWsTimer);
+            this.childNavWsTimer = null;
+        }
+        if (this.childNavMountTimers) {
+            this.childNavMountTimers.forEach((timer) => window.clearTimeout(timer));
+            this.childNavMountTimers.clear();
+            this.childNavMountTimers = null;
+        }
+        this.childNavCleanupDocs = null;
+        removeAllChildNavHosts();
         if (this.breadcrumbMoreHandler) {
             this.eventBus.off("open-menu-breadcrumbmore", this.breadcrumbMoreHandler);
             this.breadcrumbMoreHandler = null;
@@ -4179,6 +4753,11 @@ module.exports = class FhelperPlugin extends Plugin {
                     ...(data.childDocIndex || {}),
                     sortBy: "tree",
                 },
+                childDocWidget: {
+                    ...createDefaultChildDocWidgetConfig(),
+                    ...(data.childDocWidget || {}),
+                    mode: normalizeChildNavMode(data.childDocWidget?.mode),
+                },
             };
             this.data[STORAGE_NAME] = this.config;
             this.applyImageCenterStyle();
@@ -4187,6 +4766,7 @@ module.exports = class FhelperPlugin extends Plugin {
             if (this.config.imageScale?.enabled) {
                 scheduleLayoutRefresh(this);
             }
+            syncAllChildNavPanels(this);
         }
     }
 
@@ -4202,7 +4782,8 @@ module.exports = class FhelperPlugin extends Plugin {
                     || data.imageScale
                     || data.panguSpacing
                     || data.docRefStyle
-                    || data.childDocIndex);
+                    || data.childDocIndex
+                    || data.childDocWidget);
             if (hasNewConfig) {
                 this.applyConfig(data);
                 return;
@@ -4258,6 +4839,7 @@ module.exports = class FhelperPlugin extends Plugin {
             panguSpacing: { ...(this.config.panguSpacing || createDefaultPanguSpacingConfig()) },
             docRefStyle: { ...(this.config.docRefStyle || createDefaultDocRefStyleConfig()) },
             childDocIndex: { ...(this.config.childDocIndex || createDefaultChildDocIndexConfig()) },
+            childDocWidget: { ...(this.config.childDocWidget || createDefaultChildDocWidgetConfig()) },
         };
         this.settingToggleEls.forEach((input) => {
             input.checked = enabled;
@@ -4471,6 +5053,18 @@ module.exports = class FhelperPlugin extends Plugin {
         if (this.docRefStyleEnableEl) {
             this.config.docRefStyle.enabled = this.docRefStyleEnableEl.checked;
         }
+        if (this.childDocWidgetEnableEl) {
+            this.config.childDocWidget = {
+                ...(this.config.childDocWidget || createDefaultChildDocWidgetConfig()),
+                enabled: this.childDocWidgetEnableEl.checked,
+            };
+        }
+        if (this.childDocWidgetModeEl) {
+            this.config.childDocWidget = {
+                ...(this.config.childDocWidget || createDefaultChildDocWidgetConfig()),
+                mode: normalizeChildNavMode(this.childDocWidgetModeEl.value),
+            };
+        }
         if (this.childDocIndexNotebookSelectEl) {
             this.config.childDocIndex = {
                 ...(this.config.childDocIndex || createDefaultChildDocIndexConfig()),
@@ -4532,6 +5126,7 @@ module.exports = class FhelperPlugin extends Plugin {
         syncDocRefStyleFeature(this);
         this.data[STORAGE_NAME] = this.config;
         scheduleLayoutRefresh(this);
+        syncAllChildNavPanels(this);
         return this.saveData(STORAGE_NAME, this.config);
     }
 
@@ -4619,6 +5214,33 @@ module.exports = class FhelperPlugin extends Plugin {
             control: this.docRefStyleEnableEl,
         }));
         panel.appendChild(panguSection);
+
+        const childDocWidget = this.config.childDocWidget || createDefaultChildDocWidgetConfig();
+        const childNavSection = this.createSettingSection(this.i18n.sectionChildDocWidget);
+        this.childDocWidgetEnableEl = this.createSettingSwitch(childDocWidget.enabled === true);
+        childNavSection.appendChild(this.createSettingRow({
+            title: this.i18n.childDocWidgetEnable,
+            description: this.i18n.childDocWidgetEnableDesc,
+            control: this.childDocWidgetEnableEl,
+        }));
+        this.childDocWidgetModeEl = document.createElement("select");
+        this.childDocWidgetModeEl.className = "b3-select";
+        [
+            { value: "direct", label: this.i18n.childDocWidgetModeDirect },
+            { value: "nested", label: this.i18n.childDocWidgetModeNested },
+        ].forEach(({ value, label }) => {
+            const opt = document.createElement("option");
+            opt.value = value;
+            opt.textContent = label;
+            this.childDocWidgetModeEl.appendChild(opt);
+        });
+        this.childDocWidgetModeEl.value = normalizeChildNavMode(childDocWidget.mode);
+        childNavSection.appendChild(this.createSettingRow({
+            title: this.i18n.childDocWidgetMode,
+            description: this.i18n.childDocWidgetModeDesc,
+            control: this.childDocWidgetModeEl,
+        }));
+        panel.appendChild(childNavSection);
 
         const childDocIndexSection = this.createSettingSection(this.i18n.sectionChildDocIndex);
         const globalIndexBtn = document.createElement("button");
@@ -4799,11 +5421,12 @@ module.exports = class FhelperPlugin extends Plugin {
     }
 
     ensureSettingStyles() {
-        if (document.getElementById(SETTING_STYLE_ID)) {
-            return;
+        let style = document.getElementById(SETTING_STYLE_ID);
+        if (!style) {
+            style = document.createElement("style");
+            style.id = SETTING_STYLE_ID;
+            document.head.appendChild(style);
         }
-        const style = document.createElement("style");
-        style.id = SETTING_STYLE_ID;
         style.textContent = `
 .fhelper-setting {
     display: flex;
@@ -4935,8 +5558,122 @@ module.exports = class FhelperPlugin extends Plugin {
     padding: 12px 16px;
     border-top: 1px solid var(--b3-border-color);
 }
+.fhelper-child-nav {
+    margin: 4px 0 10px;
+    user-select: none;
+}
+.fhelper-child-nav__shell {
+    padding: 8px 10px;
+    border: 1px solid var(--b3-border-color);
+    border-radius: 8px;
+    background: var(--b3-theme-background);
+    box-shadow: none;
+}
+.fhelper-child-nav__head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin-bottom: 8px;
+}
+.fhelper-child-nav__title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-weight: 650;
+}
+.fhelper-child-nav__badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 22px;
+    height: 20px;
+    padding: 0 6px;
+    border-radius: 999px;
+    background: rgba(15, 118, 110, 0.14);
+    color: #0f766e;
+    font-size: 11px;
+    font-weight: 700;
+}
+.fhelper-child-nav__meta {
+    color: var(--b3-theme-on-surface);
+    opacity: 0.75;
+    font-size: 12px;
+}
+.fhelper-child-nav__tree {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+.fhelper-child-nav__row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-height: 30px;
+    padding: 4px 8px;
+    border-radius: 10px;
+    cursor: pointer;
+}
+.fhelper-child-nav__row:hover {
+    background: var(--b3-list-hover);
+}
+.fhelper-child-nav__twist {
+    width: 18px;
+    height: 18px;
+    border: 0;
+    background: transparent;
+    color: var(--b3-theme-on-surface);
+    border-radius: 6px;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    flex: 0 0 auto;
+}
+.fhelper-child-nav__twist.is-placeholder {
+    visibility: hidden;
+}
+.fhelper-child-nav__twist svg {
+    width: 12px;
+    height: 12px;
+    transition: transform .15s ease;
+}
+.fhelper-child-nav__twist.is-open svg {
+    transform: rotate(90deg);
+}
+.fhelper-child-nav__icon {
+    width: 18px;
+    flex: 0 0 auto;
+    text-align: center;
+}
+.fhelper-child-nav__label {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.fhelper-child-nav__children {
+    margin-left: 14px;
+    padding-left: 10px;
+    border-left: 1px dashed var(--b3-border-color);
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+.fhelper-child-nav__empty,
+.fhelper-child-nav__error {
+    padding: 10px 8px;
+    font-size: 12.5px;
+    color: var(--b3-theme-on-surface);
+    opacity: 0.8;
+}
+.fhelper-child-nav__error {
+    color: var(--b3-theme-error);
+    opacity: 1;
+}
 `;
-        document.head.appendChild(style);
     }
 
     switchSettingTab(tabName) {
@@ -4957,6 +5694,8 @@ module.exports = class FhelperPlugin extends Plugin {
         this.imageScaleCenterEl = null;
         this.panguSpacingEnableEl = null;
         this.docRefStyleEnableEl = null;
+        this.childDocWidgetEnableEl = null;
+        this.childDocWidgetModeEl = null;
         this.childDocIndexNotebookSelectEl = null;
         this.slashSearchEl = null;
         this.slashListEl = null;
