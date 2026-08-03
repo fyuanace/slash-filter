@@ -6,6 +6,8 @@ const {
     fetchSyncPost,
     getModelByDockType,
     expandDocTree,
+    openTab,
+    Constants,
 } = require("siyuan");
 
 const STORAGE_NAME = "fhelper-config.json";
@@ -1171,12 +1173,23 @@ const LIST_DOCS_SORT_UNASSIGNED = 256;
 
 function createDefaultChildDocIndexConfig() {
     return {
+        enabled: true,
         sortBy: "tree",
         scope: "all",
         notebookIds: [],
         selectedNotebookId: "",
         batchConcurrency: CHILD_DOC_INDEX_DEFAULT_CONCURRENCY,
     };
+}
+
+function isChildDocIndexEnabled(plugin) {
+    return plugin?.config?.childDocIndex?.enabled !== false;
+}
+
+const CHILD_DOC_INDEX_OFF_CLASS = "fhelper-child-doc-index-off";
+
+function setChildDocIndexDomGate(enabled) {
+    document.documentElement.classList.toggle(CHILD_DOC_INDEX_OFF_CLASS, !enabled);
 }
 
 const CHILD_NAV_HOST_CLASS = "fhelper-child-nav";
@@ -1329,6 +1342,10 @@ function removeAllChildNavHosts(root = document) {
     root.querySelectorAll?.(`.${CHILD_NAV_HOST_CLASS}`)?.forEach((el) => removeChildNavHost(el));
 }
 
+/**
+ * SiYuan DOM: .protyle-content > .protyle-top > title ; .protyle-content > .protyle-wysiwyg
+ * Always inject immediately before wysiwyg (below title).
+ */
 function findChildNavInsertAnchor(protyle) {
     const p = unwrapProtyle(protyle);
     if (!p) {
@@ -1337,11 +1354,40 @@ function findChildNavInsertAnchor(protyle) {
     const title = p.title?.element
         || p.element?.querySelector?.(".protyle-title");
     const wysiwyg = p.wysiwyg?.element;
-    const parent = title?.parentElement || wysiwyg?.parentElement;
+    const content = p.contentElement
+        || wysiwyg?.parentElement
+        || title?.closest?.(".protyle-content")
+        || p.element?.querySelector?.(".protyle-content");
+    const parent = content || title?.parentElement;
     if (!parent) {
         return null;
     }
-    return { parent, before: wysiwyg || title?.nextElementSibling || null, title, wysiwyg };
+    const before = (wysiwyg && wysiwyg.parentElement === parent) ? wysiwyg : null;
+    return { parent, before, title, wysiwyg };
+}
+
+function placeChildNavHost(host, anchor) {
+    if (!host || !anchor?.parent) {
+        return;
+    }
+    const { parent, before, title } = anchor;
+    if (before && before.parentElement === parent) {
+        if (host.parentElement === parent && host.nextElementSibling === before) {
+            return;
+        }
+        parent.insertBefore(host, before);
+        return;
+    }
+    if (title?.parentElement) {
+        const tParent = title.parentElement;
+        if (title.nextSibling) {
+            tParent.insertBefore(host, title.nextSibling);
+        } else {
+            tParent.appendChild(host);
+        }
+        return;
+    }
+    parent.appendChild(host);
 }
 
 /** Match editor title/wysiwyg horizontal layout (fixed vs adaptive width). */
@@ -1359,6 +1405,10 @@ function syncChildNavHostLayout(host, protyle) {
     host.style.paddingRight = cs.paddingRight;
     host.style.marginLeft = cs.marginLeft;
     host.style.marginRight = cs.marginRight;
+    // Match body typography (editor font size / family).
+    host.style.fontSize = cs.fontSize;
+    host.style.fontFamily = cs.fontFamily;
+    host.style.lineHeight = cs.lineHeight;
     const realWidth = parseInt(ref.getAttribute("data-realwidth") || "", 10);
     if (Number.isFinite(realWidth) && realWidth > 0) {
         // data-realwidth is content width; keep same side padding as the editor.
@@ -1381,23 +1431,24 @@ function syncAllChildNavHostLayouts(plugin) {
 }
 
 function ensureChildNavHost(protyle, docId) {
-    const anchor = findChildNavInsertAnchor(protyle);
+    const p = unwrapProtyle(protyle);
+    const anchor = findChildNavInsertAnchor(p);
     if (!anchor) {
         return null;
     }
-    const { parent, before } = anchor;
-    let host = parent.querySelector(`:scope > .${CHILD_NAV_HOST_CLASS}`);
+    let host = p?.element?.querySelector?.(`.${CHILD_NAV_HOST_CLASS}`)
+        || anchor.parent.querySelector(`:scope > .${CHILD_NAV_HOST_CLASS}`);
     if (!host) {
         host = document.createElement("div");
         host.className = CHILD_NAV_HOST_CLASS;
         host.contentEditable = "false";
         host.setAttribute("spellcheck", "false");
-        if (before && before.parentElement === parent) {
-            parent.insertBefore(host, before);
-        } else if (anchor.title?.nextSibling) {
-            parent.insertBefore(host, anchor.title.nextSibling);
-        } else {
-            parent.appendChild(host);
+        placeChildNavHost(host, anchor);
+    } else {
+        const needsMove = host.parentElement !== anchor.parent
+            || (anchor.before && host.nextElementSibling !== anchor.before);
+        if (needsMove) {
+            placeChildNavHost(host, anchor);
         }
     }
     if (host.dataset.docId && host.dataset.docId !== docId) {
@@ -1408,22 +1459,172 @@ function ensureChildNavHost(protyle, docId) {
         host.dataset.paintedDocId = "";
     }
     host.dataset.docId = docId;
-    syncChildNavHostLayout(host, protyle);
+    delete host.dataset.position;
+    syncChildNavHostLayout(host, p);
     return host;
 }
 
-function openChildNavDoc(id) {
-    if (!id) {
-        return;
+function findActiveProtyleForChildNav() {
+    const activeWnd = document.querySelector(".layout__wnd--active");
+    if (activeWnd) {
+        for (const { protyle } of getAllEditor()) {
+            const p = unwrapProtyle(protyle);
+            if (p?.element && activeWnd.contains(p.element) && !p.element.classList.contains("fn__none")) {
+                return p;
+            }
+        }
+    }
+    for (const { protyle } of getAllEditor()) {
+        const p = unwrapProtyle(protyle);
+        if (p?.element && !p.element.classList.contains("fn__none") && p.element.clientHeight > 0) {
+            return p;
+        }
+    }
+    return null;
+}
+
+function focusEditableAtEnd(editEl) {
+    if (!editEl) {
+        return null;
     }
     try {
-        window.open(`siyuan://blocks/${id}`);
+        editEl.scrollIntoView?.({ block: "nearest" });
     } catch (error) {
-        console.warn(`${LOG_PREFIX} openChildNavDoc failed`, id, error);
+        // ignore
+    }
+    try {
+        editEl.focus({ preventScroll: true });
+    } catch (error) {
+        try {
+            editEl.focus();
+        } catch (error2) {
+            // ignore
+        }
+    }
+    const range = document.createRange();
+    try {
+        // Prefer text node end when present (more reliable for title input).
+        const walker = document.createTreeWalker(editEl, NodeFilter.SHOW_TEXT, null);
+        let lastText = null;
+        let node = walker.nextNode();
+        while (node) {
+            lastText = node;
+            node = walker.nextNode();
+        }
+        if (lastText) {
+            const len = lastText.textContent?.length || 0;
+            range.setStart(lastText, len);
+            range.setEnd(lastText, len);
+        } else {
+            range.selectNodeContents(editEl);
+            range.collapse(false);
+        }
+    } catch (error) {
+        return null;
+    }
+    const sel = window.getSelection();
+    sel?.removeAllRanges?.();
+    sel?.addRange?.(range);
+    return range;
+}
+
+/** Before leave: put caret at end of first body block so mouse-back restores there. */
+function focusChildNavReturnAnchor(protyle) {
+    const p = unwrapProtyle(protyle);
+    if (!p) {
+        return null;
+    }
+    const rootId = getProtyleDocId(p);
+    const firstBlock = p.wysiwyg?.element?.querySelector?.(":scope > [data-node-id]") || null;
+    let blockElement = firstBlock;
+    let editEl = null;
+    if (firstBlock) {
+        editEl = firstBlock.querySelector?.('[contenteditable="true"]') || firstBlock;
+    }
+    if (!editEl) {
+        // Empty doc fallback: title input
+        editEl = p.title?.editElement
+            || p.element?.querySelector?.(".protyle-title__input");
+        blockElement = editEl
+            || p.title?.element
+            || p.element?.querySelector?.(".protyle-title");
+    }
+    const id = blockElement?.getAttribute?.("data-node-id") || rootId;
+    const range = focusEditableAtEnd(editEl);
+    if (p.toolbar && range) {
+        p.toolbar.range = range;
+    }
+    const textLen = String(editEl?.textContent || "").length;
+    return {
+        id: id || rootId,
+        protyle: p,
+        position: { start: textLen, end: textLen },
+        zoomId: p.block?.showAll ? p.block.id : undefined,
+    };
+}
+
+/** Push the focused return anchor onto SiYuan backStack. */
+function pushProtyleToBackStack(anchor) {
+    if (!anchor?.protyle?.model || !anchor.id || !Array.isArray(window.siyuan?.backStack)) {
+        return;
+    }
+    const p = anchor.protyle;
+    const last = window.siyuan.backStack[window.siyuan.backStack.length - 1];
+    if (last && last.protyle === p && last.id === anchor.id) {
+        last.position = anchor.position || last.position;
+        return;
+    }
+    window.siyuan.backStack.push({
+        position: anchor.position || { start: 0, end: 0 },
+        id: anchor.id,
+        protyle: p,
+        zoomId: anchor.zoomId,
+    });
+    if (window.siyuan.backStack.length > (Constants?.SIZE_UNDO || 200)) {
+        window.siyuan.backStack.shift();
+    }
+    if (window.siyuan.backStack.length > 1) {
+        document.querySelector("#barBack")?.classList.remove("toolbar__item--disabled");
     }
 }
 
-function renderChildNavNodeEl(node, onToggle) {
+function openChildNavDoc(id, fromProtyle) {
+    if (!id) {
+        return;
+    }
+    const plugin = activeFhelperPlugin;
+    const source = unwrapProtyle(fromProtyle) || findActiveProtyleForChildNav();
+    // Focus end of first body line so mouse-back restores there.
+    const returnAnchor = focusChildNavReturnAnchor(source);
+    pushProtyleToBackStack(returnAnchor);
+
+    const navigate = () => {
+        if (plugin?.app && typeof openTab === "function") {
+            try {
+                openTab({
+                    app: plugin.app,
+                    doc: {
+                        id,
+                        action: [
+                            Constants?.CB_GET_FOCUS || "cb-get-focus",
+                            Constants?.CB_GET_SCROLL || "cb-get-scroll",
+                        ],
+                    },
+                });
+                return;
+            } catch (error) {
+                console.warn(`${LOG_PREFIX} openTab failed`, id, error);
+            }
+        }
+        console.warn(`${LOG_PREFIX} openChildNavDoc: openTab unavailable`, id);
+    };
+    // Let the browser apply selection before tab switch (otherwise caret never moves).
+    window.requestAnimationFrame(() => {
+        window.setTimeout(navigate, 30);
+    });
+}
+
+function renderChildNavNodeEl(node, onToggle, onOpen) {
     const wrap = document.createElement("div");
     wrap.className = "fhelper-child-nav__node";
 
@@ -1446,7 +1647,7 @@ function renderChildNavNodeEl(node, onToggle) {
 
     const icon = document.createElement("span");
     icon.className = "fhelper-child-nav__icon";
-    icon.textContent = node.subFileCount > 0 ? "📂" : "📄";
+    icon.textContent = "📄";
 
     const label = document.createElement("span");
     label.className = "fhelper-child-nav__label";
@@ -1456,13 +1657,13 @@ function renderChildNavNodeEl(node, onToggle) {
     row.appendChild(twist);
     row.appendChild(icon);
     row.appendChild(label);
-    row.addEventListener("click", () => openChildNavDoc(node.id));
+    row.addEventListener("click", () => onOpen(node.id));
     wrap.appendChild(row);
 
     if (node.children?.length && node.open) {
         const kids = document.createElement("div");
         kids.className = "fhelper-child-nav__children";
-        node.children.forEach((child) => kids.appendChild(renderChildNavNodeEl(child, onToggle)));
+        node.children.forEach((child) => kids.appendChild(renderChildNavNodeEl(child, onToggle, onOpen)));
         wrap.appendChild(kids);
     }
     return wrap;
@@ -1536,7 +1737,11 @@ function paintChildNavHost(host, plugin, docId, tree, errorText) {
             host.dataset.treeSig = childNavTreeSignature(tree);
             paintChildNavHost(host, plugin, docId, tree, "");
         };
-        tree.forEach((node) => treeEl.appendChild(renderChildNavNodeEl(node, onToggle)));
+        const onOpen = (targetId) => {
+            const source = findProtyleByElement(host) || findActiveProtyleForChildNav();
+            openChildNavDoc(targetId, source);
+        };
+        tree.forEach((node) => treeEl.appendChild(renderChildNavNodeEl(node, onToggle, onOpen)));
     }
     shell.appendChild(treeEl);
     host.appendChild(shell);
@@ -1612,8 +1817,7 @@ async function mountChildNavForProtyle(plugin, protyle) {
     }
     const docId = getProtyleDocId(p);
     if (!plugin?.config?.childDocWidget?.enabled || !docId) {
-        const anchor = findChildNavInsertAnchor(p);
-        anchor?.parent?.querySelectorAll?.(`:scope > .${CHILD_NAV_HOST_CLASS}`)?.forEach(removeChildNavHost);
+        p.element?.querySelectorAll?.(`.${CHILD_NAV_HOST_CLASS}`)?.forEach(removeChildNavHost);
         return;
     }
     if (!plugin.childNavCleanupDocs) {
@@ -2231,6 +2435,9 @@ function formatChildDocIndexMessage(i18n, key, params = {}) {
 }
 
 async function handleChildDocIndexForProtyle(plugin, protyle) {
+    if (!isChildDocIndexEnabled(plugin)) {
+        return;
+    }
     if (plugin.childDocIndexBusy) {
         return;
     }
@@ -2428,6 +2635,9 @@ async function moveDocsAsChildren(parentId, docIds) {
 }
 
 async function handleGatherReferencedDocsForProtyle(plugin, protyle) {
+    if (!isChildDocIndexEnabled(plugin)) {
+        return;
+    }
     if (plugin.gatherRefsBusy) {
         return;
     }
@@ -2518,6 +2728,9 @@ async function removeDocById(docId) {
 }
 
 async function handleDeleteUnreferencedChildrenForProtyle(plugin, protyle) {
+    if (!isChildDocIndexEnabled(plugin)) {
+        return;
+    }
     if (plugin.deleteUnrefBusy) {
         return;
     }
@@ -2674,14 +2887,35 @@ function bindDocActionBreadcrumbButton(plugin, btn, action) {
     return fresh;
 }
 
+const CHILD_DOC_INDEX_BREADCRUMB_TYPES = [
+    BREADCRUMB_BTN_CHILD_INDEX,
+    BREADCRUMB_BTN_GATHER,
+    BREADCRUMB_BTN_DELETE_UNREF,
+];
+
+function removeChildDocIndexBreadcrumbButtons(root = document) {
+    const selector = CHILD_DOC_INDEX_BREADCRUMB_TYPES
+        .map((type) => `.protyle-breadcrumb [data-type="${type}"], button[data-type="${type}"]`)
+        .join(", ");
+    root.querySelectorAll?.(selector)?.forEach((el) => el.remove());
+}
+
 function ensureDocActionBreadcrumbButtons(plugin, protyle) {
     const root = getBreadcrumbRoot(protyle);
     if (!root) {
         return;
     }
+    const indexEnabled = isChildDocIndexEnabled(plugin);
+    if (!indexEnabled) {
+        removeChildDocIndexBreadcrumbButtons(root);
+    }
     const lockBtn = root.querySelector('[data-type="readonly"]');
     let insertBefore = lockBtn;
     BREADCRUMB_DOC_ACTIONS.forEach((action) => {
+        const isIndexAction = CHILD_DOC_INDEX_BREADCRUMB_TYPES.includes(action.type);
+        if (isIndexAction && !indexEnabled) {
+            return;
+        }
         let btn = root.querySelector(`[data-type="${action.type}"]`);
         if (!btn) {
             btn = document.createElement("button");
@@ -2700,9 +2934,26 @@ function ensureDocActionBreadcrumbButtons(plugin, protyle) {
     });
 }
 
+function syncChildDocIndexFeature(plugin) {
+    const enabled = isChildDocIndexEnabled(plugin);
+    setChildDocIndexDomGate(enabled);
+    if (!enabled) {
+        removeChildDocIndexBreadcrumbButtons(document);
+        return;
+    }
+    patchChildDocIndexBreadcrumbButtons(plugin);
+}
+
 function patchChildDocIndexBreadcrumbButtons(plugin) {
-    getAllEditor().forEach(({ protyle }) => {
-        ensureDocActionBreadcrumbButtons(plugin, protyle);
+    if (!isChildDocIndexEnabled(plugin)) {
+        removeChildDocIndexBreadcrumbButtons(document);
+        return;
+    }
+    getAllEditor().forEach((editor) => {
+        const protyle = unwrapProtyle(editor?.protyle || editor);
+        if (protyle) {
+            ensureDocActionBreadcrumbButtons(plugin, protyle);
+        }
     });
 }
 
@@ -4349,6 +4600,11 @@ module.exports = class FhelperPlugin extends Plugin {
     windowResizeHandler = null;
     childDocIndexProgressDialog = null;
     childDocIndexCancelFlag = null;
+    childDocIndexEnableEl = null;
+    childDocIndexGlobalBtn = null;
+    childDocIndexNotebookBtn = null;
+    childDocIndexGlobalRow = null;
+    childDocIndexNotebookRow = null;
     childDocIndexNotebookSelectEl = null;
     childDocIndexBusy = false;
     gatherRefsBusy = false;
@@ -4357,19 +4613,21 @@ module.exports = class FhelperPlugin extends Plugin {
 
     updateProtyleToolbar(toolbar) {
         toolbar.push("|");
-        toolbar.push({
-            name: "fhelper-child-doc-index",
-            icon: FHELPER_ICON_CHILD_INDEX,
-            hotkey: "",
-            tipPosition: "n",
-            tip: this.i18n.childDocIndexToolbarTip,
-            click: (protyle) => {
-                handleChildDocIndexForProtyle(this, protyle).catch((error) => {
-                    console.warn(`${LOG_PREFIX} handleChildDocIndexForProtyle failed`, error);
-                    showMessage(this.i18n.childDocIndexFailed);
-                });
-            },
-        });
+        if (isChildDocIndexEnabled(this)) {
+            toolbar.push({
+                name: "fhelper-child-doc-index",
+                icon: FHELPER_ICON_CHILD_INDEX,
+                hotkey: "",
+                tipPosition: "n",
+                tip: this.i18n.childDocIndexToolbarTip,
+                click: (protyle) => {
+                    handleChildDocIndexForProtyle(this, protyle).catch((error) => {
+                        console.warn(`${LOG_PREFIX} handleChildDocIndexForProtyle failed`, error);
+                        showMessage(this.i18n.childDocIndexFailed);
+                    });
+                },
+            });
+        }
         toolbar.push({
             name: "fhelper-locate-in-tree",
             icon: "iconFocus",
@@ -4383,37 +4641,40 @@ module.exports = class FhelperPlugin extends Plugin {
                 });
             },
         });
-        toolbar.push({
-            name: "fhelper-gather-refs",
-            icon: FHELPER_ICON_GATHER_REFS,
-            hotkey: "",
-            tipPosition: "n",
-            tip: this.i18n.gatherRefsToolbarTip,
-            click: (protyle) => {
-                handleGatherReferencedDocsForProtyle(this, protyle).catch((error) => {
-                    console.warn(`${LOG_PREFIX} handleGatherReferencedDocsForProtyle failed`, error);
-                    showMessage(this.i18n.gatherRefsFailed);
-                });
-            },
-        });
-        toolbar.push({
-            name: "fhelper-delete-unref-children",
-            icon: FHELPER_ICON_DELETE_UNREF,
-            hotkey: "",
-            tipPosition: "n",
-            tip: this.i18n.deleteUnrefToolbarTip,
-            click: (protyle) => {
-                handleDeleteUnreferencedChildrenForProtyle(this, protyle).catch((error) => {
-                    console.warn(`${LOG_PREFIX} handleDeleteUnreferencedChildrenForProtyle failed`, error);
-                    showMessage(this.i18n.deleteUnrefFailed);
-                });
-            },
-        });
+        if (isChildDocIndexEnabled(this)) {
+            toolbar.push({
+                name: "fhelper-gather-refs",
+                icon: FHELPER_ICON_GATHER_REFS,
+                hotkey: "",
+                tipPosition: "n",
+                tip: this.i18n.gatherRefsToolbarTip,
+                click: (protyle) => {
+                    handleGatherReferencedDocsForProtyle(this, protyle).catch((error) => {
+                        console.warn(`${LOG_PREFIX} handleGatherReferencedDocsForProtyle failed`, error);
+                        showMessage(this.i18n.gatherRefsFailed);
+                    });
+                },
+            });
+            toolbar.push({
+                name: "fhelper-delete-unref-children",
+                icon: FHELPER_ICON_DELETE_UNREF,
+                hotkey: "",
+                tipPosition: "n",
+                tip: this.i18n.deleteUnrefToolbarTip,
+                click: (protyle) => {
+                    handleDeleteUnreferencedChildrenForProtyle(this, protyle).catch((error) => {
+                        console.warn(`${LOG_PREFIX} handleDeleteUnreferencedChildrenForProtyle failed`, error);
+                        showMessage(this.i18n.deleteUnrefFailed);
+                    });
+                },
+            });
+        }
         return toolbar;
     }
 
     onload() {
         this.data[STORAGE_NAME] = createDefaultConfig();
+        activeFhelperPlugin = this;
 
         this.addIcons(`
 <symbol id="${FHELPER_ICON_CHILD_INDEX}" viewBox="0 0 32 32">
@@ -4554,17 +4815,19 @@ module.exports = class FhelperPlugin extends Plugin {
                 return;
             }
             topMenu.addItem({ type: "separator", id: "fhelper-breadcrumb-sep" });
-            topMenu.addItem({
-                id: "fhelper-child-doc-index",
-                icon: FHELPER_ICON_CHILD_INDEX,
-                label: this.i18n.childDocIndexMenuLabel,
-                click: () => {
-                    handleChildDocIndexForProtyle(this, protyle).catch((error) => {
-                        console.warn(`${LOG_PREFIX} breadcrumbmore child index failed`, error);
-                        showMessage(this.i18n.childDocIndexFailed);
-                    });
-                },
-            });
+            if (isChildDocIndexEnabled(this)) {
+                topMenu.addItem({
+                    id: "fhelper-child-doc-index",
+                    icon: FHELPER_ICON_CHILD_INDEX,
+                    label: this.i18n.childDocIndexMenuLabel,
+                    click: () => {
+                        handleChildDocIndexForProtyle(this, protyle).catch((error) => {
+                            console.warn(`${LOG_PREFIX} breadcrumbmore child index failed`, error);
+                            showMessage(this.i18n.childDocIndexFailed);
+                        });
+                    },
+                });
+            }
             topMenu.addItem({
                 id: "fhelper-locate-in-tree",
                 icon: "iconFocus",
@@ -4576,28 +4839,30 @@ module.exports = class FhelperPlugin extends Plugin {
                     });
                 },
             });
-            topMenu.addItem({
-                id: "fhelper-gather-refs",
-                icon: FHELPER_ICON_GATHER_REFS,
-                label: this.i18n.gatherRefsMenuLabel,
-                click: () => {
-                    handleGatherReferencedDocsForProtyle(this, protyle).catch((error) => {
-                        console.warn(`${LOG_PREFIX} breadcrumbmore gather failed`, error);
-                        showMessage(this.i18n.gatherRefsFailed);
-                    });
-                },
-            });
-            topMenu.addItem({
-                id: "fhelper-delete-unref-children",
-                icon: FHELPER_ICON_DELETE_UNREF,
-                label: this.i18n.deleteUnrefMenuLabel,
-                click: () => {
-                    handleDeleteUnreferencedChildrenForProtyle(this, protyle).catch((error) => {
-                        console.warn(`${LOG_PREFIX} breadcrumbmore delete unref failed`, error);
-                        showMessage(this.i18n.deleteUnrefFailed);
-                    });
-                },
-            });
+            if (isChildDocIndexEnabled(this)) {
+                topMenu.addItem({
+                    id: "fhelper-gather-refs",
+                    icon: FHELPER_ICON_GATHER_REFS,
+                    label: this.i18n.gatherRefsMenuLabel,
+                    click: () => {
+                        handleGatherReferencedDocsForProtyle(this, protyle).catch((error) => {
+                            console.warn(`${LOG_PREFIX} breadcrumbmore gather failed`, error);
+                            showMessage(this.i18n.gatherRefsFailed);
+                        });
+                    },
+                });
+                topMenu.addItem({
+                    id: "fhelper-delete-unref-children",
+                    icon: FHELPER_ICON_DELETE_UNREF,
+                    label: this.i18n.deleteUnrefMenuLabel,
+                    click: () => {
+                        handleDeleteUnreferencedChildrenForProtyle(this, protyle).catch((error) => {
+                            console.warn(`${LOG_PREFIX} breadcrumbmore delete unref failed`, error);
+                            showMessage(this.i18n.deleteUnrefFailed);
+                        });
+                    },
+                });
+            }
         };
         this.eventBus.on("open-menu-breadcrumbmore", this.breadcrumbMoreHandler);
 
@@ -4620,6 +4885,7 @@ module.exports = class FhelperPlugin extends Plugin {
         this.ensureBazaarSettingButton();
         this.scheduleBazaarSettingButtonFix();
         syncDocRefStyleFeature(this);
+        syncChildDocIndexFeature(this);
     }
 
     onunload() {
@@ -4663,6 +4929,7 @@ module.exports = class FhelperPlugin extends Plugin {
             this.eventBus.off("ws-main", this.docRefWsHandler);
             this.docRefWsHandler = null;
         }
+        document.documentElement.classList.remove(CHILD_DOC_INDEX_OFF_CLASS);
         if (this.childNavWsTimer) {
             window.clearTimeout(this.childNavWsTimer);
             this.childNavWsTimer = null;
@@ -4767,6 +5034,7 @@ module.exports = class FhelperPlugin extends Plugin {
                 scheduleLayoutRefresh(this);
             }
             syncAllChildNavPanels(this);
+            syncChildDocIndexFeature(this);
         }
     }
 
@@ -4861,6 +5129,9 @@ module.exports = class FhelperPlugin extends Plugin {
     }
 
     confirmAndRunGlobalChildDocIndex() {
+        if (!isChildDocIndexEnabled(this)) {
+            return;
+        }
         const confirmed = window.confirm(this.i18n.childDocIndexGlobalConfirm);
         if (!confirmed) {
             return;
@@ -4872,6 +5143,9 @@ module.exports = class FhelperPlugin extends Plugin {
     }
 
     confirmAndRunNotebookChildDocIndex() {
+        if (!isChildDocIndexEnabled(this)) {
+            return;
+        }
         const notebookId = this.childDocIndexNotebookSelectEl?.value || "";
         if (!notebookId) {
             showMessage(this.i18n.childDocIndexNotebookRequired);
@@ -5065,11 +5339,34 @@ module.exports = class FhelperPlugin extends Plugin {
                 mode: normalizeChildNavMode(this.childDocWidgetModeEl.value),
             };
         }
+        if (this.childDocIndexEnableEl) {
+            this.config.childDocIndex = {
+                ...(this.config.childDocIndex || createDefaultChildDocIndexConfig()),
+                enabled: this.childDocIndexEnableEl.checked,
+            };
+        }
         if (this.childDocIndexNotebookSelectEl) {
             this.config.childDocIndex = {
                 ...(this.config.childDocIndex || createDefaultChildDocIndexConfig()),
                 selectedNotebookId: this.childDocIndexNotebookSelectEl.value || "",
             };
+        }
+    }
+
+    updateChildDocIndexSettingControls() {
+        const enabled = this.childDocIndexEnableEl
+            ? this.childDocIndexEnableEl.checked
+            : isChildDocIndexEnabled(this);
+        this.childDocIndexGlobalRow?.classList.toggle("fn__none", !enabled);
+        this.childDocIndexNotebookRow?.classList.toggle("fn__none", !enabled);
+        if (this.childDocIndexGlobalBtn) {
+            this.childDocIndexGlobalBtn.disabled = !enabled;
+        }
+        if (this.childDocIndexNotebookBtn) {
+            this.childDocIndexNotebookBtn.disabled = !enabled;
+        }
+        if (this.childDocIndexNotebookSelectEl) {
+            this.childDocIndexNotebookSelectEl.disabled = !enabled;
         }
     }
 
@@ -5127,6 +5424,7 @@ module.exports = class FhelperPlugin extends Plugin {
         this.data[STORAGE_NAME] = this.config;
         scheduleLayoutRefresh(this);
         syncAllChildNavPanels(this);
+        syncChildDocIndexFeature(this);
         return this.saveData(STORAGE_NAME, this.config);
     }
 
@@ -5242,7 +5540,24 @@ module.exports = class FhelperPlugin extends Plugin {
         }));
         panel.appendChild(childNavSection);
 
+        const childDocIndex = this.config.childDocIndex || createDefaultChildDocIndexConfig();
         const childDocIndexSection = this.createSettingSection(this.i18n.sectionChildDocIndex);
+        this.childDocIndexEnableEl = this.createSettingSwitch(childDocIndex.enabled !== false);
+        this.childDocIndexEnableEl.addEventListener("change", () => {
+            this.updateChildDocIndexSettingControls();
+            // Preview immediately in open editors (persisted on 确定).
+            this.config.childDocIndex = {
+                ...(this.config.childDocIndex || createDefaultChildDocIndexConfig()),
+                enabled: this.childDocIndexEnableEl.checked,
+            };
+            syncChildDocIndexFeature(this);
+        });
+        childDocIndexSection.appendChild(this.createSettingRow({
+            title: this.i18n.childDocIndexEnable,
+            description: this.i18n.childDocIndexEnableDesc,
+            control: this.childDocIndexEnableEl,
+        }));
+
         const globalIndexBtn = document.createElement("button");
         globalIndexBtn.type = "button";
         globalIndexBtn.className = "b3-button b3-button--outline";
@@ -5250,11 +5565,13 @@ module.exports = class FhelperPlugin extends Plugin {
         globalIndexBtn.addEventListener("click", () => {
             this.confirmAndRunGlobalChildDocIndex();
         });
-        childDocIndexSection.appendChild(this.createSettingRow({
+        this.childDocIndexGlobalBtn = globalIndexBtn;
+        this.childDocIndexGlobalRow = this.createSettingRow({
             title: this.i18n.childDocIndexGlobalTitle,
             description: this.i18n.childDocIndexGlobalDesc,
             control: globalIndexBtn,
-        }));
+        });
+        childDocIndexSection.appendChild(this.childDocIndexGlobalRow);
 
         const notebookControls = document.createElement("div");
         notebookControls.className = "fn__flex";
@@ -5275,13 +5592,16 @@ module.exports = class FhelperPlugin extends Plugin {
         notebookIndexBtn.addEventListener("click", () => {
             this.confirmAndRunNotebookChildDocIndex();
         });
+        this.childDocIndexNotebookBtn = notebookIndexBtn;
         notebookControls.appendChild(notebookSelect);
         notebookControls.appendChild(notebookIndexBtn);
-        childDocIndexSection.appendChild(this.createSettingRow({
+        this.childDocIndexNotebookRow = this.createSettingRow({
             title: this.i18n.childDocIndexNotebookTitle,
             description: this.i18n.childDocIndexNotebookDesc,
             control: notebookControls,
-        }));
+        });
+        childDocIndexSection.appendChild(this.childDocIndexNotebookRow);
+        this.updateChildDocIndexSettingControls();
         panel.appendChild(childDocIndexSection);
 
         const aboutSection = this.createSettingSection(this.i18n.sectionAbout);
@@ -5603,27 +5923,29 @@ module.exports = class FhelperPlugin extends Plugin {
 .fhelper-child-nav__tree {
     display: flex;
     flex-direction: column;
-    gap: 2px;
+    gap: 0;
 }
 .fhelper-child-nav__row {
     display: flex;
     align-items: center;
-    gap: 6px;
-    min-height: 30px;
-    padding: 4px 8px;
-    border-radius: 10px;
+    gap: 4px;
+    min-height: 28px;
+    padding: 3px 6px;
+    border-radius: 6px;
     cursor: pointer;
+    font-size: inherit;
+    line-height: inherit;
 }
 .fhelper-child-nav__row:hover {
     background: var(--b3-list-hover);
 }
 .fhelper-child-nav__twist {
-    width: 18px;
-    height: 18px;
+    width: 16px;
+    height: 16px;
     border: 0;
     background: transparent;
     color: var(--b3-theme-on-surface);
-    border-radius: 6px;
+    border-radius: 4px;
     cursor: pointer;
     display: inline-flex;
     align-items: center;
@@ -5635,17 +5957,19 @@ module.exports = class FhelperPlugin extends Plugin {
     visibility: hidden;
 }
 .fhelper-child-nav__twist svg {
-    width: 12px;
-    height: 12px;
+    width: 10px;
+    height: 10px;
     transition: transform .15s ease;
 }
 .fhelper-child-nav__twist.is-open svg {
     transform: rotate(90deg);
 }
 .fhelper-child-nav__icon {
-    width: 18px;
+    width: 16px;
     flex: 0 0 auto;
     text-align: center;
+    font-size: 12px;
+    line-height: 1;
 }
 .fhelper-child-nav__label {
     flex: 1 1 auto;
@@ -5655,12 +5979,12 @@ module.exports = class FhelperPlugin extends Plugin {
     white-space: nowrap;
 }
 .fhelper-child-nav__children {
-    margin-left: 14px;
-    padding-left: 10px;
+    margin-left: 12px;
+    padding-left: 8px;
     border-left: 1px dashed var(--b3-border-color);
     display: flex;
     flex-direction: column;
-    gap: 2px;
+    gap: 0;
 }
 .fhelper-child-nav__empty,
 .fhelper-child-nav__error {
@@ -5672,6 +5996,14 @@ module.exports = class FhelperPlugin extends Plugin {
 .fhelper-child-nav__error {
     color: var(--b3-theme-error);
     opacity: 1;
+}
+html.fhelper-child-doc-index-off .protyle-breadcrumb [data-type="fhelper-child-doc-index"],
+html.fhelper-child-doc-index-off .protyle-breadcrumb [data-type="fhelper-gather-refs"],
+html.fhelper-child-doc-index-off .protyle-breadcrumb [data-type="fhelper-delete-unref-children"],
+html.fhelper-child-doc-index-off button[data-type="fhelper-child-doc-index"],
+html.fhelper-child-doc-index-off button[data-type="fhelper-gather-refs"],
+html.fhelper-child-doc-index-off button[data-type="fhelper-delete-unref-children"] {
+    display: none !important;
 }
 `;
     }
@@ -5696,6 +6028,11 @@ module.exports = class FhelperPlugin extends Plugin {
         this.docRefStyleEnableEl = null;
         this.childDocWidgetEnableEl = null;
         this.childDocWidgetModeEl = null;
+        this.childDocIndexEnableEl = null;
+        this.childDocIndexGlobalBtn = null;
+        this.childDocIndexNotebookBtn = null;
+        this.childDocIndexGlobalRow = null;
+        this.childDocIndexNotebookRow = null;
         this.childDocIndexNotebookSelectEl = null;
         this.slashSearchEl = null;
         this.slashListEl = null;
