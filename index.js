@@ -1483,102 +1483,85 @@ function findActiveProtyleForChildNav() {
     return null;
 }
 
-function focusEditableAtEnd(editEl) {
-    if (!editEl) {
-        return null;
-    }
-    try {
-        editEl.scrollIntoView?.({ block: "nearest" });
-    } catch (error) {
-        // ignore
-    }
-    try {
-        editEl.focus({ preventScroll: true });
-    } catch (error) {
-        try {
-            editEl.focus();
-        } catch (error2) {
-            // ignore
-        }
-    }
-    const range = document.createRange();
-    try {
-        // Prefer text node end when present (more reliable for title input).
-        const walker = document.createTreeWalker(editEl, NodeFilter.SHOW_TEXT, null);
-        let lastText = null;
-        let node = walker.nextNode();
-        while (node) {
-            lastText = node;
-            node = walker.nextNode();
-        }
-        if (lastText) {
-            const len = lastText.textContent?.length || 0;
-            range.setStart(lastText, len);
-            range.setEnd(lastText, len);
-        } else {
-            range.selectNodeContents(editEl);
-            range.collapse(false);
-        }
-    } catch (error) {
-        return null;
-    }
-    const sel = window.getSelection();
-    sel?.removeAllRanges?.();
-    sel?.addRange?.(range);
-    return range;
-}
+/** rootId → scrollTop that shows the child-nav panel (for mouse-back restore). */
+const childNavReturnByRoot = new Map();
+/** Set when user triggers back; cleared after restore or timeout. */
+let childNavBackRestorePendingUntil = 0;
 
-/** Before leave: put caret at end of first body block so mouse-back restores there. */
-function focusChildNavReturnAnchor(protyle) {
+function getChildNavScrollTop(protyle) {
     const p = unwrapProtyle(protyle);
-    if (!p) {
-        return null;
+    const content = p?.contentElement;
+    const host = p?.element?.querySelector?.(`.${CHILD_NAV_HOST_CLASS}`);
+    if (!content) {
+        return 0;
     }
-    const rootId = getProtyleDocId(p);
-    const firstBlock = p.wysiwyg?.element?.querySelector?.(":scope > [data-node-id]") || null;
-    let blockElement = firstBlock;
-    let editEl = null;
-    if (firstBlock) {
-        editEl = firstBlock.querySelector?.('[contenteditable="true"]') || firstBlock;
+    if (!host) {
+        return content.scrollTop || 0;
     }
-    if (!editEl) {
-        // Empty doc fallback: title input
-        editEl = p.title?.editElement
-            || p.element?.querySelector?.(".protyle-title__input");
-        blockElement = editEl
-            || p.title?.element
-            || p.element?.querySelector?.(".protyle-title");
-    }
-    const id = blockElement?.getAttribute?.("data-node-id") || rootId;
-    const range = focusEditableAtEnd(editEl);
-    if (p.toolbar && range) {
-        p.toolbar.range = range;
-    }
-    const textLen = String(editEl?.textContent || "").length;
-    return {
-        id: id || rootId,
-        protyle: p,
-        position: { start: textLen, end: textLen },
-        zoomId: p.block?.showAll ? p.block.id : undefined,
-    };
+    const contentRect = content.getBoundingClientRect();
+    const hostRect = host.getBoundingClientRect();
+    const next = content.scrollTop + (hostRect.top - contentRect.top) - 8;
+    return next > 0 ? next : 0;
 }
 
-/** Push the focused return anchor onto SiYuan backStack. */
-function pushProtyleToBackStack(anchor) {
-    if (!anchor?.protyle?.model || !anchor.id || !Array.isArray(window.siyuan?.backStack)) {
+function scrollProtyleToChildNav(protyle, preferredScrollTop) {
+    const p = unwrapProtyle(protyle);
+    const content = p?.contentElement;
+    const host = p?.element?.querySelector?.(`.${CHILD_NAV_HOST_CLASS}`);
+    if (!content) {
         return;
     }
-    const p = anchor.protyle;
+    if (typeof preferredScrollTop === "number") {
+        content.scrollTop = preferredScrollTop;
+    }
+    if (host) {
+        const cRect = content.getBoundingClientRect();
+        const hRect = host.getBoundingClientRect();
+        if (hRect.top < cRect.top + 4 || hRect.bottom > cRect.bottom - 4) {
+            try {
+                host.scrollIntoView({ block: "start", behavior: "instant" });
+            } catch (error) {
+                host.scrollIntoView(true);
+            }
+        }
+    }
+}
+
+/**
+ * Record the child-nav panel as the return anchor (no caret move).
+ * Mouse-back restores this doc and scrolls to the nav view.
+ */
+function pushChildNavReturnAnchor(protyle) {
+    const p = unwrapProtyle(protyle);
+    if (!p?.model || !Array.isArray(window.siyuan?.backStack)) {
+        return;
+    }
+    const rootId = getProtyleDocId(p);
+    if (!rootId) {
+        return;
+    }
+    const scrollTop = getChildNavScrollTop(p);
+    childNavReturnByRoot.set(rootId, { scrollTop, at: Date.now() });
+
     const last = window.siyuan.backStack[window.siyuan.backStack.length - 1];
-    if (last && last.protyle === p && last.id === anchor.id) {
-        last.position = anchor.position || last.position;
+    // Prefer rewriting the current doc's stack top so mouse-back lands once on nav,
+    // instead of stacking an extra history entry.
+    if (last && last.protyle === p) {
+        last.position = { start: 0, end: 0 };
+        last.id = rootId;
+        last.zoomId = undefined;
+        last.fhelperChildNav = true;
+        last.fhelperNavScrollTop = scrollTop;
         return;
     }
     window.siyuan.backStack.push({
-        position: anchor.position || { start: 0, end: 0 },
-        id: anchor.id,
+        position: { start: 0, end: 0 },
+        // rootId → focusStack treats as doc/title restore; we then scroll to nav.
+        id: rootId,
         protyle: p,
-        zoomId: anchor.zoomId,
+        zoomId: undefined,
+        fhelperChildNav: true,
+        fhelperNavScrollTop: scrollTop,
     });
     if (window.siyuan.backStack.length > (Constants?.SIZE_UNDO || 200)) {
         window.siyuan.backStack.shift();
@@ -1588,40 +1571,105 @@ function pushProtyleToBackStack(anchor) {
     }
 }
 
+function tryRestoreChildNavViewAfterBack() {
+    if (Date.now() > childNavBackRestorePendingUntil) {
+        return false;
+    }
+    const p = findActiveProtyleForChildNav();
+    const rootId = getProtyleDocId(p);
+    if (!rootId || !childNavReturnByRoot.has(rootId)) {
+        return false;
+    }
+    // Only restore when this doc is the one we just returned to (has our panel).
+    const host = p?.element?.querySelector?.(`.${CHILD_NAV_HOST_CLASS}`);
+    if (!host) {
+        return false;
+    }
+    const info = childNavReturnByRoot.get(rootId);
+    scrollProtyleToChildNav(p, info?.scrollTop);
+    childNavReturnByRoot.delete(rootId);
+    childNavBackRestorePendingUntil = 0;
+    return true;
+}
+
+function scheduleRestoreChildNavViewAfterBack(arm = false) {
+    // goBack is async (focusStack); retry a few times after mouse-back / toolbar back.
+    if (arm) {
+        childNavBackRestorePendingUntil = Date.now() + 1200;
+    }
+    if (Date.now() > childNavBackRestorePendingUntil) {
+        return;
+    }
+    [0, 50, 150, 320, 600, 1000].forEach((delay) => {
+        window.setTimeout(tryRestoreChildNavViewAfterBack, delay);
+    });
+}
+
+function installChildNavBackRestore(plugin) {
+    if (!plugin || plugin.childNavBackRestoreInstalled) {
+        return;
+    }
+    plugin.childNavBackMouseHandler = (event) => {
+        if (event.button === 3) {
+            scheduleRestoreChildNavViewAfterBack(true);
+        }
+    };
+    plugin.childNavBackClickHandler = (event) => {
+        const target = event.target;
+        if (target?.closest?.("#barBack")) {
+            scheduleRestoreChildNavViewAfterBack(true);
+        }
+    };
+    // Bubble after SiYuan's window mouseup goBack handler.
+    window.addEventListener("mouseup", plugin.childNavBackMouseHandler);
+    document.addEventListener("click", plugin.childNavBackClickHandler, true);
+    plugin.childNavBackRestoreInstalled = true;
+}
+
+function uninstallChildNavBackRestore(plugin) {
+    if (!plugin?.childNavBackRestoreInstalled) {
+        return;
+    }
+    if (plugin.childNavBackMouseHandler) {
+        window.removeEventListener("mouseup", plugin.childNavBackMouseHandler);
+        plugin.childNavBackMouseHandler = null;
+    }
+    if (plugin.childNavBackClickHandler) {
+        document.removeEventListener("click", plugin.childNavBackClickHandler, true);
+        plugin.childNavBackClickHandler = null;
+    }
+    plugin.childNavBackRestoreInstalled = false;
+    childNavReturnByRoot.clear();
+    childNavBackRestorePendingUntil = 0;
+}
+
 function openChildNavDoc(id, fromProtyle) {
     if (!id) {
         return;
     }
     const plugin = activeFhelperPlugin;
     const source = unwrapProtyle(fromProtyle) || findActiveProtyleForChildNav();
-    // Focus end of first body line so mouse-back restores there.
-    const returnAnchor = focusChildNavReturnAnchor(source);
-    pushProtyleToBackStack(returnAnchor);
+    // Treat the nav panel as the return anchor (no caret jump).
+    pushChildNavReturnAnchor(source);
 
-    const navigate = () => {
-        if (plugin?.app && typeof openTab === "function") {
-            try {
-                openTab({
-                    app: plugin.app,
-                    doc: {
-                        id,
-                        action: [
-                            Constants?.CB_GET_FOCUS || "cb-get-focus",
-                            Constants?.CB_GET_SCROLL || "cb-get-scroll",
-                        ],
-                    },
-                });
-                return;
-            } catch (error) {
-                console.warn(`${LOG_PREFIX} openTab failed`, id, error);
-            }
+    if (plugin?.app && typeof openTab === "function") {
+        try {
+            openTab({
+                app: plugin.app,
+                doc: {
+                    id,
+                    action: [
+                        Constants?.CB_GET_FOCUS || "cb-get-focus",
+                        Constants?.CB_GET_SCROLL || "cb-get-scroll",
+                    ],
+                },
+            });
+            return;
+        } catch (error) {
+            console.warn(`${LOG_PREFIX} openTab failed`, id, error);
         }
-        console.warn(`${LOG_PREFIX} openChildNavDoc: openTab unavailable`, id);
-    };
-    // Let the browser apply selection before tab switch (otherwise caret never moves).
-    window.requestAnimationFrame(() => {
-        window.setTimeout(navigate, 30);
-    });
+    }
+    console.warn(`${LOG_PREFIX} openChildNavDoc: openTab unavailable`, id);
 }
 
 function renderChildNavNodeEl(node, onToggle, onOpen) {
@@ -1924,10 +1972,13 @@ function scheduleChildNavWsRefresh(plugin, event) {
 
 function handleProtyleChildNavStaticLoad(plugin, event) {
     scheduleMountChildNav(plugin, getProtyleFromEvent(event));
+    // If user just hit back, retry scroll-to-nav after panel remount.
+    scheduleRestoreChildNavViewAfterBack(false);
 }
 
 function handleProtyleChildNavSwitch(plugin, event) {
     scheduleMountChildNav(plugin, getProtyleFromEvent(event));
+    scheduleRestoreChildNavViewAfterBack(false);
 }
 
 // Compatibility aliases used by settings/config save paths.
@@ -4876,6 +4927,7 @@ module.exports = class FhelperPlugin extends Plugin {
 
         this.registerBazaarSettingWatcher();
         this.scheduleBazaarSettingButtonFix();
+        installChildNavBackRestore(this);
     }
 
     onLayoutReady() {
@@ -4886,6 +4938,7 @@ module.exports = class FhelperPlugin extends Plugin {
         this.scheduleBazaarSettingButtonFix();
         syncDocRefStyleFeature(this);
         syncChildDocIndexFeature(this);
+        installChildNavBackRestore(this);
     }
 
     onunload() {
@@ -4930,6 +4983,7 @@ module.exports = class FhelperPlugin extends Plugin {
             this.docRefWsHandler = null;
         }
         document.documentElement.classList.remove(CHILD_DOC_INDEX_OFF_CLASS);
+        uninstallChildNavBackRestore(this);
         if (this.childNavWsTimer) {
             window.clearTimeout(this.childNavWsTimer);
             this.childNavWsTimer = null;

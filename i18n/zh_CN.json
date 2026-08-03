@@ -32,7 +32,7 @@
   "docRefStyleEnable": "文档引用美化",
   "docRefStyleEnableDesc": "仅对目标为文档块的引用加下划线与文档图标；目标缺失时显示删除线与默认文档图标。按文档分桶缓存：关文档清缓存、开文档重建；新建子文档后自动刷新父文档。",
   "childDocWidgetEnable": "启用子文档导航植入",
-  "childDocWidgetEnableDesc": "在标题下方直接植入子文档列表（不写入文档块）。打开/切换文档时更新；新建、删除、移动文档后自动刷新。跳转子文档前会先聚焦正文首行末尾，便于侧键返回。",
+  "childDocWidgetEnableDesc": "在标题下方直接植入子文档列表（不写入文档块）。打开/切换文档时更新；新建、删除、移动文档后自动刷新。跳转子文档时会把导航面板记为返回锚点，侧键可回到导航视图。",
   "childDocWidgetMode": "列表模式",
   "childDocWidgetModeDesc": "直接子文档仅显示一层；嵌套模式递归展示完整子树。",
   "childDocWidgetModeDirect": "仅直接子文档",
