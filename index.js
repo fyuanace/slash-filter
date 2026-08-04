@@ -19,6 +19,7 @@ const SIYUAN_LOCAL_ZOOM_KEY = "local-zoom";
 const IMAGE_CENTER_STYLE_ID = "fhelper-img-center-css";
 const SETTING_STYLE_ID = "fhelper-setting-css";
 const DOC_REF_STYLE_ID = "fhelper-doc-ref-css";
+const FILE_TREE_STYLE_ID = "fhelper-file-tree-css";
 const DOC_REF_CLASS = "fhelper-doc-ref";
 const DOC_REF_BROKEN_CLASS = "fhelper-doc-ref-broken";
 const DOC_REF_ICON_CLASS = "fhelper-doc-ref-icon";
@@ -84,6 +85,41 @@ function createDefaultDocRefStyleConfig() {
     return {
         enabled: false,
     };
+}
+
+function createDefaultFileTreeConfig() {
+    return {
+        // Hide the file-tree row "+" (新建子文档) button.
+        hideNewSubDoc: true,
+    };
+}
+
+const FILE_TREE_HIDE_NEW_SUBDOC_CSS = `
+.sy__file .b3-list-item__action[data-type="new"],
+.file-tree .b3-list-item__action[data-type="new"],
+.layout-tab-container .b3-list-item[data-type="navigation-file"] > .b3-list-item__action[data-type="new"],
+.layout-tab-container .b3-list-item[data-type="navigation-root"] > .b3-list-item__action[data-type="new"] {
+    display: none !important;
+}
+`;
+
+function setFileTreeHideNewSubDocCssEnabled(enabled) {
+    let styleEl = document.getElementById(FILE_TREE_STYLE_ID);
+    if (enabled) {
+        if (!styleEl) {
+            styleEl = document.createElement("style");
+            styleEl.id = FILE_TREE_STYLE_ID;
+            document.head.appendChild(styleEl);
+        }
+        styleEl.textContent = FILE_TREE_HIDE_NEW_SUBDOC_CSS;
+        return;
+    }
+    styleEl?.remove();
+}
+
+function syncFileTreeFeature(plugin) {
+    const hide = plugin?.config?.fileTree?.hideNewSubDoc !== false;
+    setFileTreeHideNewSubDocCssEnabled(!!plugin && hide);
 }
 
 function setImageCenterCssEnabled(enabled) {
@@ -4679,6 +4715,7 @@ function createDefaultConfig() {
         docRefStyle: createDefaultDocRefStyleConfig(),
         childDocIndex: createDefaultChildDocIndexConfig(),
         childDocWidget: createDefaultChildDocWidgetConfig(),
+        fileTree: createDefaultFileTreeConfig(),
     };
 }
 
@@ -4823,6 +4860,7 @@ module.exports = class FhelperPlugin extends Plugin {
     docRefStyleEnableEl = null;
     childDocWidgetEnableEl = null;
     childDocWidgetModeEl = null;
+    fileTreeHideNewSubDocEl = null;
     protyleLayoutWatchers = new Map();
     panguSpacingWatchers = new Map();
     docRefByDoc = new Map();
@@ -4915,7 +4953,9 @@ module.exports = class FhelperPlugin extends Plugin {
 
     onload() {
         this.data[STORAGE_NAME] = createDefaultConfig();
+        this.config = this.data[STORAGE_NAME];
         activeFhelperPlugin = this;
+        syncFileTreeFeature(this);
 
         this.addIcons(`
 <symbol id="${FHELPER_ICON_CHILD_INDEX}" viewBox="0 0 32 32">
@@ -5128,6 +5168,7 @@ module.exports = class FhelperPlugin extends Plugin {
         this.scheduleBazaarSettingButtonFix();
         syncDocRefStyleFeature(this);
         syncChildDocIndexFeature(this);
+        syncFileTreeFeature(this);
         installChildNavBackRestore(this);
     }
 
@@ -5174,6 +5215,7 @@ module.exports = class FhelperPlugin extends Plugin {
         }
         document.documentElement.classList.remove(CHILD_DOC_INDEX_OFF_CLASS);
         uninstallChildNavBackRestore(this);
+        setFileTreeHideNewSubDocCssEnabled(false);
         if (this.childNavWsTimer) {
             window.clearTimeout(this.childNavWsTimer);
             this.childNavWsTimer = null;
@@ -5269,6 +5311,10 @@ module.exports = class FhelperPlugin extends Plugin {
                     ...(data.childDocWidget || {}),
                     mode: normalizeChildNavMode(data.childDocWidget?.mode),
                 },
+                fileTree: {
+                    ...createDefaultFileTreeConfig(),
+                    ...(data.fileTree || {}),
+                },
             };
             this.data[STORAGE_NAME] = this.config;
             this.applyImageCenterStyle();
@@ -5279,6 +5325,7 @@ module.exports = class FhelperPlugin extends Plugin {
             }
             syncAllChildNavPanels(this);
             syncChildDocIndexFeature(this);
+            syncFileTreeFeature(this);
         }
     }
 
@@ -5295,7 +5342,8 @@ module.exports = class FhelperPlugin extends Plugin {
                     || data.panguSpacing
                     || data.docRefStyle
                     || data.childDocIndex
-                    || data.childDocWidget);
+                    || data.childDocWidget
+                    || data.fileTree);
             if (hasNewConfig) {
                 this.applyConfig(data);
                 return;
@@ -5352,6 +5400,7 @@ module.exports = class FhelperPlugin extends Plugin {
             docRefStyle: { ...(this.config.docRefStyle || createDefaultDocRefStyleConfig()) },
             childDocIndex: { ...(this.config.childDocIndex || createDefaultChildDocIndexConfig()) },
             childDocWidget: { ...(this.config.childDocWidget || createDefaultChildDocWidgetConfig()) },
+            fileTree: { ...(this.config.fileTree || createDefaultFileTreeConfig()) },
         };
         this.settingToggleEls.forEach((input) => {
             input.checked = enabled;
@@ -5589,6 +5638,12 @@ module.exports = class FhelperPlugin extends Plugin {
                 enabled: this.childDocIndexEnableEl.checked,
             };
         }
+        if (this.fileTreeHideNewSubDocEl) {
+            this.config.fileTree = {
+                ...(this.config.fileTree || createDefaultFileTreeConfig()),
+                hideNewSubDoc: this.fileTreeHideNewSubDocEl.checked,
+            };
+        }
         if (this.childDocIndexNotebookSelectEl) {
             this.config.childDocIndex = {
                 ...(this.config.childDocIndex || createDefaultChildDocIndexConfig()),
@@ -5669,6 +5724,7 @@ module.exports = class FhelperPlugin extends Plugin {
         scheduleLayoutRefresh(this);
         syncAllChildNavPanels(this);
         syncChildDocIndexFeature(this);
+        syncFileTreeFeature(this);
         return this.saveData(STORAGE_NAME, this.config);
     }
 
@@ -5756,6 +5812,16 @@ module.exports = class FhelperPlugin extends Plugin {
             control: this.docRefStyleEnableEl,
         }));
         panel.appendChild(panguSection);
+
+        const fileTree = this.config.fileTree || createDefaultFileTreeConfig();
+        const fileTreeSection = this.createSettingSection(this.i18n.sectionFileTree);
+        this.fileTreeHideNewSubDocEl = this.createSettingSwitch(fileTree.hideNewSubDoc !== false);
+        fileTreeSection.appendChild(this.createSettingRow({
+            title: this.i18n.fileTreeHideNewSubDoc,
+            description: this.i18n.fileTreeHideNewSubDocDesc,
+            control: this.fileTreeHideNewSubDocEl,
+        }));
+        panel.appendChild(fileTreeSection);
 
         const childDocWidget = this.config.childDocWidget || createDefaultChildDocWidgetConfig();
         const childNavSection = this.createSettingSection(this.i18n.sectionChildDocWidget);
