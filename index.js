@@ -1428,6 +1428,8 @@ function syncChildNavHostLayout(host, protyle) {
         return;
     }
     const cs = window.getComputedStyle(ref);
+    const content = p?.contentElement || ref.closest?.(".protyle-content") || ref.parentElement;
+    const contentCs = content ? window.getComputedStyle(content) : null;
     host.style.boxSizing = "border-box";
     host.style.width = "100%";
     host.style.maxWidth = cs.maxWidth && cs.maxWidth !== "none" ? cs.maxWidth : "";
@@ -1439,6 +1441,19 @@ function syncChildNavHostLayout(host, protyle) {
     host.style.fontSize = cs.fontSize;
     host.style.fontFamily = cs.fontFamily;
     host.style.lineHeight = cs.lineHeight;
+    // Use editor/content background, not app chrome background.
+    const pickBg = (value) => {
+        if (!value || value === "transparent" || value === "rgba(0, 0, 0, 0)") {
+            return "";
+        }
+        return value;
+    };
+    const editorBg = pickBg(cs.backgroundColor) || pickBg(contentCs?.backgroundColor) || "";
+    host.style.backgroundColor = editorBg || "transparent";
+    const shell = host.querySelector?.(".fhelper-child-nav__shell");
+    if (shell) {
+        shell.style.backgroundColor = "transparent";
+    }
     const realWidth = parseInt(ref.getAttribute("data-realwidth") || "", 10);
     if (Number.isFinite(realWidth) && realWidth > 0) {
         // data-realwidth is content width; keep same side padding as the editor.
@@ -6198,7 +6213,8 @@ module.exports = class FhelperPlugin extends Plugin {
     padding: 8px 10px;
     border: 1px solid var(--b3-border-color);
     border-radius: 8px;
-    background: var(--b3-theme-background);
+    /* Match editor pane, not app chrome (--b3-theme-background). */
+    background: transparent;
     box-shadow: none;
 }
 .fhelper-child-nav__head {
