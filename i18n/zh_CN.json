@@ -27,7 +27,7 @@
   "configSyncPullNow": "缓存写入配置",
   "configSyncPushed": "配置已写入缓存（需思源同步后才会到其他设备）",
   "configSyncRestartTitle": "缓存已写入配置",
-  "configSyncRestartDesc": "配置与主题已从缓存写入。点击确定后将自动重启思源以生效。",
+  "configSyncRestartDesc": "配置与主题已从缓存写入。点击确定后将自动重启思源以生效。重启后主题可能不会自动切换为同步的主题。",
   "configSyncUpToDate": "缓存已是最新，无需更新",
   "configSyncNoPack": "缓存中还没有配置数据",
   "configSyncFailed": "配置缓存操作失败，请查看控制台日志",

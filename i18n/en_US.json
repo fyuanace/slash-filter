@@ -27,7 +27,7 @@
   "configSyncPullNow": "Write cache → config",
   "configSyncPushed": "Config written to cache (SiYuan sync still required for other devices)",
   "configSyncRestartTitle": "Cache written to config",
-  "configSyncRestartDesc": "Config and themes have been written from cache. Click OK to automatically restart SiYuan and apply them.",
+  "configSyncRestartDesc": "Config and themes have been written from cache. Click OK to automatically restart SiYuan and apply them. After restart, the theme may not automatically switch to the synced one.",
   "configSyncUpToDate": "Cache is already up to date",
   "configSyncNoPack": "No config data in cache yet",
   "configSyncFailed": "Config cache operation failed; see console logs",

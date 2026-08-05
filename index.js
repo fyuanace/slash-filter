@@ -601,7 +601,7 @@ async function pullConfigSync(plugin, options = {}) {
 function promptConfigSyncRestart(plugin) {
     const title = plugin?.i18n?.configSyncRestartTitle || "缓存已写入配置";
     const text = plugin?.i18n?.configSyncRestartDesc
-        || "配置与主题已从缓存写入。点击确定后将自动重启思源以生效。";
+        || "配置与主题已从缓存写入。点击确定后将自动重启思源以生效。重启后主题可能不会自动切换为同步的主题。";
     if (typeof confirm === "function") {
         confirm(title, text, () => {
             restartSiYuanApp();
