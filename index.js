@@ -9,10 +9,15 @@ const {
     expandDocTree,
     openTab,
     Constants,
+    getFrontend,
+    confirm,
+    exitSiYuan,
 } = require("siyuan");
 
 const STORAGE_NAME = "fhelper-config.json";
 const LEGACY_STORAGE_NAMES = ["slash-filter-config.json", "slash-filter-config"];
+const CONFIG_SYNC_DIR_NAME = "config-sync";
+const CONFIG_SYNC_BUILTIN_THEMES = new Set(["daylight", "midnight"]);
 const ZWSP = "\u200b";
 const SCREEN_DPI = 96;
 const SIYUAN_LOCAL_ZOOM_KEY = "local-zoom";
@@ -120,6 +125,572 @@ function setFileTreeHideNewSubDocCssEnabled(enabled) {
 function syncFileTreeFeature(plugin) {
     const hide = plugin?.config?.fileTree?.hideNewSubDoc !== false;
     setFileTreeHideNewSubDocCssEnabled(!!plugin && hide);
+}
+
+function createDefaultConfigSyncConfig() {
+    // Always on: themes + conf are both cached; no user toggles.
+    return {
+        enabled: true,
+        syncThemes: true,
+        syncConf: true,
+    };
+}
+
+function isMobileFrontend() {
+    try {
+        const front = typeof getFrontend === "function" ? String(getFrontend() || "") : "";
+        return front === "mobile" || front === "browser-mobile" || /mobile$/i.test(front);
+    } catch (error) {
+        return false;
+    }
+}
+
+/** Desktop always active; mobile never runs cache logic. */
+function isConfigSyncActive() {
+    return !isMobileFrontend();
+}
+
+function getConfigSyncRoot(plugin) {
+    const name = plugin?.name || "fhelper";
+    return `/data/storage/petal/${name}/${CONFIG_SYNC_DIR_NAME}`;
+}
+
+async function apiReadDir(path) {
+    try {
+        const response = await fetchSyncPost("/api/file/readDir", { path });
+        if (response?.code !== 0) {
+            return [];
+        }
+        return Array.isArray(response.data) ? response.data : [];
+    } catch (error) {
+        return [];
+    }
+}
+
+async function apiRemovePath(path) {
+    try {
+        await fetchSyncPost("/api/file/removeFile", { path });
+    } catch (error) {
+        // ignore missing
+    }
+}
+
+async function apiEnsureDir(path) {
+    const formData = new FormData();
+    formData.append("path", path);
+    formData.append("isDir", "true");
+    const response = await fetch("/api/file/putFile", { method: "POST", body: formData });
+    const data = await response.json().catch(() => ({}));
+    if (data?.code && data.code !== 0) {
+        throw new Error(data.msg || `putFile dir failed: ${path}`);
+    }
+}
+
+async function apiPutBytes(path, bytes, fileName) {
+    const formData = new FormData();
+    formData.append("path", path);
+    formData.append("isDir", "false");
+    formData.append("file", new File([bytes], fileName || path.split("/").pop() || "file"));
+    const response = await fetch("/api/file/putFile", { method: "POST", body: formData });
+    const data = await response.json().catch(() => ({}));
+    if (data?.code && data.code !== 0) {
+        throw new Error(data.msg || `putFile failed: ${path}`);
+    }
+}
+
+async function apiPutText(path, text) {
+    await apiPutBytes(path, new Blob([text], { type: "application/json" }), path.split("/").pop());
+}
+
+async function apiGetFileResponse(path) {
+    return fetch("/api/file/getFile", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path }),
+    });
+}
+
+async function apiGetText(path) {
+    const response = await apiGetFileResponse(path);
+    if (!response.ok) {
+        return null;
+    }
+    const text = await response.text();
+    try {
+        const maybe = JSON.parse(text);
+        if (maybe && typeof maybe === "object" && typeof maybe.code === "number" && maybe.code !== 0 && Object.keys(maybe).length <= 4) {
+            return null;
+        }
+    } catch (error) {
+        // raw text content
+    }
+    return text;
+}
+
+async function apiGetBlob(path) {
+    const response = await apiGetFileResponse(path);
+    if (!response.ok) {
+        return null;
+    }
+    const contentType = response.headers.get("content-type") || "";
+    if (contentType.includes("application/json")) {
+        try {
+            const maybe = await response.clone().json();
+            if (maybe && typeof maybe.code === "number" && maybe.code !== 0) {
+                return null;
+            }
+        } catch (error) {
+            // continue
+        }
+    }
+    return response.blob();
+}
+
+async function hashText(text) {
+    const data = new TextEncoder().encode(String(text || ""));
+    if (globalThis.crypto?.subtle) {
+        const digest = await crypto.subtle.digest("SHA-256", data);
+        return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+    }
+    let h = 2166136261;
+    for (let i = 0; i < data.length; i++) {
+        h ^= data[i];
+        h = Math.imul(h, 16777619);
+    }
+    return (h >>> 0).toString(16);
+}
+
+async function hashBlob(blob) {
+    const buf = await blob.arrayBuffer();
+    if (globalThis.crypto?.subtle) {
+        const digest = await crypto.subtle.digest("SHA-256", buf);
+        return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+    }
+    return hashText(String(buf.byteLength));
+}
+
+function sanitizeConfForSync(raw) {
+    if (!raw || typeof raw !== "object") {
+        return {};
+    }
+    const conf = JSON.parse(JSON.stringify(raw));
+    if (conf.appearance) {
+        conf.appearance.darkThemes = null;
+        conf.appearance.lightThemes = null;
+        conf.appearance.icons = null;
+    }
+    if (conf.editor) {
+        conf.editor.emoji = [];
+    }
+    if (conf.export) {
+        conf.export.pandocBin = "";
+    }
+    conf.userData = "";
+    conf.account = null;
+    conf.accessAuthCode = "";
+    if (conf.system) {
+        conf.system.id = "";
+        conf.system.name = "";
+        conf.system.osPlatform = "";
+        conf.system.container = "";
+        conf.system.isMicrosoftStore = false;
+        conf.system.isInsider = false;
+        conf.system.microsoftDefenderExcluded = false;
+    }
+    conf.sync = null;
+    conf.stat = null;
+    conf.api = null;
+    conf.repo = null;
+    conf.secrets = null;
+    conf.notebookCrypto = null;
+    conf.onboarding = null;
+    conf.publish = null;
+    conf.cookieKey = "";
+    conf.mcpOAuth = "";
+    conf.cloudRegion = 0;
+    if (conf.ai) {
+        (conf.ai.providers || []).forEach((provider) => {
+            if (provider) {
+                provider.apiKey = "";
+            }
+        });
+        if (conf.ai.embedding) {
+            conf.ai.embedding.apiKey = "";
+        }
+        if (conf.ai.rerank) {
+            conf.ai.rerank.apiKey = "";
+        }
+        conf.ai.mcp = null;
+    }
+    return conf;
+}
+
+async function loadConfigSyncManifest(plugin) {
+    const text = await apiGetText(`${getConfigSyncRoot(plugin)}/manifest.json`);
+    if (!text) {
+        return null;
+    }
+    try {
+        return JSON.parse(text);
+    } catch (error) {
+        return null;
+    }
+}
+
+async function saveConfigSyncManifest(plugin, manifest) {
+    const root = getConfigSyncRoot(plugin);
+    await apiEnsureDir(root);
+    await apiPutText(`${root}/manifest.json`, JSON.stringify(manifest, null, 2));
+}
+
+async function listCustomThemeNames() {
+    const entries = await apiReadDir("/conf/appearance/themes");
+    return entries
+        .filter((item) => item?.isDir && item.name && !CONFIG_SYNC_BUILTIN_THEMES.has(item.name))
+        .map((item) => item.name)
+        .sort();
+}
+
+async function copyDirRecursive(srcDir, destDir) {
+    await apiEnsureDir(destDir);
+    const entries = await apiReadDir(srcDir);
+    for (const entry of entries) {
+        if (!entry?.name) {
+            continue;
+        }
+        const srcPath = `${srcDir}/${entry.name}`;
+        const destPath = `${destDir}/${entry.name}`;
+        if (entry.isDir) {
+            await copyDirRecursive(srcPath, destPath);
+            continue;
+        }
+        const blob = await apiGetBlob(srcPath);
+        if (!blob) {
+            continue;
+        }
+        await apiPutBytes(destPath, blob, entry.name);
+    }
+}
+
+async function removeDirContents(path) {
+    const entries = await apiReadDir(path);
+    for (const entry of entries) {
+        if (!entry?.name) {
+            continue;
+        }
+        await apiRemovePath(`${path}/${entry.name}`);
+    }
+}
+
+async function buildLocalThemesFingerprint() {
+    const names = await listCustomThemeNames();
+    const parts = [];
+    for (const name of names) {
+        const themeJson = await apiGetText(`/conf/appearance/themes/${name}/theme.json`);
+        parts.push(`${name}:${themeJson || ""}`);
+        const entries = await apiReadDir(`/conf/appearance/themes/${name}`);
+        entries.forEach((entry) => {
+            parts.push(`${name}/${entry.name}:${entry.updated || 0}:${entry.isDir ? "d" : "f"}`);
+        });
+    }
+    return hashText(parts.join("|"));
+}
+
+async function buildLocalConfFingerprint() {
+    const response = await fetchSyncPost("/api/system/getConf", {});
+    const conf = sanitizeConfForSync(response?.data || response);
+    return hashText(JSON.stringify(conf));
+}
+
+async function exportConfToPetal(plugin) {
+    const root = getConfigSyncRoot(plugin);
+    await apiEnsureDir(`${root}/conf`);
+    // Same API as UI: 设置 → 关于 → 导出设置 → /api/system/exportConf
+    const exported = await fetchSyncPost("/api/system/exportConf", {});
+    if (exported?.code && exported.code !== 0) {
+        throw new Error(exported.msg || "exportConf failed");
+    }
+    const name = exported?.data?.name; // e.g. siyuan-conf-20260805015051.json
+    if (!name) {
+        throw new Error("exportConf returned empty name");
+    }
+    let zipBlob = await apiGetBlob(`/temp/export/${name}.zip`);
+    if (!zipBlob && exported?.data?.zip) {
+        // Fallback: same download URL the UI opens
+        const zipUrl = String(exported.data.zip).startsWith("http")
+            ? exported.data.zip
+            : `${window.location.origin}${exported.data.zip}`;
+        const res = await fetch(zipUrl);
+        if (res.ok) {
+            zipBlob = await res.blob();
+        }
+    }
+    if (!zipBlob) {
+        throw new Error(`exportConf zip not found: /temp/export/${name}.zip`);
+    }
+    // Stable names inside petal so S3 sync path stays constant.
+    await apiPutBytes(`${root}/conf/siyuan-conf.json.zip`, zipBlob, "siyuan-conf.json.zip");
+    // Keep extracted JSON sidecar for fingerprint / appearance apply on import.
+    const jsonText = await apiGetText(`/temp/export/${name}`);
+    if (jsonText) {
+        await apiPutText(`${root}/conf/siyuan-conf.json`, jsonText);
+    }
+    return {
+        file: "conf/siyuan-conf.json.zip",
+        jsonFile: jsonText ? "conf/siyuan-conf.json" : "",
+        name,
+        hash: jsonText ? await hashText(jsonText) : await hashBlob(zipBlob),
+    };
+}
+
+async function exportThemesToPetal(plugin) {
+    const root = getConfigSyncRoot(plugin);
+    const themesDir = `${root}/themes`;
+    await apiEnsureDir(themesDir);
+    await removeDirContents(themesDir);
+    const names = await listCustomThemeNames();
+    for (const name of names) {
+        await copyDirRecursive(`/conf/appearance/themes/${name}`, `${themesDir}/${name}`);
+    }
+    return { names, hash: await buildLocalThemesFingerprint() };
+}
+
+async function importConfFromPetal(plugin, manifest) {
+    const root = getConfigSyncRoot(plugin);
+    // Prefer official zip (same format as UI export); fallback to json sidecar.
+    const zipRel = manifest?.conf?.file?.endsWith(".zip")
+        ? manifest.conf.file
+        : "conf/siyuan-conf.json.zip";
+    const jsonRel = manifest?.conf?.jsonFile || "conf/siyuan-conf.json";
+    let fileRel = zipRel;
+    let blob = await apiGetBlob(`${root}/${zipRel}`);
+    let fileName = zipRel.split("/").pop() || "siyuan-conf.json.zip";
+    let mime = "application/zip";
+    if (!blob) {
+        const text = await apiGetText(`${root}/${jsonRel}`);
+        if (!text) {
+            throw new Error(`missing conf pack under ${root}/conf`);
+        }
+        fileRel = jsonRel;
+        fileName = jsonRel.split("/").pop() || "siyuan-conf.json";
+        mime = "application/json";
+        blob = new Blob([text], { type: mime });
+    }
+    const formData = new FormData();
+    formData.append("file", new File([blob], fileName, { type: mime }));
+    const response = await fetch("/api/system/importConf", { method: "POST", body: formData });
+    const data = await response.json().catch(() => ({}));
+    if (data?.code && data.code !== 0) {
+        throw new Error(data.msg || "importConf failed");
+    }
+    // importConf does not apply Appearance; restore theme selection from JSON sidecar.
+    try {
+        const jsonText = await apiGetText(`${root}/${jsonRel}`);
+        if (jsonText) {
+            const confObj = JSON.parse(jsonText);
+            if (confObj?.appearance) {
+                await fetchSyncPost("/api/setting/setAppearance", confObj.appearance);
+            }
+        }
+    } catch (error) {
+        console.warn(`${LOG_PREFIX} apply appearance after importConf failed`, error);
+    }
+}
+
+async function importThemesFromPetal(plugin) {
+    const root = getConfigSyncRoot(plugin);
+    const themesDir = `${root}/themes`;
+    const entries = await apiReadDir(themesDir);
+    for (const entry of entries) {
+        if (!entry?.isDir || !entry.name || CONFIG_SYNC_BUILTIN_THEMES.has(entry.name)) {
+            continue;
+        }
+        await copyDirRecursive(`${themesDir}/${entry.name}`, `/conf/appearance/themes/${entry.name}`);
+    }
+}
+
+async function pushConfigSync(plugin, options = {}) {
+    if (!isConfigSyncActive()) {
+        return { skipped: true, reason: "mobile" };
+    }
+    if (plugin.configSyncBusy) {
+        return { skipped: true, reason: "busy" };
+    }
+    plugin.configSyncBusy = true;
+    try {
+        const root = getConfigSyncRoot(plugin);
+        await apiEnsureDir(root);
+        const prev = await loadConfigSyncManifest(plugin);
+        const localConfHash = await buildLocalConfFingerprint();
+        const localThemesHash = await buildLocalThemesFingerprint();
+        const needConf = !prev?.conf?.hash || prev.conf.hash !== localConfHash || options.force;
+        const needThemes = !prev?.themes?.hash || prev.themes.hash !== localThemesHash || options.force;
+        if (!needConf && !needThemes) {
+            return { skipped: true, reason: "up-to-date" };
+        }
+        const manifest = {
+            version: 1,
+            updatedAt: Date.now(),
+            conf: prev?.conf || null,
+            themes: prev?.themes || null,
+        };
+        if (needConf) {
+            const packed = await exportConfToPetal(plugin);
+            manifest.conf = {
+                file: packed.file,
+                jsonFile: packed.jsonFile || "",
+                exportName: packed.name || "",
+                hash: localConfHash || packed.hash,
+            };
+        }
+        if (needThemes) {
+            const themePack = await exportThemesToPetal(plugin);
+            manifest.themes = {
+                hash: localThemesHash || themePack.hash,
+                names: themePack.names,
+            };
+        }
+        await saveConfigSyncManifest(plugin, manifest);
+        if (options.notify) {
+            showMessage(plugin.i18n.configSyncPushed || "配置已写入缓存（需思源同步后才会到其他设备）");
+        }
+        return { ok: true, manifest };
+    } finally {
+        plugin.configSyncBusy = false;
+    }
+}
+
+async function pullConfigSync(plugin, options = {}) {
+    if (!isConfigSyncActive()) {
+        return { skipped: true, reason: "mobile" };
+    }
+    if (plugin.configSyncBusy) {
+        return { skipped: true, reason: "busy" };
+    }
+    plugin.configSyncBusy = true;
+    try {
+        const manifest = await loadConfigSyncManifest(plugin);
+        if (!manifest) {
+            if (options.notify) {
+                showMessage(plugin.i18n.configSyncNoPack || "缓存中还没有配置数据");
+            }
+            return { skipped: true, reason: "no-pack" };
+        }
+        const localConfHash = await buildLocalConfFingerprint();
+        const localThemesHash = await buildLocalThemesFingerprint();
+        const needConf = manifest.conf?.hash && (options.force || manifest.conf.hash !== localConfHash);
+        const needThemes = manifest.themes?.hash && (options.force || manifest.themes.hash !== localThemesHash);
+        if (!needConf && !needThemes) {
+            return { skipped: true, reason: "up-to-date" };
+        }
+        if (needConf) {
+            await importConfFromPetal(plugin, manifest);
+        }
+        if (needThemes) {
+            await importThemesFromPetal(plugin);
+        }
+        if (options.notify !== false) {
+            promptConfigSyncRestart(plugin);
+        }
+        return { ok: true, needConf, needThemes };
+    } finally {
+        plugin.configSyncBusy = false;
+    }
+}
+
+function promptConfigSyncRestart(plugin) {
+    const title = plugin?.i18n?.configSyncRestartTitle || "缓存已写入配置";
+    const text = plugin?.i18n?.configSyncRestartDesc
+        || "配置与主题已从缓存写入。点击确定后将自动重启思源以生效。";
+    if (typeof confirm === "function") {
+        confirm(title, text, () => {
+            restartSiYuanApp();
+        });
+        return;
+    }
+    const ok = window.confirm(`${title}\n\n${text}`);
+    if (ok) {
+        restartSiYuanApp();
+    }
+}
+
+/**
+ * Restart desktop SiYuan: schedule relaunch, then use official exitSiYuan()
+ * so kernel flush / sync / layout save still run. Do NOT call app.exit()
+ * directly — that skips SiYuan's shutdown prep.
+ */
+async function restartSiYuanApp() {
+    let relaunchScheduled = false;
+    try {
+        // Schedule relaunch first; it does not quit by itself.
+        // eslint-disable-next-line global-require
+        const { app } = require("@electron/remote");
+        if (app && typeof app.relaunch === "function") {
+            app.relaunch();
+            relaunchScheduled = true;
+        }
+    } catch (error) {
+        console.warn(`${LOG_PREFIX} electron relaunch unavailable`, error);
+    }
+
+    try {
+        if (typeof exitSiYuan === "function") {
+            // Official path: save layout / kernel exit / then host quit.
+            await Promise.resolve(exitSiYuan());
+            return;
+        }
+    } catch (error) {
+        console.warn(`${LOG_PREFIX} exitSiYuan failed`, error);
+    }
+
+    // Fallbacks only if exitSiYuan is missing.
+    try {
+        await fetchSyncPost("/api/system/exit", { force: false, execInstallPkg: 1 });
+    } catch (error) {
+        console.warn(`${LOG_PREFIX} kernel exit failed`, error);
+    }
+    try {
+        // eslint-disable-next-line global-require
+        const { ipcRenderer } = require("electron");
+        ipcRenderer.send((Constants && Constants.SIYUAN_QUIT) || "siyuan-quit", location.port);
+        return;
+    } catch (error) {
+        // ignore
+    }
+    if (!relaunchScheduled) {
+        try {
+            await fetchSyncPost("/api/ui/reloadUI", {});
+        } catch (error) {
+            window.location.reload();
+        }
+    }
+}
+
+function scheduleConfigSyncPush() {
+    // Auto push disabled — cache write is manual only.
+}
+
+function installConfigSyncWatchers(plugin) {
+    // Auto write-to-cache on settings/theme change removed; manual buttons only.
+    uninstallConfigSyncWatchers(plugin);
+}
+
+function uninstallConfigSyncWatchers(plugin) {
+    if (!plugin?.configSyncWatchersInstalled) {
+        return;
+    }
+    plugin.configSyncObserver?.disconnect();
+    plugin.configSyncObserver = null;
+    if (plugin.configSyncWsHandler) {
+        plugin.eventBus.off("ws-main", plugin.configSyncWsHandler);
+        plugin.configSyncWsHandler = null;
+    }
+    if (plugin.configSyncPushTimer) {
+        window.clearTimeout(plugin.configSyncPushTimer);
+        plugin.configSyncPushTimer = null;
+    }
+    plugin.configSyncDomHandler = null;
+    plugin.configSyncWatchersInstalled = false;
 }
 
 function setImageCenterCssEnabled(enabled) {
@@ -4731,6 +5302,7 @@ function createDefaultConfig() {
         childDocIndex: createDefaultChildDocIndexConfig(),
         childDocWidget: createDefaultChildDocWidgetConfig(),
         fileTree: createDefaultFileTreeConfig(),
+        configSync: createDefaultConfigSyncConfig(),
     };
 }
 
@@ -5185,9 +5757,14 @@ module.exports = class FhelperPlugin extends Plugin {
         syncChildDocIndexFeature(this);
         syncFileTreeFeature(this);
         installChildNavBackRestore(this);
+        // Import is manual only; watchers only push on theme change / settings close.
+        if (isConfigSyncActive()) {
+            installConfigSyncWatchers(this);
+        }
     }
 
     onunload() {
+        uninstallConfigSyncWatchers(this);
         uninstallSlashHintHook();
         this.childDocIndexProgressDialog?.destroy();
         this.childDocIndexProgressDialog = null;
@@ -5330,6 +5907,7 @@ module.exports = class FhelperPlugin extends Plugin {
                     ...createDefaultFileTreeConfig(),
                     ...(data.fileTree || {}),
                 },
+                configSync: createDefaultConfigSyncConfig(),
             };
             this.data[STORAGE_NAME] = this.config;
             this.applyImageCenterStyle();
@@ -5341,6 +5919,11 @@ module.exports = class FhelperPlugin extends Plugin {
             syncAllChildNavPanels(this);
             syncChildDocIndexFeature(this);
             syncFileTreeFeature(this);
+            if (isConfigSyncActive()) {
+                installConfigSyncWatchers(this);
+            } else {
+                uninstallConfigSyncWatchers(this);
+            }
         }
     }
 
@@ -5358,7 +5941,8 @@ module.exports = class FhelperPlugin extends Plugin {
                     || data.docRefStyle
                     || data.childDocIndex
                     || data.childDocWidget
-                    || data.fileTree);
+                    || data.fileTree
+                    || data.configSync);
             if (hasNewConfig) {
                 this.applyConfig(data);
                 return;
@@ -5416,6 +6000,7 @@ module.exports = class FhelperPlugin extends Plugin {
             childDocIndex: { ...(this.config.childDocIndex || createDefaultChildDocIndexConfig()) },
             childDocWidget: { ...(this.config.childDocWidget || createDefaultChildDocWidgetConfig()) },
             fileTree: { ...(this.config.fileTree || createDefaultFileTreeConfig()) },
+            configSync: { ...(this.config.configSync || createDefaultConfigSyncConfig()) },
         };
         this.settingToggleEls.forEach((input) => {
             input.checked = enabled;
@@ -5659,6 +6244,8 @@ module.exports = class FhelperPlugin extends Plugin {
                 hideNewSubDoc: this.fileTreeHideNewSubDocEl.checked,
             };
         }
+        // Config/theme cache is always on (desktop); persist defaults for older configs.
+        this.config.configSync = createDefaultConfigSyncConfig();
         if (this.childDocIndexNotebookSelectEl) {
             this.config.childDocIndex = {
                 ...(this.config.childDocIndex || createDefaultChildDocIndexConfig()),
@@ -5740,6 +6327,11 @@ module.exports = class FhelperPlugin extends Plugin {
         syncAllChildNavPanels(this);
         syncChildDocIndexFeature(this);
         syncFileTreeFeature(this);
+        if (isConfigSyncActive()) {
+            installConfigSyncWatchers(this);
+        } else {
+            uninstallConfigSyncWatchers(this);
+        }
         return this.saveData(STORAGE_NAME, this.config);
     }
 
@@ -5777,13 +6369,19 @@ module.exports = class FhelperPlugin extends Plugin {
         return row;
     }
 
-    createSettingSection(title) {
+    createSettingSection(title, description) {
         const section = document.createElement("div");
         section.className = "fhelper-setting__section";
         const heading = document.createElement("div");
         heading.className = "fhelper-setting__section-title";
         heading.textContent = title;
         section.appendChild(heading);
+        if (description) {
+            const desc = document.createElement("div");
+            desc.className = "fhelper-setting__section-desc";
+            desc.textContent = description;
+            section.appendChild(desc);
+        }
         return section;
     }
 
@@ -5837,6 +6435,52 @@ module.exports = class FhelperPlugin extends Plugin {
             control: this.fileTreeHideNewSubDocEl,
         }));
         panel.appendChild(fileTreeSection);
+
+        const configSyncSection = this.createSettingSection(
+            this.i18n.sectionConfigSync,
+            isMobileFrontend()
+                ? (this.i18n.configSyncMobileDisabledDesc || this.i18n.sectionConfigSyncDesc)
+                : this.i18n.sectionConfigSyncDesc,
+        );
+        const syncActions = document.createElement("div");
+        syncActions.className = "fhelper-setting__toolbar";
+        const pushBtn = document.createElement("button");
+        pushBtn.type = "button";
+        pushBtn.className = "b3-button b3-button--outline";
+        pushBtn.textContent = this.i18n.configSyncPushNow;
+        pushBtn.disabled = isMobileFrontend();
+        pushBtn.addEventListener("click", () => {
+            if (isMobileFrontend()) {
+                return;
+            }
+            this.syncSettingFormToConfig();
+            pushConfigSync(this, { force: true, notify: true }).catch((error) => {
+                console.warn(`${LOG_PREFIX} manual pushConfigSync failed`, error);
+                showMessage(this.i18n.configSyncFailed);
+            });
+        });
+        const pullBtn = document.createElement("button");
+        pullBtn.type = "button";
+        pullBtn.className = "b3-button b3-button--outline";
+        pullBtn.textContent = this.i18n.configSyncPullNow;
+        pullBtn.disabled = isMobileFrontend();
+        pullBtn.addEventListener("click", () => {
+            if (isMobileFrontend()) {
+                return;
+            }
+            this.syncSettingFormToConfig();
+            pullConfigSync(this, { force: true, notify: true }).catch((error) => {
+                console.warn(`${LOG_PREFIX} manual pullConfigSync failed`, error);
+                showMessage(this.i18n.configSyncFailed);
+            });
+        });
+        syncActions.appendChild(pushBtn);
+        syncActions.appendChild(pullBtn);
+        configSyncSection.appendChild(this.createSettingRow({
+            title: this.i18n.configSyncActions,
+            control: syncActions,
+        }));
+        panel.appendChild(configSyncSection);
 
         const childDocWidget = this.config.childDocWidget || createDefaultChildDocWidgetConfig();
         const childNavSection = this.createSettingSection(this.i18n.sectionChildDocWidget);
@@ -6134,6 +6778,15 @@ module.exports = class FhelperPlugin extends Plugin {
     color: var(--b3-theme-on-surface);
     background: var(--b3-theme-background);
     border-bottom: 1px solid var(--b3-border-color);
+}
+.fhelper-setting__section-desc {
+    padding: 10px 14px;
+    font-size: 12px;
+    line-height: 1.55;
+    color: var(--b3-theme-on-surface-light);
+    background: var(--b3-theme-background);
+    border-bottom: 1px solid var(--b3-border-color);
+    white-space: pre-wrap;
 }
 .fhelper-setting__row {
     display: flex;
