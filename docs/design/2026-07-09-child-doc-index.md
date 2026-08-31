@@ -3,7 +3,7 @@ type: design-change
 project: fhelper
 module: child-doc-index
 date: 2026-07-09
-status: implemented
+status: superseded
 summary: >
   在父文档正文末尾增量追加直接子文档的标准动态块引用；只处理一层父子；
   已有引用按 refs 表跳过；与文档引用美化兼容。
@@ -23,6 +23,7 @@ tags:
 | 时间 | 说明 |
 |------|------|
 | 2026-07-09 | 定稿：一层直接子、标准 `((id 'title'))`、refs 增量、文件树 API、全局 / 当前文档入口 |
+| 2026-08-31 | 功能已移除，由子文档导航植入承担列举；见 [2026-08-31-child-nav-box-doc.md](2026-08-31-child-nav-box-doc.md) |
 
 ## 背景信息
 
@@ -74,7 +75,7 @@ SELECT def_block_id FROM refs WHERE root_id = '<父文档块ID>'
 
 ## 其他模块引用约束
 
-- **正文导航 / 导航植入**不得复用本模块的 `listDocsByPath` 热路径；无子文档时该 API 可能因磁盘无文件夹报错。分流见 [2026-08-04-child-nav-body-sql.md](2026-08-04-child-nav-body-sql.md)。
+- **导航植入**不得复用本模块的 `listDocsByPath` 热路径；无子文档时该 API 可能因磁盘无文件夹报错。分流见 [2026-08-04-child-nav-body-sql.md](2026-08-04-child-nav-body-sql.md)。
 - 索引写入的是普通动态块引用，其它模块应按普通 `block-ref` 处理，勿假设存在特殊 IAL。
 
 ## 工程师测试验收方法
@@ -87,4 +88,4 @@ SELECT def_block_id FROM refs WHERE root_id = '<父文档块ID>'
 
 ## 其他说明
 
-无。
+功能已于 2026-08-31 移除。现行列举方案见 [2026-08-31-child-nav-box-doc.md](2026-08-31-child-nav-box-doc.md)。

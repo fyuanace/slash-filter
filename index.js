@@ -1774,35 +1774,9 @@ function handleProtyleDocRefDestroy(plugin, event) {
     p?.element?.querySelectorAll?.(`.${CHILD_NAV_HOST_CLASS}`)?.forEach(removeChildNavHost);
 }
 
-const CHILD_DOC_INDEX_DEFAULT_CONCURRENCY = 3;
 const LIST_DOCS_SORT_UNASSIGNED = 256;
 
-// const notebookSortModeCache = new Map();
-
-function createDefaultChildDocIndexConfig() {
-    return {
-        enabled: true,
-        sortBy: "tree",
-        scope: "all",
-        notebookIds: [],
-        selectedNotebookId: "",
-        batchConcurrency: CHILD_DOC_INDEX_DEFAULT_CONCURRENCY,
-    };
-}
-
-function isChildDocIndexEnabled(plugin) {
-    return plugin?.config?.childDocIndex?.enabled !== false;
-}
-
-const CHILD_DOC_INDEX_OFF_CLASS = "fhelper-child-doc-index-off";
-
-function setChildDocIndexDomGate(enabled) {
-    document.documentElement.classList.toggle(CHILD_DOC_INDEX_OFF_CLASS, !enabled);
-}
-
 const CHILD_NAV_HOST_CLASS = "fhelper-child-nav";
-const CHILD_NAV_LEGACY_ATTR = "custom-fhelper-child-nav";
-const CHILD_NAV_SRC_MARK = "/plugins/fhelper/child-nav/";
 /** Debounce only SQL refresh; shell is primed synchronously to avoid layout flash. */
 const CHILD_NAV_MOUNT_DEBOUNCE_MS = 32;
 /** docId → { tree, mode, at, hostHeight } for instant paint on reopen. */
@@ -1827,6 +1801,45 @@ function sleepMs(ms) {
     return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
+function getNotebookById(id) {
+    if (!id) {
+        return null;
+    }
+    const notebooks = window.siyuan?.notebooks;
+    if (!Array.isArray(notebooks)) {
+        return null;
+    }
+    return notebooks.find((nb) => nb?.id === id) || null;
+}
+
+function isNotebookBoxDoc(docId, notebook) {
+    return !!(docId && notebook && docId === notebook);
+}
+
+function isNotebookBoxDocPath(path, notebook) {
+    if (!notebook) {
+        return false;
+    }
+    const p = String(path || "").replace(/\\/g, "/");
+    return p === "/"
+        || p === `/${notebook}`
+        || p.toLowerCase() === `/${notebook}.sy`.toLowerCase();
+}
+
+function notebookBoxDocPath(notebook) {
+    return notebook ? `/${notebook}.sy` : "";
+}
+
+function normalizeBoxDocPath(path, notebook) {
+    if (!notebook) {
+        return path;
+    }
+    if (isNotebookBoxDocPath(path, notebook)) {
+        return notebookBoxDocPath(notebook);
+    }
+    return path;
+}
+
 async function getDocPathBySql(docId) {
     if (!docId) {
         return null;
@@ -1836,19 +1849,24 @@ async function getDocPathBySql(docId) {
             `SELECT id, box, path FROM blocks WHERE id = '${escapeSqlId(docId)}' AND type = 'd' LIMIT 1`,
         );
         const row = rows?.[0];
-        if (!row?.box || !row?.path) {
-            return null;
+        if (row?.box) {
+            return {
+                notebook: row.box,
+                path: normalizeBoxDocPath(row.path, row.box),
+            };
         }
-        return { notebook: row.box, path: row.path };
     } catch (error) {
         console.warn(`${LOG_PREFIX} getDocPathBySql failed`, docId, error);
-        return null;
     }
+    if (getNotebookById(docId)) {
+        return { notebook: docId, path: notebookBoxDocPath(docId) };
+    }
+    return null;
 }
 
 /** Parent doc storage path: `/a/b/c.sy` -> `/a/b.sy`; `/a.sy` -> null */
 function getParentDocStoragePath(docPath) {
-    const normalized = String(docPath || "");
+    const normalized = String(docPath || "").replace(/\\/g, "/");
     if (!/\.sy$/i.test(normalized)) {
         return null;
     }
@@ -1858,6 +1876,25 @@ function getParentDocStoragePath(docPath) {
         return null;
     }
     return `${withoutExt.slice(0, idx)}.sy`;
+}
+
+/**
+ * Logical parent in the file tree. Root-level ordinary docs sit under the
+ * notebook box document even though files stay at the notebook root.
+ */
+function getLogicalParentDocPath(docPath, notebook) {
+    const physical = getParentDocStoragePath(docPath);
+    if (physical) {
+        return physical;
+    }
+    if (!notebook || isNotebookBoxDocPath(docPath, notebook)) {
+        return null;
+    }
+    const normalized = String(docPath || "").replace(/\\/g, "/");
+    if (!/^\/[^/]+\.sy$/i.test(normalized)) {
+        return null;
+    }
+    return notebookBoxDocPath(notebook);
 }
 
 function toChildNavNode(row) {
@@ -1878,12 +1915,20 @@ function toChildNavNode(row) {
  * List child docs via SQL only — never call listDocsByPath here.
  * Missing on-disk folders would otherwise toast "open ... file not found".
  */
-async function queryChildNavDescendants(notebook, parentDocPath) {
-    const folder = toListDocsFolderPath(parentDocPath);
+async function queryChildNavDescendants(notebook, parentDocPath, parentDocId) {
+    const isBox = isNotebookBoxDoc(parentDocId, notebook)
+        || isNotebookBoxDocPath(parentDocPath, notebook);
+    const folder = isBox ? "/" : toListDocsFolderPath(parentDocPath);
     const prefix = folder === "/" ? "/" : `${folder}/`;
+    const pathClause = isBox
+        ? ""
+        : ` AND path LIKE '${escapeSqlId(prefix)}%'`;
+    const excludeSelf = parentDocId
+        ? ` AND id != '${escapeSqlId(parentDocId)}'`
+        : "";
     try {
         const rows = await runSqlQuery(
-            `SELECT id, content, path FROM blocks WHERE type = 'd' AND box = '${escapeSqlId(notebook)}' AND path LIKE '${escapeSqlId(prefix)}%' ORDER BY path ASC LIMIT 2000`,
+            `SELECT id, content, path FROM blocks WHERE type = 'd' AND box = '${escapeSqlId(notebook)}'${pathClause}${excludeSelf} ORDER BY path ASC LIMIT 2000`,
         );
         return Array.isArray(rows) ? rows : [];
     } catch (error) {
@@ -1897,13 +1942,15 @@ async function buildChildNavTree(docId, mode) {
     if (!pathInfo) {
         return [];
     }
-    const rows = await queryChildNavDescendants(pathInfo.notebook, pathInfo.path);
+    const parentPath = normalizeBoxDocPath(pathInfo.path, pathInfo.notebook);
+    const rows = await queryChildNavDescendants(pathInfo.notebook, parentPath, docId);
     const nested = normalizeChildNavMode(mode) === "nested";
+    const isDirectChild = (row) => (
+        getLogicalParentDocPath(row.path, pathInfo.notebook) === parentPath
+    );
 
     if (!nested) {
-        return rows
-            .filter((row) => getParentDocStoragePath(row.path) === pathInfo.path)
-            .map(toChildNavNode);
+        return rows.filter(isDirectChild).map(toChildNavNode);
     }
 
     const byPath = new Map();
@@ -1914,14 +1961,14 @@ async function buildChildNavTree(docId, mode) {
     });
     const roots = [];
     byPath.forEach((node) => {
-        const parentPath = getParentDocStoragePath(node.path);
-        const parent = parentPath ? byPath.get(parentPath) : null;
+        const logicalParent = getLogicalParentDocPath(node.path, pathInfo.notebook);
+        const parent = logicalParent ? byPath.get(logicalParent) : null;
         if (parent) {
             parent.children.push(node);
             parent.subFileCount = parent.children.length;
             return;
         }
-        if (parentPath === pathInfo.path) {
+        if (logicalParent === parentPath) {
             roots.push(node);
         }
     });
@@ -2644,29 +2691,6 @@ async function refreshChildNavHost(plugin, host, docId, options = {}) {
     }
 }
 
-async function cleanupLegacyChildNavBlocks(docId) {
-    if (!docId) {
-        return;
-    }
-    let ids = [];
-    try {
-        const rows = await runSqlQuery(
-            `SELECT id FROM blocks WHERE root_id = '${escapeSqlId(docId)}' AND (ial LIKE '%${CHILD_NAV_LEGACY_ATTR}%' OR markdown LIKE '%${CHILD_NAV_SRC_MARK}%') LIMIT 50`,
-        );
-        ids = (rows || []).map((row) => row.id).filter(Boolean);
-    } catch (error) {
-        console.warn(`${LOG_PREFIX} cleanupLegacyChildNavBlocks sql failed`, error);
-        return;
-    }
-    for (const id of ids) {
-        try {
-            await fetchSyncPost("/api/block/deleteBlock", { id });
-        } catch (error) {
-            console.warn(`${LOG_PREFIX} cleanup legacy child-nav block failed`, id, error);
-        }
-    }
-}
-
 async function mountChildNavForProtyle(plugin, protyle) {
     const p = unwrapProtyle(protyle);
     if (!p) {
@@ -2676,15 +2700,6 @@ async function mountChildNavForProtyle(plugin, protyle) {
     if (!plugin?.config?.childDocWidget?.enabled || !docId) {
         p.element?.querySelectorAll?.(`.${CHILD_NAV_HOST_CLASS}`)?.forEach(removeChildNavHost);
         return;
-    }
-    if (!plugin.childNavCleanupDocs) {
-        plugin.childNavCleanupDocs = new Set();
-    }
-    if (!plugin.childNavCleanupDocs.has(docId)) {
-        plugin.childNavCleanupDocs.add(docId);
-        cleanupLegacyChildNavBlocks(docId).catch((error) => {
-            console.warn(`${LOG_PREFIX} cleanupLegacyChildNavBlocks failed`, docId, error);
-        });
     }
     const host = primeChildNavHost(plugin, p) || ensureChildNavHost(p, docId);
     if (!host) {
@@ -2877,15 +2892,6 @@ function resolveProtyleDocId(editor) {
     return { editor: p, docId: null };
 }
 
-function escapeKramdownSingleQuoted(text) {
-    return String(text ?? "").replace(/\\/g, "\\\\").replace(/'/g, "\\'");
-}
-
-function buildChildDocRefMarkdown(childId, title) {
-    const label = escapeKramdownSingleQuoted((title || "").trim() || childId);
-    return `((${childId} '${label}'))`;
-}
-
 async function runSqlQuery(stmt) {
     const response = await fetchSyncPost("/api/query/sql", { stmt });
     return parseSqlQueryRows(response);
@@ -2997,14 +3003,16 @@ async function getDocPathById(docId) {
         const data = response?.data ?? response;
         const notebook = data?.notebook || data?.box;
         const path = data?.path;
-        if (!notebook || !path) {
-            return null;
+        if (notebook) {
+            return { notebook, path: normalizeBoxDocPath(path, notebook) };
         }
-        return { notebook, path };
     } catch (error) {
         console.warn(`${LOG_PREFIX} getPathByID failed`, docId, error);
-        return null;
     }
+    if (getNotebookById(docId)) {
+        return { notebook: docId, path: notebookBoxDocPath(docId) };
+    }
+    return null;
 }
 
 function mapListDocsFileToChild(file, notebook) {
@@ -3042,14 +3050,7 @@ async function fetchDocsByPathRaw(notebook, path, options = {}) {
     return response?.data?.files || response?.files || [];
 }
 
-async function listDocsByPath(notebook, path, options = {}) {
-    const rawFiles = await fetchDocsByPathRaw(notebook, path, options);
-    return (rawFiles || [])
-        .map((file) => mapListDocsFileToChild(file, notebook))
-        .filter(Boolean);
-}
-
-async function queryDirectChildDocs(parentId, config) {
+async function queryDirectChildDocs(parentId) {
     if (!parentId) {
         return { children: [], notebookId: null };
     }
@@ -3058,19 +3059,23 @@ async function queryDirectChildDocs(parentId, config) {
         console.warn(`${LOG_PREFIX} queryDirectChildDocs: path not found`, parentId);
         return { children: [], notebookId: null };
     }
-    const folderPath = toListDocsFolderPath(pathInfo.path);
+    const isBox = isNotebookBoxDoc(parentId, pathInfo.notebook)
+        || isNotebookBoxDocPath(pathInfo.path, pathInfo.notebook);
+    const folderPath = isBox ? "/" : toListDocsFolderPath(pathInfo.path);
+    const dropBoxDoc = (files) => (files || []).filter((child) => child.id !== pathInfo.notebook);
     try {
         const rawFiles = await fetchDocsByPathRaw(pathInfo.notebook, folderPath, { sort: LIST_DOCS_SORT_UNASSIGNED });
         return {
-            children: mapRawFilesToChildren(rawFiles, pathInfo.notebook),
+            children: dropBoxDoc(mapRawFilesToChildren(rawFiles, pathInfo.notebook)),
             notebookId: pathInfo.notebook,
         };
     } catch (error) {
         console.warn(`${LOG_PREFIX} listDocsByPath failed`, parentId, folderPath, error);
         try {
-            const rawFiles = await fetchDocsByPathRaw(pathInfo.notebook, pathInfo.path, { sort: LIST_DOCS_SORT_UNASSIGNED });
+            const fallbackPath = isBox ? "/" : pathInfo.path;
+            const rawFiles = await fetchDocsByPathRaw(pathInfo.notebook, fallbackPath, { sort: LIST_DOCS_SORT_UNASSIGNED });
             return {
-                children: mapRawFilesToChildren(rawFiles, pathInfo.notebook),
+                children: dropBoxDoc(mapRawFilesToChildren(rawFiles, pathInfo.notebook)),
                 notebookId: pathInfo.notebook,
             };
         } catch (fallbackError) {
@@ -3080,270 +3085,12 @@ async function queryDirectChildDocs(parentId, config) {
     }
 }
 
-async function queryExistingRefTargets(rootId) {
-    const existing = new Set();
-    if (!rootId) {
-        return existing;
-    }
-    try {
-        const stmt = `SELECT DISTINCT def_block_id FROM refs WHERE root_id = '${escapeSqlId(rootId)}'`;
-        const rows = await runSqlQuery(stmt);
-        rows.forEach((row) => {
-            if (row.def_block_id) {
-                existing.add(row.def_block_id);
-            }
-        });
-        if (existing.size > 0) {
-            return existing;
-        }
-    } catch (error) {
-        console.warn(`${LOG_PREFIX} queryExistingRefTargets refs failed`, error);
-    }
-    try {
-        const stmt = `SELECT markdown, content FROM blocks WHERE root_id = '${escapeSqlId(rootId)}' AND markdown LIKE '%block-ref%'`;
-        const rows = await runSqlQuery(stmt);
-        rows.forEach((row) => {
-            const text = `${row.markdown || ""}\n${row.content || ""}`;
-            const re = /data-id="(\d{14}-[0-9a-z]{7})"/g;
-            let match = re.exec(text);
-            while (match) {
-                existing.add(match[1]);
-                match = re.exec(text);
-            }
-            const mdRe = /\(\((\d{14}-[0-9a-z]{7})\s/g;
-            match = mdRe.exec(text);
-            while (match) {
-                existing.add(match[1]);
-                match = mdRe.exec(text);
-            }
-        });
-    } catch (error) {
-        console.warn(`${LOG_PREFIX} queryExistingRefTargets fallback failed`, error);
-    }
-    return existing;
-}
-
-async function appendChildDocRef(parentId, childId, title) {
-    const response = await fetchSyncPost("/api/block/appendBlock", {
-        dataType: "markdown",
-        data: buildChildDocRefMarkdown(childId, title),
-        parentID: parentId,
-    });
-    if (response && typeof response.code === "number" && response.code !== 0) {
-        throw new Error(response.msg || "appendBlock failed");
-    }
-    return response;
-}
-
-async function syncChildDocIndexForDoc(parentId, config, options = {}) {
-    const result = {
-        parentId,
-        added: 0,
-        skipped: 0,
-        failed: 0,
-        noChildren: false,
-    };
-    if (!parentId) {
-        return result;
-    }
-    if (options.cancelled?.()) {
-        result.cancelled = true;
-        return result;
-    }
-    const queryResult = options.prefetchedChildren
-        ? { children: options.prefetchedChildren, notebookId: options.notebookId || options.prefetchedChildren[0]?.box || null }
-        : await queryDirectChildDocs(parentId, config);
-    const children = queryResult.children || [];
-    if (!children.length) {
-        result.noChildren = true;
-        return result;
-    }
-    const existing = await queryExistingRefTargets(parentId);
-    for (const child of children) {
-        if (options.cancelled?.()) {
-            result.cancelled = true;
-            break;
-        }
-        if (existing.has(child.id)) {
-            result.skipped += 1;
-            continue;
-        }
-        try {
-            await appendChildDocRef(parentId, child.id, child.content);
-            existing.add(child.id);
-            result.added += 1;
-        } catch (error) {
-            console.warn(`${LOG_PREFIX} appendChildDocRef failed`, parentId, child.id, error);
-            result.failed += 1;
-        }
-    }
-    return result;
-}
-
-async function resolveNotebookIdsForIndex(config) {
-    if (config?.scope === "selectedNotebooks" && Array.isArray(config.notebookIds) && config.notebookIds.length > 0) {
-        return [...new Set(config.notebookIds.filter(Boolean))];
-    }
-    const notebooks = await listOpenNotebooks();
-    return notebooks.map((item) => item.id).filter(Boolean);
-}
-
-async function collectDirectChildrenByParentInNotebook(notebook, options = {}) {
-    const childrenByParent = new Map();
-    if (!notebook) {
-        return childrenByParent;
-    }
-    const queue = [{ parentId: null, folderPath: "/" }];
-    const visited = new Set();
-    while (queue.length > 0) {
-        if (options.cancelled?.()) {
-            break;
-        }
-        const { parentId, folderPath } = queue.shift();
-        const key = `${notebook}:${folderPath}`;
-        if (visited.has(key)) {
-            continue;
-        }
-        visited.add(key);
-        let rawFiles = [];
-        try {
-            rawFiles = await fetchDocsByPathRaw(notebook, folderPath, { sort: LIST_DOCS_SORT_UNASSIGNED });
-        } catch (error) {
-            console.warn(`${LOG_PREFIX} collect children failed`, notebook, folderPath, error);
-            continue;
-        }
-        const files = mapRawFilesToChildren(rawFiles, notebook);
-        if (parentId && files.length > 0) {
-            childrenByParent.set(parentId, files);
-        }
-        files.forEach((file) => {
-            // Prefer subFileCount when known; if unknown, still probe one level deeper.
-            if (file.subFileCount === 0) {
-                return;
-            }
-            queue.push({
-                parentId: file.id,
-                folderPath: toListDocsFolderPath(file.path),
-            });
-        });
-    }
-    return childrenByParent;
-}
-
-async function runGlobalChildDocIndex(plugin, callbacks = {}) {
-    const config = callbacks.config
-        || plugin.config.childDocIndex
-        || createDefaultChildDocIndexConfig();
-    const { onProgress, isCancelled } = callbacks;
-    const summary = {
-        parents: 0,
-        added: 0,
-        skipped: 0,
-        failed: 0,
-        cancelled: false,
-    };
-    const notebookIds = await resolveNotebookIdsForIndex(config);
-    const childrenByParent = new Map();
-    for (const notebookId of notebookIds) {
-        if (isCancelled?.()) {
-            summary.cancelled = true;
-            break;
-        }
-        const partial = await collectDirectChildrenByParentInNotebook(notebookId, {
-            config,
-            cancelled: isCancelled,
-        });
-        partial.forEach((children, parentId) => {
-            childrenByParent.set(parentId, children);
-        });
-    }
-    const parentIds = [...childrenByParent.keys()];
-    summary.parents = parentIds.length;
-    for (let index = 0; index < parentIds.length; index += 1) {
-        if (isCancelled?.()) {
-            summary.cancelled = true;
-            break;
-        }
-        const parentId = parentIds[index];
-        const prefetchedChildren = childrenByParent.get(parentId);
-        const result = await syncChildDocIndexForDoc(parentId, config, {
-            prefetchedChildren,
-            notebookId: prefetchedChildren?.[0]?.box || null,
-            cancelled: isCancelled,
-        });
-        summary.added += result.added;
-        summary.skipped += result.skipped;
-        summary.failed += result.failed;
-        if (result.cancelled) {
-            summary.cancelled = true;
-            break;
-        }
-        onProgress?.({
-            current: index + 1,
-            total: parentIds.length,
-            added: summary.added,
-            skipped: summary.skipped,
-            failed: summary.failed,
-        });
-    }
-    return summary;
-}
-
-function formatChildDocIndexMessage(i18n, key, params = {}) {
+function formatTemplateMessage(i18n, key, params = {}) {
     let text = i18n[key] || key;
     Object.entries(params).forEach(([name, value]) => {
         text = text.replace(new RegExp(`\\$\\{${name}\\}`, "g"), String(value));
     });
     return text;
-}
-
-async function handleChildDocIndexForProtyle(plugin, protyle) {
-    if (!isChildDocIndexEnabled(plugin)) {
-        return;
-    }
-    if (plugin.childDocIndexBusy) {
-        return;
-    }
-    plugin.childDocIndexBusy = true;
-    try {
-        const editor = unwrapProtyle(protyle) || findProtyleByElement(protyle?.element);
-        const { editor: resolvedEditor, docId } = resolveProtyleDocId(editor);
-        if (!docId) {
-            console.warn(`${LOG_PREFIX} childDocIndex: cannot resolve doc id`, {
-                hasEditor: !!resolvedEditor,
-                rootID: resolvedEditor?.block?.rootID,
-                blockId: resolvedEditor?.block?.id,
-                titleId: resolvedEditor?.title?.element?.getAttribute?.("data-node-id"),
-            });
-            showMessage(plugin.i18n.childDocIndexNoDoc);
-            return;
-        }
-        const config = plugin.config.childDocIndex || createDefaultChildDocIndexConfig();
-        const result = await syncChildDocIndexForDoc(docId, config);
-        if (result.noChildren) {
-            console.warn(`${LOG_PREFIX} childDocIndex: no children for`, docId);
-            showMessage(plugin.i18n.childDocIndexNoChildren);
-            return;
-        }
-        if (result.added === 0 && result.failed === 0) {
-            showMessage(plugin.i18n.childDocIndexAllExist);
-            return;
-        }
-        if (result.failed > 0) {
-            showMessage(formatChildDocIndexMessage(plugin.i18n, "childDocIndexPartial", {
-                added: result.added,
-                failed: result.failed,
-            }));
-            return;
-        }
-        showMessage(formatChildDocIndexMessage(plugin.i18n, "childDocIndexAdded", { count: result.added }));
-        if (plugin.config.docRefStyle?.enabled && resolvedEditor) {
-            markDocRefDirty(plugin, docId);
-            scheduleRebuildDocRef(plugin, resolvedEditor);
-        }
-    } finally {
-        plugin.childDocIndexBusy = false;
-    }
 }
 
 function toDocDirPath(path) {
@@ -3353,12 +3100,15 @@ function toDocDirPath(path) {
     return String(path).replace(/\.sy$/i, "");
 }
 
-function isDocPathUnderParent(childPath, parentPath) {
+function isDocPathUnderParent(childPath, parentPath, notebook, childBox) {
     if (!childPath || !parentPath) {
         return false;
     }
     if (childPath === parentPath) {
         return true;
+    }
+    if (notebook && isNotebookBoxDocPath(parentPath, notebook)) {
+        return childBox === notebook && !isNotebookBoxDocPath(childPath, notebook);
     }
     const parentDir = toDocDirPath(parentPath);
     if (parentDir === "/") {
@@ -3415,7 +3165,7 @@ async function handleLocateDocInTreeForProtyle(plugin, protyle) {
         const editor = unwrapProtyle(protyle) || findProtyleByElement(protyle?.element);
         const { docId } = resolveProtyleDocId(editor);
         if (!docId) {
-            showMessage(plugin.i18n.childDocIndexNoDoc);
+            showMessage(plugin.i18n.cannotResolveDoc);
             return;
         }
         await locateDocInFileTree(docId, editor);
@@ -3466,11 +3216,11 @@ WHERE type = 'd' AND id IN (${inList})
         }
         const path = row.path || "";
         // Already under this doc (incl. deeper descendants): skip.
-        if (isDocPathUnderParent(path, parentPathInfo.path)) {
+        if (isDocPathUnderParent(path, parentPathInfo.path, parentPathInfo.notebook, row.box)) {
             continue;
         }
         // Would create a cycle if we move an ancestor under this doc.
-        if (isDocPathUnderParent(parentPathInfo.path, path)) {
+        if (isDocPathUnderParent(parentPathInfo.path, path, row.box, parentPathInfo.notebook)) {
             continue;
         }
         result.push({
@@ -3498,9 +3248,6 @@ async function moveDocsAsChildren(parentId, docIds) {
 }
 
 async function handleGatherReferencedDocsForProtyle(plugin, protyle) {
-    if (!isChildDocIndexEnabled(plugin)) {
-        return;
-    }
     if (plugin.gatherRefsBusy) {
         return;
     }
@@ -3509,7 +3256,7 @@ async function handleGatherReferencedDocsForProtyle(plugin, protyle) {
         const editor = unwrapProtyle(protyle) || findProtyleByElement(protyle?.element);
         const { docId } = resolveProtyleDocId(editor);
         if (!docId) {
-            showMessage(plugin.i18n.childDocIndexNoDoc);
+            showMessage(plugin.i18n.cannotResolveDoc);
             return;
         }
         const candidates = await queryReferencedDocsOutsideChildren(docId);
@@ -3522,12 +3269,12 @@ async function handleGatherReferencedDocsForProtyle(plugin, protyle) {
             .map((item) => `· ${item.title}`)
             .join("\n");
         const extra = candidates.length > 8
-            ? formatChildDocIndexMessage(plugin.i18n, "gatherRefsConfirmMore", {
+            ? formatTemplateMessage(plugin.i18n, "gatherRefsConfirmMore", {
                 count: candidates.length - 8,
             })
             : "";
         const confirmed = window.confirm(
-            formatChildDocIndexMessage(plugin.i18n, "gatherRefsConfirm", {
+            formatTemplateMessage(plugin.i18n, "gatherRefsConfirm", {
                 count: candidates.length,
                 list: `${preview}${extra ? `\n${extra}` : ""}`,
             }),
@@ -3536,7 +3283,7 @@ async function handleGatherReferencedDocsForProtyle(plugin, protyle) {
             return;
         }
         const { moved } = await moveDocsAsChildren(docId, candidates.map((item) => item.id));
-        showMessage(formatChildDocIndexMessage(plugin.i18n, "gatherRefsDone", { count: moved }));
+        showMessage(formatTemplateMessage(plugin.i18n, "gatherRefsDone", { count: moved }));
     } catch (error) {
         console.warn(`${LOG_PREFIX} gatherReferencedDocs failed`, error);
         showMessage(plugin.i18n.gatherRefsFailed);
@@ -3574,7 +3321,7 @@ async function queryUnreferencedChildDocs(parentId) {
     if (!parentId) {
         return [];
     }
-    const { children } = await queryDirectChildDocs(parentId, createDefaultChildDocIndexConfig());
+    const { children } = await queryDirectChildDocs(parentId);
     if (!children.length) {
         return [];
     }
@@ -3591,9 +3338,6 @@ async function removeDocById(docId) {
 }
 
 async function handleDeleteUnreferencedChildrenForProtyle(plugin, protyle) {
-    if (!isChildDocIndexEnabled(plugin)) {
-        return;
-    }
     if (plugin.deleteUnrefBusy) {
         return;
     }
@@ -3602,7 +3346,7 @@ async function handleDeleteUnreferencedChildrenForProtyle(plugin, protyle) {
         const editor = unwrapProtyle(protyle) || findProtyleByElement(protyle?.element);
         const { docId } = resolveProtyleDocId(editor);
         if (!docId) {
-            showMessage(plugin.i18n.childDocIndexNoDoc);
+            showMessage(plugin.i18n.cannotResolveDoc);
             return;
         }
         const candidates = await queryUnreferencedChildDocs(docId);
@@ -3615,7 +3359,7 @@ async function handleDeleteUnreferencedChildrenForProtyle(plugin, protyle) {
             .slice(0, 8)
             .map((item) => {
                 const sub = (item.subFileCount || 0) > 0
-                    ? formatChildDocIndexMessage(plugin.i18n, "deleteUnrefHasChildren", {
+                    ? formatTemplateMessage(plugin.i18n, "deleteUnrefHasChildren", {
                         count: item.subFileCount,
                     })
                     : "";
@@ -3623,15 +3367,15 @@ async function handleDeleteUnreferencedChildrenForProtyle(plugin, protyle) {
             })
             .join("\n");
         const extra = candidates.length > 8
-            ? formatChildDocIndexMessage(plugin.i18n, "deleteUnrefConfirmMore", {
+            ? formatTemplateMessage(plugin.i18n, "deleteUnrefConfirmMore", {
                 count: candidates.length - 8,
             })
             : "";
         const confirmed = window.confirm(
-            formatChildDocIndexMessage(plugin.i18n, "deleteUnrefConfirm", {
+            formatTemplateMessage(plugin.i18n, "deleteUnrefConfirm", {
                 count: candidates.length,
                 subtreeHint: withSubtree > 0
-                    ? formatChildDocIndexMessage(plugin.i18n, "deleteUnrefSubtreeHint", {
+                    ? formatTemplateMessage(plugin.i18n, "deleteUnrefSubtreeHint", {
                         count: withSubtree,
                     })
                     : "",
@@ -3653,13 +3397,13 @@ async function handleDeleteUnreferencedChildrenForProtyle(plugin, protyle) {
             }
         }
         if (failed > 0) {
-            showMessage(formatChildDocIndexMessage(plugin.i18n, "deleteUnrefPartial", {
+            showMessage(formatTemplateMessage(plugin.i18n, "deleteUnrefPartial", {
                 deleted,
                 failed,
             }));
             return;
         }
-        showMessage(formatChildDocIndexMessage(plugin.i18n, "deleteUnrefDone", { count: deleted }));
+        showMessage(formatTemplateMessage(plugin.i18n, "deleteUnrefDone", { count: deleted }));
     } catch (error) {
         console.warn(`${LOG_PREFIX} deleteUnreferencedChildren failed`, error);
         showMessage(plugin.i18n.deleteUnrefFailed);
@@ -3668,22 +3412,14 @@ async function handleDeleteUnreferencedChildrenForProtyle(plugin, protyle) {
     }
 }
 
-const BREADCRUMB_BTN_CHILD_INDEX = "fhelper-child-doc-index";
 const BREADCRUMB_BTN_LOCATE = "fhelper-locate-in-tree";
 const BREADCRUMB_BTN_GATHER = "fhelper-gather-refs";
 const BREADCRUMB_BTN_DELETE_UNREF = "fhelper-delete-unref-children";
-const FHELPER_ICON_CHILD_INDEX = "iconFhelperChildIndex";
 const FHELPER_ICON_GATHER_REFS = "iconFhelperGatherRefs";
 const FHELPER_ICON_DELETE_UNREF = "iconFhelperDeleteUnref";
+const LEGACY_BREADCRUMB_CHILD_INDEX = "fhelper-child-doc-index";
 
 const BREADCRUMB_DOC_ACTIONS = [
-    {
-        type: BREADCRUMB_BTN_CHILD_INDEX,
-        iconHref: `#${FHELPER_ICON_CHILD_INDEX}`,
-        tipKey: "childDocIndexBreadcrumbTip",
-        run: (plugin, editor) => handleChildDocIndexForProtyle(plugin, editor),
-        failKey: "childDocIndexFailed",
-    },
     {
         type: BREADCRUMB_BTN_LOCATE,
         iconHref: "#iconFocus",
@@ -3706,17 +3442,6 @@ const BREADCRUMB_DOC_ACTIONS = [
         failKey: "deleteUnrefFailed",
     },
 ];
-
-async function listOpenNotebooks() {
-    try {
-        const response = await fetchSyncPost("/api/notebook/lsNotebooks", {});
-        const notebooks = response?.data?.notebooks || response?.notebooks || [];
-        return (notebooks || []).filter((item) => item && !item.closed);
-    } catch (error) {
-        console.warn(`${LOG_PREFIX} listOpenNotebooks failed`, error);
-        return [];
-    }
-}
 
 function getBreadcrumbRoot(protyle) {
     const p = unwrapProtyle(protyle);
@@ -3744,23 +3469,16 @@ function bindDocActionBreadcrumbButton(plugin, btn, action) {
         const editor = findProtyleByElement(fresh);
         Promise.resolve(action.run(plugin, editor)).catch((error) => {
             console.warn(`${LOG_PREFIX} breadcrumb action failed`, action.type, error);
-            showMessage(plugin.i18n[action.failKey] || plugin.i18n.childDocIndexFailed);
+            showMessage(plugin.i18n[action.failKey] || plugin.i18n.cannotResolveDoc);
         });
     }, true);
     return fresh;
 }
 
-const CHILD_DOC_INDEX_BREADCRUMB_TYPES = [
-    BREADCRUMB_BTN_CHILD_INDEX,
-    BREADCRUMB_BTN_GATHER,
-    BREADCRUMB_BTN_DELETE_UNREF,
-];
-
-function removeChildDocIndexBreadcrumbButtons(root = document) {
-    const selector = CHILD_DOC_INDEX_BREADCRUMB_TYPES
-        .map((type) => `.protyle-breadcrumb [data-type="${type}"], button[data-type="${type}"]`)
-        .join(", ");
-    root.querySelectorAll?.(selector)?.forEach((el) => el.remove());
+function removeLegacyChildIndexBreadcrumbButtons(root = document) {
+    root.querySelectorAll?.(
+        `.protyle-breadcrumb [data-type="${LEGACY_BREADCRUMB_CHILD_INDEX}"], button[data-type="${LEGACY_BREADCRUMB_CHILD_INDEX}"]`,
+    )?.forEach((el) => el.remove());
 }
 
 function ensureDocActionBreadcrumbButtons(plugin, protyle) {
@@ -3768,17 +3486,10 @@ function ensureDocActionBreadcrumbButtons(plugin, protyle) {
     if (!root) {
         return;
     }
-    const indexEnabled = isChildDocIndexEnabled(plugin);
-    if (!indexEnabled) {
-        removeChildDocIndexBreadcrumbButtons(root);
-    }
+    removeLegacyChildIndexBreadcrumbButtons(root);
     const lockBtn = root.querySelector('[data-type="readonly"]');
     let insertBefore = lockBtn;
     BREADCRUMB_DOC_ACTIONS.forEach((action) => {
-        const isIndexAction = CHILD_DOC_INDEX_BREADCRUMB_TYPES.includes(action.type);
-        if (isIndexAction && !indexEnabled) {
-            return;
-        }
         let btn = root.querySelector(`[data-type="${action.type}"]`);
         if (!btn) {
             btn = document.createElement("button");
@@ -3797,21 +3508,8 @@ function ensureDocActionBreadcrumbButtons(plugin, protyle) {
     });
 }
 
-function syncChildDocIndexFeature(plugin) {
-    const enabled = isChildDocIndexEnabled(plugin);
-    setChildDocIndexDomGate(enabled);
-    if (!enabled) {
-        removeChildDocIndexBreadcrumbButtons(document);
-        return;
-    }
-    patchChildDocIndexBreadcrumbButtons(plugin);
-}
-
-function patchChildDocIndexBreadcrumbButtons(plugin) {
-    if (!isChildDocIndexEnabled(plugin)) {
-        removeChildDocIndexBreadcrumbButtons(document);
-        return;
-    }
+function patchDocActionBreadcrumbButtons(plugin) {
+    removeLegacyChildIndexBreadcrumbButtons(document);
     getAllEditor().forEach((editor) => {
         const protyle = unwrapProtyle(editor?.protyle || editor);
         if (protyle) {
@@ -5299,7 +4997,6 @@ function createDefaultConfig() {
         imageScale: createDefaultImageScaleConfig(),
         panguSpacing: createDefaultPanguSpacingConfig(),
         docRefStyle: createDefaultDocRefStyleConfig(),
-        childDocIndex: createDefaultChildDocIndexConfig(),
         childDocWidget: createDefaultChildDocWidgetConfig(),
         fileTree: createDefaultFileTreeConfig(),
         configSync: createDefaultConfigSyncConfig(),
@@ -5414,7 +5111,7 @@ function patchAllEditors(plugin) {
     scheduleSlashHintHook(plugin);
     watchAllEditorLayouts(plugin);
     syncPanguSpacingWatchers(plugin);
-    patchChildDocIndexBreadcrumbButtons(plugin);
+    patchDocActionBreadcrumbButtons(plugin);
     if (plugin.config.docRefStyle?.enabled) {
         watchAllDocRefEditors(plugin);
         decorateAllOpenEditors(plugin).catch((error) => {
@@ -5461,39 +5158,14 @@ module.exports = class FhelperPlugin extends Plugin {
     docRefWsPending = null;
     childNavWsTimer = null;
     childNavMountTimers = null;
-    childNavCleanupDocs = null;
     layoutRefreshTimer = null;
     windowResizeHandler = null;
-    childDocIndexProgressDialog = null;
-    childDocIndexCancelFlag = null;
-    childDocIndexEnableEl = null;
-    childDocIndexGlobalBtn = null;
-    childDocIndexNotebookBtn = null;
-    childDocIndexGlobalRow = null;
-    childDocIndexNotebookRow = null;
-    childDocIndexNotebookSelectEl = null;
-    childDocIndexBusy = false;
     gatherRefsBusy = false;
     deleteUnrefBusy = false;
     breadcrumbMoreHandler = null;
 
     updateProtyleToolbar(toolbar) {
         toolbar.push("|");
-        if (isChildDocIndexEnabled(this)) {
-            toolbar.push({
-                name: "fhelper-child-doc-index",
-                icon: FHELPER_ICON_CHILD_INDEX,
-                hotkey: "",
-                tipPosition: "n",
-                tip: this.i18n.childDocIndexToolbarTip,
-                click: (protyle) => {
-                    handleChildDocIndexForProtyle(this, protyle).catch((error) => {
-                        console.warn(`${LOG_PREFIX} handleChildDocIndexForProtyle failed`, error);
-                        showMessage(this.i18n.childDocIndexFailed);
-                    });
-                },
-            });
-        }
         toolbar.push({
             name: "fhelper-locate-in-tree",
             icon: "iconFocus",
@@ -5507,34 +5179,32 @@ module.exports = class FhelperPlugin extends Plugin {
                 });
             },
         });
-        if (isChildDocIndexEnabled(this)) {
-            toolbar.push({
-                name: "fhelper-gather-refs",
-                icon: FHELPER_ICON_GATHER_REFS,
-                hotkey: "",
-                tipPosition: "n",
-                tip: this.i18n.gatherRefsToolbarTip,
-                click: (protyle) => {
-                    handleGatherReferencedDocsForProtyle(this, protyle).catch((error) => {
-                        console.warn(`${LOG_PREFIX} handleGatherReferencedDocsForProtyle failed`, error);
-                        showMessage(this.i18n.gatherRefsFailed);
-                    });
-                },
-            });
-            toolbar.push({
-                name: "fhelper-delete-unref-children",
-                icon: FHELPER_ICON_DELETE_UNREF,
-                hotkey: "",
-                tipPosition: "n",
-                tip: this.i18n.deleteUnrefToolbarTip,
-                click: (protyle) => {
-                    handleDeleteUnreferencedChildrenForProtyle(this, protyle).catch((error) => {
-                        console.warn(`${LOG_PREFIX} handleDeleteUnreferencedChildrenForProtyle failed`, error);
-                        showMessage(this.i18n.deleteUnrefFailed);
-                    });
-                },
-            });
-        }
+        toolbar.push({
+            name: "fhelper-gather-refs",
+            icon: FHELPER_ICON_GATHER_REFS,
+            hotkey: "",
+            tipPosition: "n",
+            tip: this.i18n.gatherRefsToolbarTip,
+            click: (protyle) => {
+                handleGatherReferencedDocsForProtyle(this, protyle).catch((error) => {
+                    console.warn(`${LOG_PREFIX} handleGatherReferencedDocsForProtyle failed`, error);
+                    showMessage(this.i18n.gatherRefsFailed);
+                });
+            },
+        });
+        toolbar.push({
+            name: "fhelper-delete-unref-children",
+            icon: FHELPER_ICON_DELETE_UNREF,
+            hotkey: "",
+            tipPosition: "n",
+            tip: this.i18n.deleteUnrefToolbarTip,
+            click: (protyle) => {
+                handleDeleteUnreferencedChildrenForProtyle(this, protyle).catch((error) => {
+                    console.warn(`${LOG_PREFIX} handleDeleteUnreferencedChildrenForProtyle failed`, error);
+                    showMessage(this.i18n.deleteUnrefFailed);
+                });
+            },
+        });
         return toolbar;
     }
 
@@ -5545,10 +5215,6 @@ module.exports = class FhelperPlugin extends Plugin {
         syncFileTreeFeature(this);
 
         this.addIcons(`
-<symbol id="${FHELPER_ICON_CHILD_INDEX}" viewBox="0 0 32 32">
-  <path d="M5 5h9v5H5zm13 0h9v5h-9zM5 14h22v2.2H5zm0 6h14v2.2H5zm0 5h18v2.2H5z" fill="currentColor"></path>
-  <path d="M24 19.2l5 3.4-5 3.4v-2.2h-6.5v-2.4H24z" fill="currentColor"></path>
-</symbol>
 <symbol id="${FHELPER_ICON_GATHER_REFS}" viewBox="0 0 32 32">
   <path d="M6 4.5h11v7H6zm0 11h8v7H6zm14-5.5h6.5v17H20z" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"></path>
   <path d="M17 8h4v2.2h-4zM14 19h4v2.2h-4z" fill="currentColor"></path>
@@ -5565,17 +5231,6 @@ module.exports = class FhelperPlugin extends Plugin {
             hotkey: "",
             callback: () => {
                 this.openSetting();
-            },
-        });
-
-        this.addCommand({
-            langKey: "childDocIndexCurrentDoc",
-            hotkey: "",
-            editorCallback: (protyle) => {
-                handleChildDocIndexForProtyle(this, protyle).catch((error) => {
-                    console.warn(`${LOG_PREFIX} handleChildDocIndexForProtyle failed`, error);
-                    showMessage(this.i18n.childDocIndexFailed);
-                });
             },
         });
 
@@ -5683,19 +5338,6 @@ module.exports = class FhelperPlugin extends Plugin {
                 return;
             }
             topMenu.addItem({ type: "separator", id: "fhelper-breadcrumb-sep" });
-            if (isChildDocIndexEnabled(this)) {
-                topMenu.addItem({
-                    id: "fhelper-child-doc-index",
-                    icon: FHELPER_ICON_CHILD_INDEX,
-                    label: this.i18n.childDocIndexMenuLabel,
-                    click: () => {
-                        handleChildDocIndexForProtyle(this, protyle).catch((error) => {
-                            console.warn(`${LOG_PREFIX} breadcrumbmore child index failed`, error);
-                            showMessage(this.i18n.childDocIndexFailed);
-                        });
-                    },
-                });
-            }
             topMenu.addItem({
                 id: "fhelper-locate-in-tree",
                 icon: "iconFocus",
@@ -5707,30 +5349,28 @@ module.exports = class FhelperPlugin extends Plugin {
                     });
                 },
             });
-            if (isChildDocIndexEnabled(this)) {
-                topMenu.addItem({
-                    id: "fhelper-gather-refs",
-                    icon: FHELPER_ICON_GATHER_REFS,
-                    label: this.i18n.gatherRefsMenuLabel,
-                    click: () => {
-                        handleGatherReferencedDocsForProtyle(this, protyle).catch((error) => {
-                            console.warn(`${LOG_PREFIX} breadcrumbmore gather failed`, error);
-                            showMessage(this.i18n.gatherRefsFailed);
-                        });
-                    },
-                });
-                topMenu.addItem({
-                    id: "fhelper-delete-unref-children",
-                    icon: FHELPER_ICON_DELETE_UNREF,
-                    label: this.i18n.deleteUnrefMenuLabel,
-                    click: () => {
-                        handleDeleteUnreferencedChildrenForProtyle(this, protyle).catch((error) => {
-                            console.warn(`${LOG_PREFIX} breadcrumbmore delete unref failed`, error);
-                            showMessage(this.i18n.deleteUnrefFailed);
-                        });
-                    },
-                });
-            }
+            topMenu.addItem({
+                id: "fhelper-gather-refs",
+                icon: FHELPER_ICON_GATHER_REFS,
+                label: this.i18n.gatherRefsMenuLabel,
+                click: () => {
+                    handleGatherReferencedDocsForProtyle(this, protyle).catch((error) => {
+                        console.warn(`${LOG_PREFIX} breadcrumbmore gather failed`, error);
+                        showMessage(this.i18n.gatherRefsFailed);
+                    });
+                },
+            });
+            topMenu.addItem({
+                id: "fhelper-delete-unref-children",
+                icon: FHELPER_ICON_DELETE_UNREF,
+                label: this.i18n.deleteUnrefMenuLabel,
+                click: () => {
+                    handleDeleteUnreferencedChildrenForProtyle(this, protyle).catch((error) => {
+                        console.warn(`${LOG_PREFIX} breadcrumbmore delete unref failed`, error);
+                        showMessage(this.i18n.deleteUnrefFailed);
+                    });
+                },
+            });
         };
         this.eventBus.on("open-menu-breadcrumbmore", this.breadcrumbMoreHandler);
 
@@ -5754,7 +5394,7 @@ module.exports = class FhelperPlugin extends Plugin {
         this.ensureBazaarSettingButton();
         this.scheduleBazaarSettingButtonFix();
         syncDocRefStyleFeature(this);
-        syncChildDocIndexFeature(this);
+        patchDocActionBreadcrumbButtons(this);
         syncFileTreeFeature(this);
         installChildNavBackRestore(this);
         // Import is manual only; watchers only push on theme change / settings close.
@@ -5766,9 +5406,6 @@ module.exports = class FhelperPlugin extends Plugin {
     onunload() {
         uninstallConfigSyncWatchers(this);
         uninstallSlashHintHook();
-        this.childDocIndexProgressDialog?.destroy();
-        this.childDocIndexProgressDialog = null;
-        this.childDocIndexCancelFlag = null;
         if (this.bazaarObserver) {
             this.bazaarObserver.disconnect();
             this.bazaarObserver = null;
@@ -5805,7 +5442,6 @@ module.exports = class FhelperPlugin extends Plugin {
             this.eventBus.off("ws-main", this.docRefWsHandler);
             this.docRefWsHandler = null;
         }
-        document.documentElement.classList.remove(CHILD_DOC_INDEX_OFF_CLASS);
         uninstallChildNavBackRestore(this);
         setFileTreeHideNewSubDocCssEnabled(false);
         if (this.childNavWsTimer) {
@@ -5817,7 +5453,6 @@ module.exports = class FhelperPlugin extends Plugin {
             this.childNavMountTimers.clear();
             this.childNavMountTimers = null;
         }
-        this.childNavCleanupDocs = null;
         removeAllChildNavHosts();
         if (this.breadcrumbMoreHandler) {
             this.eventBus.off("open-menu-breadcrumbmore", this.breadcrumbMoreHandler);
@@ -5893,11 +5528,6 @@ module.exports = class FhelperPlugin extends Plugin {
                     ...createDefaultDocRefStyleConfig(),
                     ...(data.docRefStyle || {}),
                 },
-                childDocIndex: {
-                    ...createDefaultChildDocIndexConfig(),
-                    ...(data.childDocIndex || {}),
-                    sortBy: "tree",
-                },
                 childDocWidget: {
                     ...createDefaultChildDocWidgetConfig(),
                     ...(data.childDocWidget || {}),
@@ -5917,7 +5547,7 @@ module.exports = class FhelperPlugin extends Plugin {
                 scheduleLayoutRefresh(this);
             }
             syncAllChildNavPanels(this);
-            syncChildDocIndexFeature(this);
+            patchDocActionBreadcrumbButtons(this);
             syncFileTreeFeature(this);
             if (isConfigSyncActive()) {
                 installConfigSyncWatchers(this);
@@ -5939,7 +5569,6 @@ module.exports = class FhelperPlugin extends Plugin {
                     || data.imageScale
                     || data.panguSpacing
                     || data.docRefStyle
-                    || data.childDocIndex
                     || data.childDocWidget
                     || data.fileTree
                     || data.configSync);
@@ -5997,7 +5626,6 @@ module.exports = class FhelperPlugin extends Plugin {
             imageScale: { ...(this.config.imageScale || createDefaultImageScaleConfig()) },
             panguSpacing: { ...(this.config.panguSpacing || createDefaultPanguSpacingConfig()) },
             docRefStyle: { ...(this.config.docRefStyle || createDefaultDocRefStyleConfig()) },
-            childDocIndex: { ...(this.config.childDocIndex || createDefaultChildDocIndexConfig()) },
             childDocWidget: { ...(this.config.childDocWidget || createDefaultChildDocWidgetConfig()) },
             fileTree: { ...(this.config.fileTree || createDefaultFileTreeConfig()) },
             configSync: { ...(this.config.configSync || createDefaultConfigSyncConfig()) },
@@ -6018,152 +5646,6 @@ module.exports = class FhelperPlugin extends Plugin {
             callback: () => {
                 this.openSetting();
             },
-        });
-    }
-
-    confirmAndRunGlobalChildDocIndex() {
-        if (!isChildDocIndexEnabled(this)) {
-            return;
-        }
-        const confirmed = window.confirm(this.i18n.childDocIndexGlobalConfirm);
-        if (!confirmed) {
-            return;
-        }
-        this.runGlobalChildDocIndexWithProgress({
-            scope: "all",
-            notebookIds: [],
-        });
-    }
-
-    confirmAndRunNotebookChildDocIndex() {
-        if (!isChildDocIndexEnabled(this)) {
-            return;
-        }
-        const notebookId = this.childDocIndexNotebookSelectEl?.value || "";
-        if (!notebookId) {
-            showMessage(this.i18n.childDocIndexNotebookRequired);
-            return;
-        }
-        const notebookName = this.childDocIndexNotebookSelectEl?.selectedOptions?.[0]?.textContent
-            || notebookId;
-        const confirmed = window.confirm(formatChildDocIndexMessage(this.i18n, "childDocIndexNotebookConfirm", {
-            name: notebookName,
-        }));
-        if (!confirmed) {
-            return;
-        }
-        this.config.childDocIndex = {
-            ...(this.config.childDocIndex || createDefaultChildDocIndexConfig()),
-            selectedNotebookId: notebookId,
-        };
-        this.data[STORAGE_NAME] = this.config;
-        this.saveData(STORAGE_NAME, this.config).catch((error) => {
-            console.warn(`${LOG_PREFIX} save notebook selection failed`, error);
-        });
-        this.runGlobalChildDocIndexWithProgress({
-            scope: "selectedNotebooks",
-            notebookIds: [notebookId],
-        });
-    }
-
-    runGlobalChildDocIndexWithProgress(overrideConfig = null) {
-        if (this.childDocIndexProgressDialog) {
-            this.childDocIndexProgressDialog.destroy();
-            this.childDocIndexProgressDialog = null;
-        }
-        this.childDocIndexCancelFlag = { cancelled: false };
-        const cancelFlag = this.childDocIndexCancelFlag;
-        const statusEl = document.createElement("div");
-        statusEl.className = "fn__flex-column";
-        statusEl.style.gap = "12px";
-        statusEl.style.padding = "8px 4px";
-        const progressText = document.createElement("div");
-        progressText.textContent = this.i18n.childDocIndexGlobalRunning;
-        const detailText = document.createElement("div");
-        detailText.className = "b3-label__text";
-        detailText.textContent = "";
-        statusEl.appendChild(progressText);
-        statusEl.appendChild(detailText);
-        const footer = document.createElement("div");
-        footer.className = "fn__flex";
-        footer.style.justifyContent = "flex-end";
-        const cancelBtn = document.createElement("button");
-        cancelBtn.className = "b3-button b3-button--cancel";
-        cancelBtn.textContent = this.i18n.childDocIndexGlobalCancel;
-        cancelBtn.addEventListener("click", () => {
-            cancelFlag.cancelled = true;
-            cancelBtn.disabled = true;
-            progressText.textContent = this.i18n.childDocIndexGlobalCancelling;
-        });
-        footer.appendChild(cancelBtn);
-        statusEl.appendChild(footer);
-        this.childDocIndexProgressDialog = new Dialog({
-            title: this.i18n.childDocIndexGlobalProgressTitle,
-            content: "",
-            width: "520px",
-            height: "220px",
-            destroyCallback: () => {
-                this.childDocIndexProgressDialog = null;
-                this.childDocIndexCancelFlag = null;
-            },
-        });
-        const body = this.childDocIndexProgressDialog.element.querySelector(".b3-dialog__body");
-        body?.appendChild(statusEl);
-        const runtimeConfig = {
-            ...(this.config.childDocIndex || createDefaultChildDocIndexConfig()),
-            ...(overrideConfig || {}),
-        };
-        runGlobalChildDocIndex(this, {
-            config: runtimeConfig,
-            isCancelled: () => cancelFlag.cancelled,
-            onProgress: ({ current, total, added, skipped, failed }) => {
-                progressText.textContent = formatChildDocIndexMessage(this.i18n, "childDocIndexGlobalProgress", {
-                    current,
-                    total,
-                });
-                detailText.textContent = formatChildDocIndexMessage(this.i18n, "childDocIndexGlobalDetail", {
-                    added,
-                    skipped,
-                    failed,
-                });
-            },
-        }).then((summary) => {
-            cancelBtn.remove();
-            if (summary.cancelled) {
-                progressText.textContent = formatChildDocIndexMessage(this.i18n, "childDocIndexGlobalDoneCancelled", {
-                    parents: summary.parents,
-                    added: summary.added,
-                    skipped: summary.skipped,
-                    failed: summary.failed,
-                });
-            } else {
-                progressText.textContent = formatChildDocIndexMessage(this.i18n, "childDocIndexGlobalDone", {
-                    parents: summary.parents,
-                    added: summary.added,
-                    skipped: summary.skipped,
-                    failed: summary.failed,
-                });
-            }
-            detailText.textContent = "";
-            const closeBtn = document.createElement("button");
-            closeBtn.className = "b3-button b3-button--text";
-            closeBtn.textContent = this.i18n.confirm;
-            closeBtn.addEventListener("click", () => {
-                this.childDocIndexProgressDialog?.destroy();
-            });
-            footer.appendChild(closeBtn);
-        }).catch((error) => {
-            console.warn(`${LOG_PREFIX} runGlobalChildDocIndex failed`, error);
-            progressText.textContent = this.i18n.childDocIndexFailed;
-            detailText.textContent = String(error?.message || error || "");
-            cancelBtn.remove();
-            const closeBtn = document.createElement("button");
-            closeBtn.className = "b3-button b3-button--text";
-            closeBtn.textContent = this.i18n.confirm;
-            closeBtn.addEventListener("click", () => {
-                this.childDocIndexProgressDialog?.destroy();
-            });
-            footer.appendChild(closeBtn);
         });
     }
 
@@ -6232,12 +5714,6 @@ module.exports = class FhelperPlugin extends Plugin {
                 mode: normalizeChildNavMode(this.childDocWidgetModeEl.value),
             };
         }
-        if (this.childDocIndexEnableEl) {
-            this.config.childDocIndex = {
-                ...(this.config.childDocIndex || createDefaultChildDocIndexConfig()),
-                enabled: this.childDocIndexEnableEl.checked,
-            };
-        }
         if (this.fileTreeHideNewSubDocEl) {
             this.config.fileTree = {
                 ...(this.config.fileTree || createDefaultFileTreeConfig()),
@@ -6246,69 +5722,6 @@ module.exports = class FhelperPlugin extends Plugin {
         }
         // Config/theme cache is always on (desktop); persist defaults for older configs.
         this.config.configSync = createDefaultConfigSyncConfig();
-        if (this.childDocIndexNotebookSelectEl) {
-            this.config.childDocIndex = {
-                ...(this.config.childDocIndex || createDefaultChildDocIndexConfig()),
-                selectedNotebookId: this.childDocIndexNotebookSelectEl.value || "",
-            };
-        }
-    }
-
-    updateChildDocIndexSettingControls() {
-        const enabled = this.childDocIndexEnableEl
-            ? this.childDocIndexEnableEl.checked
-            : isChildDocIndexEnabled(this);
-        this.childDocIndexGlobalRow?.classList.toggle("fn__none", !enabled);
-        this.childDocIndexNotebookRow?.classList.toggle("fn__none", !enabled);
-        if (this.childDocIndexGlobalBtn) {
-            this.childDocIndexGlobalBtn.disabled = !enabled;
-        }
-        if (this.childDocIndexNotebookBtn) {
-            this.childDocIndexNotebookBtn.disabled = !enabled;
-        }
-        if (this.childDocIndexNotebookSelectEl) {
-            this.childDocIndexNotebookSelectEl.disabled = !enabled;
-        }
-    }
-
-    populateChildDocIndexNotebookSelect(selectEl) {
-        if (!selectEl) {
-            return;
-        }
-        selectEl.innerHTML = "";
-        const loadingOpt = document.createElement("option");
-        loadingOpt.value = "";
-        loadingOpt.textContent = this.i18n.childDocIndexNotebookLoading;
-        selectEl.appendChild(loadingOpt);
-        listOpenNotebooks().then((notebooks) => {
-            if (!selectEl.isConnected) {
-                return;
-            }
-            selectEl.innerHTML = "";
-            const placeholder = document.createElement("option");
-            placeholder.value = "";
-            placeholder.textContent = this.i18n.childDocIndexNotebookPlaceholder;
-            selectEl.appendChild(placeholder);
-            notebooks.forEach((notebook) => {
-                const opt = document.createElement("option");
-                opt.value = notebook.id;
-                opt.textContent = notebook.name || notebook.id;
-                selectEl.appendChild(opt);
-            });
-            const saved = this.config.childDocIndex?.selectedNotebookId;
-            if (saved && [...selectEl.options].some((opt) => opt.value === saved)) {
-                selectEl.value = saved;
-            }
-        }).catch((error) => {
-            console.warn(`${LOG_PREFIX} populateChildDocIndexNotebookSelect failed`, error);
-            if (selectEl.isConnected) {
-                selectEl.innerHTML = "";
-                const errOpt = document.createElement("option");
-                errOpt.value = "";
-                errOpt.textContent = this.i18n.childDocIndexNotebookLoadFailed;
-                selectEl.appendChild(errOpt);
-            }
-        });
     }
 
     updateImageScaleControlState() {
@@ -6325,7 +5738,7 @@ module.exports = class FhelperPlugin extends Plugin {
         this.data[STORAGE_NAME] = this.config;
         scheduleLayoutRefresh(this);
         syncAllChildNavPanels(this);
-        syncChildDocIndexFeature(this);
+        patchDocActionBreadcrumbButtons(this);
         syncFileTreeFeature(this);
         if (isConfigSyncActive()) {
             installConfigSyncWatchers(this);
@@ -6508,70 +5921,6 @@ module.exports = class FhelperPlugin extends Plugin {
             control: this.childDocWidgetModeEl,
         }));
         panel.appendChild(childNavSection);
-
-        const childDocIndex = this.config.childDocIndex || createDefaultChildDocIndexConfig();
-        const childDocIndexSection = this.createSettingSection(this.i18n.sectionChildDocIndex);
-        this.childDocIndexEnableEl = this.createSettingSwitch(childDocIndex.enabled !== false);
-        this.childDocIndexEnableEl.addEventListener("change", () => {
-            this.updateChildDocIndexSettingControls();
-            // Preview immediately in open editors (persisted on 确定).
-            this.config.childDocIndex = {
-                ...(this.config.childDocIndex || createDefaultChildDocIndexConfig()),
-                enabled: this.childDocIndexEnableEl.checked,
-            };
-            syncChildDocIndexFeature(this);
-        });
-        childDocIndexSection.appendChild(this.createSettingRow({
-            title: this.i18n.childDocIndexEnable,
-            description: this.i18n.childDocIndexEnableDesc,
-            control: this.childDocIndexEnableEl,
-        }));
-
-        const globalIndexBtn = document.createElement("button");
-        globalIndexBtn.type = "button";
-        globalIndexBtn.className = "b3-button b3-button--outline";
-        globalIndexBtn.textContent = this.i18n.childDocIndexGlobalBtn;
-        globalIndexBtn.addEventListener("click", () => {
-            this.confirmAndRunGlobalChildDocIndex();
-        });
-        this.childDocIndexGlobalBtn = globalIndexBtn;
-        this.childDocIndexGlobalRow = this.createSettingRow({
-            title: this.i18n.childDocIndexGlobalTitle,
-            description: this.i18n.childDocIndexGlobalDesc,
-            control: globalIndexBtn,
-        });
-        childDocIndexSection.appendChild(this.childDocIndexGlobalRow);
-
-        const notebookControls = document.createElement("div");
-        notebookControls.className = "fn__flex";
-        notebookControls.style.gap = "8px";
-        notebookControls.style.alignItems = "center";
-        notebookControls.style.flexWrap = "wrap";
-        notebookControls.style.justifyContent = "flex-end";
-        const notebookSelect = document.createElement("select");
-        notebookSelect.className = "b3-select";
-        notebookSelect.style.minWidth = "180px";
-        notebookSelect.style.maxWidth = "280px";
-        this.childDocIndexNotebookSelectEl = notebookSelect;
-        this.populateChildDocIndexNotebookSelect(notebookSelect);
-        const notebookIndexBtn = document.createElement("button");
-        notebookIndexBtn.type = "button";
-        notebookIndexBtn.className = "b3-button b3-button--outline";
-        notebookIndexBtn.textContent = this.i18n.childDocIndexNotebookBtn;
-        notebookIndexBtn.addEventListener("click", () => {
-            this.confirmAndRunNotebookChildDocIndex();
-        });
-        this.childDocIndexNotebookBtn = notebookIndexBtn;
-        notebookControls.appendChild(notebookSelect);
-        notebookControls.appendChild(notebookIndexBtn);
-        this.childDocIndexNotebookRow = this.createSettingRow({
-            title: this.i18n.childDocIndexNotebookTitle,
-            description: this.i18n.childDocIndexNotebookDesc,
-            control: notebookControls,
-        });
-        childDocIndexSection.appendChild(this.childDocIndexNotebookRow);
-        this.updateChildDocIndexSettingControls();
-        panel.appendChild(childDocIndexSection);
 
         const aboutSection = this.createSettingSection(this.i18n.sectionAbout);
         aboutSection.appendChild(this.createSettingRow({
@@ -6978,14 +6327,6 @@ module.exports = class FhelperPlugin extends Plugin {
     color: var(--b3-theme-error);
     opacity: 1;
 }
-html.fhelper-child-doc-index-off .protyle-breadcrumb [data-type="fhelper-child-doc-index"],
-html.fhelper-child-doc-index-off .protyle-breadcrumb [data-type="fhelper-gather-refs"],
-html.fhelper-child-doc-index-off .protyle-breadcrumb [data-type="fhelper-delete-unref-children"],
-html.fhelper-child-doc-index-off button[data-type="fhelper-child-doc-index"],
-html.fhelper-child-doc-index-off button[data-type="fhelper-gather-refs"],
-html.fhelper-child-doc-index-off button[data-type="fhelper-delete-unref-children"] {
-    display: none !important;
-}
 `;
     }
 
@@ -7009,12 +6350,6 @@ html.fhelper-child-doc-index-off button[data-type="fhelper-delete-unref-children
         this.docRefStyleEnableEl = null;
         this.childDocWidgetEnableEl = null;
         this.childDocWidgetModeEl = null;
-        this.childDocIndexEnableEl = null;
-        this.childDocIndexGlobalBtn = null;
-        this.childDocIndexNotebookBtn = null;
-        this.childDocIndexGlobalRow = null;
-        this.childDocIndexNotebookRow = null;
-        this.childDocIndexNotebookSelectEl = null;
         this.slashSearchEl = null;
         this.slashListEl = null;
         this.slashEmptyEl = null;

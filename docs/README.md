@@ -1,6 +1,6 @@
 # fhelper 文档入口
 
-思源笔记插件：斜杠菜单过滤、图片 DPI 缩放、中英文空格、文档引用美化、子文档索引、子文档导航（植入 / 正文同步）、文档树辅助。
+思源笔记插件：斜杠菜单过滤、图片 DPI 缩放、中英文空格、文档引用美化、子文档导航植入、文档树辅助。
 
 主入口：`index.js`；配置持久化：`fhelper-config.json`；文案：`i18n/zh_CN.json`、`i18n/en_US.json`。
 
@@ -12,10 +12,8 @@
 | 图片缩放 | `imageScale` | 图片 DPI / 居中等显示处理 | — |
 | 中英文空格 | `panguSpacing` | 输入与粘贴时 CJK-Latin 自动空格 | — |
 | 文档引用美化 | `docRefStyle` | 仅对**文档块**引用加下划线与图标；失效引用删除线 | [design/2026-07-08-doc-ref-style.md](design/2026-07-08-doc-ref-style.md) |
-| 子文档索引 | `childDocIndex` | 在父文档末尾增量补全直接子文档的标准块引用 | [design/2026-07-09-child-doc-index.md](design/2026-07-09-child-doc-index.md) |
-| 子文档导航植入 | `childDocWidget` | 编辑器内子文档树导航面板 | — |
-| 正文子文档导航 | `childDocBodyNav` | 正文内同步子文档导航区间；查子文档**仅 SQL** | [design/2026-08-04-child-nav-body-sql.md](design/2026-08-04-child-nav-body-sql.md) |
-| 文档树辅助 | — | 定位、引用归集、一级更多菜单等 | — |
+| 子文档导航植入 | `childDocWidget` | 编辑器内子文档树导航面板；顶层笔记本文档按虚拟父子列举；查子文档仅 SQL | [design/2026-08-31-child-nav-box-doc.md](design/2026-08-31-child-nav-box-doc.md) |
+| 文档树辅助 | — | 定位、引用归集、删除未引用、一级更多菜单等 | — |
 
 ## 整体架构
 
@@ -25,15 +23,16 @@
   → 共用思源 API：fetchPost、eventBus、protyle、SQL / filetree
 
 docRefStyle ←── 只读装饰：不改写引用内容
-childDocIndex ←── 写入标准块引用 ((id 'title'))
-childDocWidget / childDocBodyNav ←── 导航展示；与索引写入解耦
+childDocWidget ←── 导航展示（仅 SQL 查子文档）
+文档树辅助 ←── 定位 / 归集 / 删除未引用
 ```
 
 关系约定：
 
-- **索引**负责写入标准动态块引用；**引用美化**负责样式层，二者兼容、无强依赖。
-- **正文导航 / 导航植入**查子文档必须走 SQL，禁止对可能无子文档的路径调用 `listDocsByPath`（见 body-sql 设计）。
-- **子文档索引**批处理可用 `listDocsByPath`（需与文档树排序一致），与正文导航热路径分离。
+- **引用美化**只负责样式层，与导航无强依赖。
+- **导航植入**查子文档必须走 SQL，禁止对可能无子文档的路径调用 `listDocsByPath`（见 [body-sql 设计](design/2026-08-04-child-nav-body-sql.md)）。
+- **顶层笔记本文档**的子文档在磁盘上仍位于笔记本根，导航按虚拟父子列举（见 [box-doc 设计](design/2026-08-31-child-nav-box-doc.md)）。
+- 已移除的**子文档索引**、**正文子文档导航**不得再作为现行模块。
 
 ## 文档目录
 
