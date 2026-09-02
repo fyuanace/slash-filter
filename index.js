@@ -25,6 +25,13 @@ const IMAGE_CENTER_STYLE_ID = "fhelper-img-center-css";
 const SETTING_STYLE_ID = "fhelper-setting-css";
 const DOC_REF_STYLE_ID = "fhelper-doc-ref-css";
 const FILE_TREE_STYLE_ID = "fhelper-file-tree-css";
+const CHILD_NAV_FLAG_ATTR = "custom-fhelper-child-nav";
+const CHILD_NAV_TARGET_ATTR = "custom-fhelper-child-nav-target";
+const CHILD_NAV_END_ATTR = "custom-fhelper-child-nav-end";
+const CHILD_NAV_STYLE_ID = "fhelper-child-nav-css";
+const CHILD_NAV_ICON_STYLE_ID = "fhelper-child-nav-icon-css";
+const CHILD_NAV_HTML_CLASS = "fhelper-child-nav-style";
+const NEW_CHILD_DOC_NAV_REF_SLASH_ID = "newChildDocNavRef";
 const DOC_REF_CLASS = "fhelper-doc-ref";
 const DOC_REF_BROKEN_CLASS = "fhelper-doc-ref-broken";
 const DOC_REF_ICON_CLASS = "fhelper-doc-ref-icon";
@@ -749,22 +756,35 @@ function parseIalMap(ial) {
 }
 
 function unicodeHexToEmoji(hex) {
-    if (!hex || !/^[0-9a-fA-F]+$/.test(hex)) {
+    const raw = String(hex || "").trim();
+    if (!raw) {
+        return null;
+    }
+    const parts = /^[0-9a-f]+(?:-[0-9a-f]+)+$/i.test(raw)
+        ? raw.split("-")
+        : /^[0-9a-f]+$/i.test(raw)
+            ? (raw.match(/.{1,8}/g) || [raw])
+            : null;
+    if (!parts) {
         return null;
     }
     try {
-        const points = hex.match(/.{1,8}/g) || [hex];
-        return points.map((part) => String.fromCodePoint(parseInt(part, 16))).join("");
+        return parts.map((part) => String.fromCodePoint(parseInt(part, 16))).join("");
     } catch (error) {
         console.debug(`${LOG_PREFIX} unicodeHexToEmoji failed`, error);
         return null;
     }
 }
 
+function defaultDocFileGlyph() {
+    const raw = window.siyuan?.storage?.["local-images"]?.file;
+    return unicodeHexToEmoji(raw) || DOC_REF_DEFAULT_ICON;
+}
+
 function resolveDocIconDisplay(icon) {
     const raw = String(icon || "").trim();
     if (!raw) {
-        return { kind: "emoji", value: DOC_REF_DEFAULT_ICON };
+        return { kind: "emoji", value: defaultDocFileGlyph() };
     }
     if (raw.includes("/") || raw.includes(".") || raw.startsWith("http") || raw.startsWith("data:")) {
         const src = raw.startsWith("http") || raw.startsWith("data:") || raw.startsWith("/")
@@ -773,7 +793,13 @@ function resolveDocIconDisplay(icon) {
         return { kind: "img", value: src };
     }
     const emoji = unicodeHexToEmoji(raw);
-    return { kind: "emoji", value: emoji || DOC_REF_DEFAULT_ICON };
+    if (emoji) {
+        return { kind: "emoji", value: emoji };
+    }
+    if (!/[./]/.test(raw)) {
+        return { kind: "emoji", value: raw };
+    }
+    return { kind: "emoji", value: defaultDocFileGlyph() };
 }
 
 function parseSqlQueryRows(response) {
@@ -883,8 +909,16 @@ function applyDocRefIconAttrs(el, display) {
     el.setAttribute(DOC_REF_ATTR_ICON, display.value);
 }
 
+function isChildNavAutoRefSpan(el) {
+    return !!(el && typeof el.closest === "function" && el.closest(`[${CHILD_NAV_FLAG_ATTR}="1"]`));
+}
+
 function applyDocRefDecoration(el, meta) {
     if (!el || !meta) {
+        return;
+    }
+    if (isChildNavAutoRefSpan(el)) {
+        clearDocRefDecoration(el);
         return;
     }
     clearDocRefDecoration(el);
@@ -1709,39 +1743,14 @@ function scheduleDocRefWsUpdate(plugin, event) {
 
 function handleDocRefWsMain(plugin, event) {
     scheduleChildNavWsRefresh(plugin, event);
-    if (!plugin.config.docRefStyle?.enabled) {
-        return;
-    }
-    scheduleDocRefWsUpdate(plugin, event);
 }
 
 function handleProtyleDocRefStaticLoad(plugin, event) {
     handleProtyleChildNavStaticLoad(plugin, event);
-    if (!plugin.config.docRefStyle?.enabled) {
-        return;
-    }
-    const protyle = getProtyleFromEvent(event);
-    if (!protyle?.wysiwyg?.element) {
-        return;
-    }
-    watchDocRefMutations(plugin, protyle);
-    rebuildDocRefCacheAndDecorate(plugin, protyle).catch((error) => {
-        console.warn(`${LOG_PREFIX} rebuildDocRefCacheAndDecorate failed`, error);
-    });
 }
 
 function handleProtyleDocRefDynamicLoad(plugin, event) {
-    if (!plugin.config.docRefStyle?.enabled) {
-        return;
-    }
-    const protyle = getProtyleFromEvent(event);
-    if (!protyle?.wysiwyg?.element) {
-        return;
-    }
-    watchDocRefMutations(plugin, protyle);
-    decorateDynamicRefs(plugin, protyle).catch((error) => {
-        console.warn(`${LOG_PREFIX} decorateDynamicRefs failed`, error);
-    });
+    scheduleRefreshChildNavRefIcons();
 }
 
 function handleProtyleDocRefSwitch(plugin, event) {
@@ -1750,17 +1759,6 @@ function handleProtyleDocRefSwitch(plugin, event) {
         ensureDocActionBreadcrumbButtons(plugin, protyle);
     }
     handleProtyleChildNavSwitch(plugin, event);
-    if (!plugin.config.docRefStyle?.enabled || !protyle?.wysiwyg?.element) {
-        return;
-    }
-    const rootId = getProtyleRootId(protyle);
-    if (plugin.docRefDirtyDocs.has(rootId) || !plugin.docRefByDoc.has(rootId)) {
-        rebuildDocRefCacheAndDecorate(plugin, protyle).catch((error) => {
-            console.warn(`${LOG_PREFIX} rebuildDocRefCacheAndDecorate failed`, error);
-        });
-        return;
-    }
-    reapplyFromDocCache(plugin, protyle);
 }
 
 function handleProtyleDocRefDestroy(plugin, event) {
@@ -1770,35 +1768,19 @@ function handleProtyleDocRefDestroy(plugin, event) {
         unwatchDocRefMutations(plugin, wysiwyg);
     }
     clearDocRefCacheForDoc(plugin, getProtyleRootId(protyle));
-    const p = unwrapProtyle(protyle);
-    p?.element?.querySelectorAll?.(`.${CHILD_NAV_HOST_CLASS}`)?.forEach(removeChildNavHost);
 }
 
 const LIST_DOCS_SORT_UNASSIGNED = 256;
 
-const CHILD_NAV_HOST_CLASS = "fhelper-child-nav";
-/** Debounce only SQL refresh; shell is primed synchronously to avoid layout flash. */
-const CHILD_NAV_MOUNT_DEBOUNCE_MS = 32;
-/** docId → { tree, mode, at, hostHeight } for instant paint on reopen. */
-const childNavTreeCache = new Map();
-
 function createDefaultChildDocWidgetConfig() {
     return {
-        enabled: false,
+        enabled: true,
         mode: "direct",
     };
 }
 
-function normalizeChildNavMode(mode) {
-    return mode === "nested" ? "nested" : "direct";
-}
-
-function getChildNavMode(plugin) {
-    return normalizeChildNavMode(plugin?.config?.childDocWidget?.mode);
-}
-
-function sleepMs(ms) {
-    return new Promise((resolve) => window.setTimeout(resolve, ms));
+function normalizeChildNavMode(_mode) {
+    return "direct";
 }
 
 function getNotebookById(id) {
@@ -1944,786 +1926,602 @@ async function buildChildNavTree(docId, mode) {
     }
     const parentPath = normalizeBoxDocPath(pathInfo.path, pathInfo.notebook);
     const rows = await queryChildNavDescendants(pathInfo.notebook, parentPath, docId);
-    const nested = normalizeChildNavMode(mode) === "nested";
     const isDirectChild = (row) => (
         getLogicalParentDocPath(row.path, pathInfo.notebook) === parentPath
     );
+    return rows.filter(isDirectChild).map(toChildNavNode);
+}
 
-    if (!nested) {
-        return rows.filter(isDirectChild).map(toChildNavNode);
+const CHILD_NAV_SYNC_DEBOUNCE_MS = 200;
+const childNavSyncingDocs = new Set();
+let childNavIconRefreshTimer = 0;
+let childNavIconRefreshSeq = 0;
+
+function cssQuotedContent(value) {
+    return `"${String(value).replace(/\\/g, "\\\\").replace(/"/g, "\\\"")}"`;
+}
+
+function escCssIdent(id) {
+    return window.CSS?.escape ? CSS.escape(String(id)) : String(id).replace(/[^a-zA-Z0-9_-]/g, "\\$&");
+}
+
+function childNavRefScope(inner) {
+    return [
+        `html.${CHILD_NAV_HTML_CLASS} .b3-typography [${CHILD_NAV_FLAG_ATTR}="1"] ${inner}`,
+        `html.${CHILD_NAV_HTML_CLASS} .protyle-wysiwyg [data-node-id][${CHILD_NAV_FLAG_ATTR}="1"] ${inner}`,
+    ].join(",\n");
+}
+
+function childNavRefIdSels(ids, pseudo = "") {
+    return (ids || []).flatMap((id) => {
+        const escaped = escCssIdent(id);
+        return [
+            `html.${CHILD_NAV_HTML_CLASS} .b3-typography [${CHILD_NAV_FLAG_ATTR}="1"] span[data-type~="block-ref"][data-id="${escaped}"]${pseudo}`,
+            `html.${CHILD_NAV_HTML_CLASS} .protyle-wysiwyg [data-node-id][${CHILD_NAV_FLAG_ATTR}="1"] span[data-type~="block-ref"][data-id="${escaped}"]${pseudo}`,
+        ];
+    }).join(",\n");
+}
+
+function buildChildNavBaseCss() {
+    const glyph = cssQuotedContent(defaultDocFileGlyph());
+    const span = "span[data-type~=\"block-ref\"][data-id]";
+    return `
+${childNavRefScope(span)} {
+    position: relative;
+    padding-left: 1.28em;
+    padding-bottom: 0.14em;
+    font-weight: 700;
+    color: var(--b3-theme-on-background);
+    text-decoration: none;
+    border-bottom: none;
+    background-image: linear-gradient(var(--b3-border-color), var(--b3-border-color));
+    background-repeat: no-repeat;
+    background-size: 100% 1px;
+    background-position: 0 100%;
+    background-origin: content-box;
+    background-clip: content-box;
+    box-decoration-break: clone;
+    -webkit-box-decoration-break: clone;
+    transition: none;
+}
+${childNavRefScope(`${span}::before`)} {
+    content: ${glyph};
+    position: absolute;
+    left: 0;
+    top: 50%;
+    transform: translateY(-50%);
+    display: block;
+    width: 1.05em;
+    margin: 0;
+    pointer-events: none;
+    background-image: none;
+    font-weight: 400;
+    font-family: var(--b3-font-family-emoji);
+    line-height: 1;
+    text-align: center;
+    speak: never;
+}
+`;
+}
+
+function setChildNavIconCss(cssText) {
+    let styleEl = document.getElementById(CHILD_NAV_ICON_STYLE_ID);
+    if (!cssText) {
+        styleEl?.remove();
+        return;
     }
+    if (!styleEl) {
+        styleEl = document.createElement("style");
+        styleEl.id = CHILD_NAV_ICON_STYLE_ID;
+        document.head.appendChild(styleEl);
+    }
+    styleEl.textContent = cssText;
+}
 
-    const byPath = new Map();
-    rows.forEach((row) => {
-        if (row?.path && row?.id) {
-            byPath.set(row.path, toChildNavNode(row));
+function collectChildNavRefTargetIds() {
+    const ids = [];
+    document.querySelectorAll(`[${CHILD_NAV_FLAG_ATTR}="1"] span[data-type~="block-ref"][data-id]`).forEach((span) => {
+        const id = span.getAttribute("data-id");
+        if (id) {
+            ids.push(id);
         }
     });
-    const roots = [];
-    byPath.forEach((node) => {
-        const logicalParent = getLogicalParentDocPath(node.path, pathInfo.notebook);
-        const parent = logicalParent ? byPath.get(logicalParent) : null;
-        if (parent) {
-            parent.children.push(node);
-            parent.subFileCount = parent.children.length;
+    return [...new Set(ids)];
+}
+
+function renderChildNavIconSheet(metasById) {
+    const icons = new Map();
+    const imgs = new Map();
+    (metasById || new Map()).forEach((meta, id) => {
+        if (!id || !meta?.exists || !meta.isDoc) {
             return;
         }
-        if (logicalParent === parentPath) {
-            roots.push(node);
-        }
-    });
-    // Nested mode: default all collapsed; user expands via twisty / context menu.
-    roots.forEach((node) => {
-        node.open = false;
-        node.subFileCount = node.children.length;
-    });
-    return roots;
-}
-
-function removeChildNavHost(host) {
-    if (host?.parentElement) {
-        host.remove();
-    }
-}
-
-function removeAllChildNavHosts(root = document) {
-    root.querySelectorAll?.(`.${CHILD_NAV_HOST_CLASS}`)?.forEach((el) => removeChildNavHost(el));
-}
-
-/**
- * SiYuan DOM: .protyle-content > .protyle-top > title ; .protyle-content > .protyle-wysiwyg
- * Always inject immediately before wysiwyg (below title).
- */
-function findChildNavInsertAnchor(protyle) {
-    const p = unwrapProtyle(protyle);
-    if (!p) {
-        return null;
-    }
-    const title = p.title?.element
-        || p.element?.querySelector?.(".protyle-title");
-    const wysiwyg = p.wysiwyg?.element;
-    const content = p.contentElement
-        || wysiwyg?.parentElement
-        || title?.closest?.(".protyle-content")
-        || p.element?.querySelector?.(".protyle-content");
-    const parent = content || title?.parentElement;
-    if (!parent) {
-        return null;
-    }
-    const before = (wysiwyg && wysiwyg.parentElement === parent) ? wysiwyg : null;
-    return { parent, before, title, wysiwyg };
-}
-
-function placeChildNavHost(host, anchor) {
-    if (!host || !anchor?.parent) {
-        return;
-    }
-    const { parent, before, title } = anchor;
-    if (before && before.parentElement === parent) {
-        if (host.parentElement === parent && host.nextElementSibling === before) {
+        const display = resolveDocIconDisplay(meta.icon);
+        if (display.kind === "img") {
+            const list = imgs.get(display.value) || [];
+            list.push(id);
+            imgs.set(display.value, list);
             return;
         }
-        parent.insertBefore(host, before);
-        return;
-    }
-    if (title?.parentElement) {
-        const tParent = title.parentElement;
-        if (title.nextSibling) {
-            tParent.insertBefore(host, title.nextSibling);
-        } else {
-            tParent.appendChild(host);
-        }
-        return;
-    }
-    parent.appendChild(host);
-}
-
-/** Match editor title/wysiwyg horizontal layout (fixed vs adaptive width). */
-function syncChildNavHostLayout(host, protyle) {
-    const p = unwrapProtyle(protyle);
-    const ref = p?.wysiwyg?.element || p?.title?.element;
-    if (!host || !ref) {
-        return;
-    }
-    const cs = window.getComputedStyle(ref);
-    const content = p?.contentElement || ref.closest?.(".protyle-content") || ref.parentElement;
-    const contentCs = content ? window.getComputedStyle(content) : null;
-    host.style.boxSizing = "border-box";
-    host.style.width = "100%";
-    host.style.maxWidth = cs.maxWidth && cs.maxWidth !== "none" ? cs.maxWidth : "";
-    host.style.paddingLeft = cs.paddingLeft;
-    host.style.paddingRight = cs.paddingRight;
-    host.style.marginLeft = cs.marginLeft;
-    host.style.marginRight = cs.marginRight;
-    // Match body typography (editor font size / family).
-    host.style.fontSize = cs.fontSize;
-    host.style.fontFamily = cs.fontFamily;
-    host.style.lineHeight = cs.lineHeight;
-    // Use editor/content background, not app chrome background.
-    const pickBg = (value) => {
-        if (!value || value === "transparent" || value === "rgba(0, 0, 0, 0)") {
-            return "";
-        }
-        return value;
-    };
-    const editorBg = pickBg(cs.backgroundColor) || pickBg(contentCs?.backgroundColor) || "";
-    host.style.backgroundColor = editorBg || "transparent";
-    const shell = host.querySelector?.(".fhelper-child-nav__shell");
-    if (shell) {
-        shell.style.backgroundColor = "transparent";
-    }
-    const realWidth = parseInt(ref.getAttribute("data-realwidth") || "", 10);
-    if (Number.isFinite(realWidth) && realWidth > 0) {
-        // data-realwidth is content width; keep same side padding as the editor.
-        host.style.maxWidth = `calc(${realWidth}px + ${cs.paddingLeft} + ${cs.paddingRight})`;
-        if (!cs.marginLeft || cs.marginLeft === "0px") {
-            host.style.marginLeft = "auto";
-            host.style.marginRight = "auto";
-        }
-    }
-}
-
-function syncAllChildNavHostLayouts(plugin) {
-    getAllEditor().forEach(({ protyle }) => {
-        const p = unwrapProtyle(protyle);
-        const host = p?.element?.querySelector?.(`.${CHILD_NAV_HOST_CLASS}`);
-        if (host) {
-            syncChildNavHostLayout(host, p);
-        }
+        const glyph = display.value || defaultDocFileGlyph();
+        const list = icons.get(glyph) || [];
+        list.push(id);
+        icons.set(glyph, list);
     });
-}
-
-function ensureChildNavHost(protyle, docId) {
-    const p = unwrapProtyle(protyle);
-    const anchor = findChildNavInsertAnchor(p);
-    if (!anchor) {
-        return null;
-    }
-    let host = p?.element?.querySelector?.(`.${CHILD_NAV_HOST_CLASS}`)
-        || anchor.parent.querySelector(`:scope > .${CHILD_NAV_HOST_CLASS}`);
-    if (!host) {
-        host = document.createElement("div");
-        host.className = CHILD_NAV_HOST_CLASS;
-        host.contentEditable = "false";
-        host.setAttribute("spellcheck", "false");
-        placeChildNavHost(host, anchor);
-    } else {
-        const needsMove = host.parentElement !== anchor.parent
-            || (anchor.before && host.nextElementSibling !== anchor.before);
-        if (needsMove) {
-            placeChildNavHost(host, anchor);
+    const parts = [];
+    for (const [glyph, ids] of icons) {
+        if (glyph === defaultDocFileGlyph()) {
+            continue;
         }
+        parts.push(`${childNavRefIdSels(ids, "::before")} {
+    content: ${cssQuotedContent(glyph)};
+}`);
     }
-    if (host.dataset.docId && host.dataset.docId !== docId) {
-        // Keep previous height briefly so switching docs doesn't collapse then expand.
-        const prevH = host.offsetHeight;
-        if (prevH > 0) {
-            host.style.minHeight = `${prevH}px`;
-        }
-        host.innerHTML = "";
-        host._fhelperTree = null;
-        host._fhelperFetchedAt = 0;
-        host.dataset.treeSig = "";
-        host.dataset.paintedDocId = "";
-        host.dataset.loading = "1";
+    for (const [src, ids] of imgs) {
+        const url = String(src).replace(/\\/g, "/").replace(/"/g, "%22");
+        parts.push(`${childNavRefIdSels(ids, "::before")} {
+    content: "";
+    width: 1.05em;
+    height: 1.05em;
+    background: url("${url}") center / contain no-repeat;
+}`);
     }
-    host.dataset.docId = docId;
-    delete host.dataset.position;
-    syncChildNavHostLayout(host, p);
-    return host;
+    setChildNavIconCss(parts.join("\n"));
 }
 
-function getCachedChildNavTree(docId, mode) {
-    const hit = childNavTreeCache.get(docId);
-    if (!hit || hit.mode !== mode || !Array.isArray(hit.tree)) {
-        return null;
-    }
-    return hit;
-}
-
-function setCachedChildNavTree(docId, mode, tree, hostHeight) {
-    if (!docId) {
+async function refreshChildNavRefIcons() {
+    if (!document.documentElement.classList.contains(CHILD_NAV_HTML_CLASS)) {
+        setChildNavIconCss("");
         return;
     }
-    childNavTreeCache.set(docId, {
-        tree,
-        mode,
-        at: Date.now(),
-        hostHeight: hostHeight > 0 ? hostHeight : (childNavTreeCache.get(docId)?.hostHeight || 0),
-    });
-}
-
-function paintChildNavSkeleton(host, plugin, docId) {
-    if (!host) {
+    const seq = childNavIconRefreshSeq + 1;
+    childNavIconRefreshSeq = seq;
+    const ids = collectChildNavRefTargetIds();
+    if (!ids.length) {
+        setChildNavIconCss("");
         return;
     }
-    const mode = getChildNavMode(plugin);
-    const cached = getCachedChildNavTree(docId, mode);
-    if (cached?.hostHeight > 0) {
-        host.style.minHeight = `${cached.hostHeight}px`;
-    }
-    const shell = document.createElement("div");
-    shell.className = "fhelper-child-nav__shell";
-    const treeEl = document.createElement("div");
-    treeEl.className = "fhelper-child-nav__tree";
-    treeEl.innerHTML = '<div class="fhelper-child-nav__empty">加载中…</div>';
-    shell.appendChild(treeEl);
-    host.innerHTML = "";
-    host.appendChild(shell);
-    host.dataset.loading = "1";
-}
-
-/**
- * Insert host + paint cache/skeleton immediately (before SQL), so the page
- * does not first render without nav then jump when the panel appears.
- */
-function primeChildNavHost(plugin, protyle) {
-    const p = unwrapProtyle(protyle);
-    if (!p || !plugin?.config?.childDocWidget?.enabled) {
-        return null;
-    }
-    const docId = getProtyleDocId(p);
-    if (!docId) {
-        return null;
-    }
-    const host = ensureChildNavHost(p, docId);
-    if (!host) {
-        return null;
-    }
-    syncChildNavHostLayout(host, p);
-    const mode = getChildNavMode(plugin);
-    const hasContent = host.dataset.paintedDocId === docId
-        && !!host.querySelector(".fhelper-child-nav__shell")
-        && host.dataset.loading !== "1";
-    if (hasContent) {
-        return host;
-    }
-    const cached = getCachedChildNavTree(docId, mode);
-    if (cached) {
-        const tree = JSON.parse(JSON.stringify(cached.tree));
-        applyChildNavOpenIds(tree, collectChildNavOpenIds(host._fhelperTree || cached.tree));
-        paintChildNavHost(host, plugin, docId, tree, "");
-        host.style.minHeight = "";
-        host.dataset.loading = "";
-        return host;
-    }
-    paintChildNavSkeleton(host, plugin, docId);
-    return host;
-}
-
-function prefetchChildNavTree(plugin, docId) {
-    if (!plugin?.config?.childDocWidget?.enabled || !docId) {
+    const metas = await queryBlockMetaByIds(ids);
+    if (seq !== childNavIconRefreshSeq) {
         return;
     }
-    const mode = getChildNavMode(plugin);
-    if (getCachedChildNavTree(docId, mode)) {
-        return;
-    }
-    buildChildNavTree(docId, mode).then((tree) => {
-        setCachedChildNavTree(docId, mode, tree, 0);
-    }).catch((error) => {
-        console.warn(`${LOG_PREFIX} prefetchChildNavTree failed`, docId, error);
-    });
+    renderChildNavIconSheet(metas);
 }
 
-/** After openTab, prime nav as soon as the target protyle exists (often before loaded-protyle-static). */
-function armChildNavPrimeForDoc(plugin, docId) {
-    if (!plugin?.config?.childDocWidget?.enabled || !docId) {
+function scheduleRefreshChildNavRefIcons() {
+    if (!document.documentElement.classList.contains(CHILD_NAV_HTML_CLASS)) {
         return;
     }
-    let tries = 0;
-    const tick = () => {
-        tries += 1;
-        for (const { protyle } of getAllEditor()) {
-            const p = unwrapProtyle(protyle);
-            if (getProtyleDocId(p) === docId && p?.element && !p.element.classList.contains("fn__none")) {
-                primeChildNavHost(plugin, p);
-                scheduleMountChildNav(plugin, p);
-                return;
-            }
+    window.clearTimeout(childNavIconRefreshTimer);
+    childNavIconRefreshTimer = window.setTimeout(() => {
+        refreshChildNavRefIcons().catch((error) => {
+            console.warn(`${LOG_PREFIX} refreshChildNavRefIcons failed`, error);
+        });
+    }, 80);
+}
+
+function setChildNavRefStyleEnabled(enabled) {
+    document.documentElement.classList.toggle(CHILD_NAV_HTML_CLASS, !!enabled);
+    window.clearTimeout(childNavIconRefreshTimer);
+    if (!enabled) {
+        document.getElementById(CHILD_NAV_STYLE_ID)?.remove();
+        setChildNavIconCss("");
+        return;
+    }
+    let styleEl = document.getElementById(CHILD_NAV_STYLE_ID);
+    if (!styleEl) {
+        styleEl = document.createElement("style");
+        styleEl.id = CHILD_NAV_STYLE_ID;
+        document.head.appendChild(styleEl);
+    }
+    styleEl.textContent = buildChildNavBaseCss();
+    scheduleRefreshChildNavRefIcons();
+}
+
+function escapeChildNavTitle(title) {
+    return String(title || "").replace(/'/g, "’").replace(/\r?\n/g, " ");
+}
+
+function childNavRefMarkdown(childId, title) {
+    // H5 heading wrapping a document block-ref; appears natively in outline.
+    return `##### ((${childId} '${escapeChildNavTitle(title)}'))`;
+}
+
+function insertedBlockIdFromResponse(response) {
+    const ops = response?.data?.[0]?.doOperations;
+    if (Array.isArray(ops)) {
+        const hit = ops.find((op) => op?.id && (op.action === "insert" || op.action === "update" || !op.action));
+        if (hit?.id) {
+            return hit.id;
         }
-        if (tries < 45) {
-            window.setTimeout(tick, 16);
-        }
-    };
-    tick();
-}
-
-function findActiveProtyleForChildNav() {
-    const activeWnd = document.querySelector(".layout__wnd--active");
-    if (activeWnd) {
-        for (const { protyle } of getAllEditor()) {
-            const p = unwrapProtyle(protyle);
-            if (p?.element && activeWnd.contains(p.element) && !p.element.classList.contains("fn__none")) {
-                return p;
-            }
-        }
-    }
-    for (const { protyle } of getAllEditor()) {
-        const p = unwrapProtyle(protyle);
-        if (p?.element && !p.element.classList.contains("fn__none") && p.element.clientHeight > 0) {
-            return p;
+        if (ops[0]?.id) {
+            return ops[0].id;
         }
     }
     return null;
 }
 
-/** rootId → scrollTop that shows the child-nav panel (for mouse-back restore). */
-const childNavReturnByRoot = new Map();
-/** Set when user triggers back; cleared after restore or timeout. */
-let childNavBackRestorePendingUntil = 0;
-
-function getChildNavScrollTop(protyle) {
-    const p = unwrapProtyle(protyle);
-    const content = p?.contentElement;
-    const host = p?.element?.querySelector?.(`.${CHILD_NAV_HOST_CLASS}`);
-    if (!content) {
-        return 0;
+async function appendMarkdownBlock({ parentID, markdown, attrs }) {
+    const response = await fetchSyncPost("/api/block/appendBlock", {
+        dataType: "markdown",
+        data: markdown,
+        parentID,
+    });
+    const newId = insertedBlockIdFromResponse(response);
+    if (!newId) {
+        console.warn(`${LOG_PREFIX} appendMarkdownBlock: no new id`, response);
+        return null;
     }
-    if (!host) {
-        return content.scrollTop || 0;
+    if (attrs) {
+        await fetchSyncPost("/api/attr/setBlockAttrs", {
+            id: newId,
+            attrs,
+        });
     }
-    const contentRect = content.getBoundingClientRect();
-    const hostRect = host.getBoundingClientRect();
-    const next = content.scrollTop + (hostRect.top - contentRect.top) - 8;
-    return next > 0 ? next : 0;
+    return newId;
 }
 
-function scrollProtyleToChildNav(protyle, preferredScrollTop) {
-    const p = unwrapProtyle(protyle);
-    const content = p?.contentElement;
-    const host = p?.element?.querySelector?.(`.${CHILD_NAV_HOST_CLASS}`);
-    if (!content) {
+function titleFromChildNavContent(content, fallback) {
+    const text = String(content || "").replace(/[\u200b\ufeff]/g, "").trim();
+    const quoted = text.match(/\(\([^)]*'([^']*)'\)\)/);
+    if (quoted?.[1]) {
+        return quoted[1];
+    }
+    const wiki = text.match(/\[\[([^\]]+)\]\]/);
+    if (wiki?.[1]) {
+        return wiki[1].split("|").pop().trim();
+    }
+    return text || fallback || "";
+}
+
+async function queryChildNavEndFenceIds(docId) {
+    if (!docId) {
+        return [];
+    }
+    try {
+        const rows = await runSqlQuery(
+            `SELECT b.id AS id FROM attributes a JOIN blocks b ON b.id = a.block_id WHERE a.name = '${CHILD_NAV_END_ATTR}' AND a.value = '1' AND b.root_id = '${escapeSqlId(docId)}' ORDER BY b.sort ASC`,
+        );
+        return (Array.isArray(rows) ? rows : []).map((row) => row?.id).filter(Boolean);
+    } catch (error) {
+        console.warn(`${LOG_PREFIX} queryChildNavEndFenceIds failed`, docId, error);
+        return [];
+    }
+}
+
+async function deleteLegacyChildNavFences(docId) {
+    const ids = await queryChildNavEndFenceIds(docId);
+    for (const id of ids) {
+        try {
+            await deleteAutoChildNavBlock(id);
+        } catch (error) {
+            console.warn(`${LOG_PREFIX} deleteLegacyChildNavFences failed`, id, error);
+        }
+    }
+}
+
+async function queryAutoChildNavBlocks(docId) {
+    if (!docId) {
+        return [];
+    }
+    try {
+        const rows = await runSqlQuery(
+            `SELECT b.id AS id, b.sort AS sort, b.content AS content, b.type AS type, b.subtype AS subtype, t.value AS target FROM attributes f JOIN blocks b ON b.id = f.block_id LEFT JOIN attributes t ON t.block_id = f.block_id AND t.name = '${CHILD_NAV_TARGET_ATTR}' WHERE f.name = '${CHILD_NAV_FLAG_ATTR}' AND f.value = '1' AND b.root_id = '${escapeSqlId(docId)}' ORDER BY b.sort ASC, b.created ASC`,
+        );
+        const list = Array.isArray(rows) ? rows : [];
+        const missing = list.filter((row) => row?.id && !row.target);
+        if (missing.length) {
+            const inList = missing.map((row) => `'${escapeSqlId(row.id)}'`).join(",");
+            const refs = await runSqlQuery(
+                `SELECT block_id, def_block_id FROM refs WHERE block_id IN (${inList})`,
+            );
+            const byBlock = new Map((Array.isArray(refs) ? refs : []).map((row) => [row.block_id, row.def_block_id]));
+            list.forEach((row) => {
+                if (!row.target) {
+                    row.target = byBlock.get(row.id) || "";
+                }
+            });
+        }
+        return list.filter((row) => row?.id);
+    } catch (error) {
+        console.warn(`${LOG_PREFIX} queryAutoChildNavBlocks failed`, docId, error);
+        return [];
+    }
+}
+
+async function updateAutoChildNavBlockMarkdown(blockId, markdown) {
+    if (!blockId || !markdown) {
         return;
     }
-    if (typeof preferredScrollTop === "number") {
-        content.scrollTop = preferredScrollTop;
+    await fetchSyncPost("/api/block/updateBlock", {
+        dataType: "markdown",
+        data: markdown,
+        id: blockId,
+    });
+}
+
+function isChildNavH5Block(block) {
+    return block?.type === "h" && String(block?.subtype || "").toLowerCase() === "h5";
+}
+
+async function insertAutoChildNavBlock({ parentID, childId, title }) {
+    return appendMarkdownBlock({
+        parentID,
+        markdown: childNavRefMarkdown(childId, title),
+        attrs: childNavBlockAttrs(childId),
+    });
+}
+
+function newSiYuanNodeId() {
+    if (typeof window.Lute?.NewNodeID === "function") {
+        return window.Lute.NewNodeID();
     }
-    if (host) {
-        const cRect = content.getBoundingClientRect();
-        const hRect = host.getBoundingClientRect();
-        if (hRect.top < cRect.top + 4 || hRect.bottom > cRect.bottom - 4) {
+    const now = new Date();
+    const pad = (n, width = 2) => String(n).padStart(width, "0");
+    const ts = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+    const rand = Math.random().toString(36).slice(2, 9);
+    return `${ts}-${rand}`;
+}
+
+function buildChildDocCreatePath(parentDocPath, newDocId) {
+    const base = String(parentDocPath || "").replace(/\.sy$/i, "");
+    if (!base) {
+        return `/${newDocId}.sy`;
+    }
+    return `${base}/${newDocId}.sy`;
+}
+
+function getCurrentBlockIdFromProtyle(protyle) {
+    const p = unwrapProtyle(protyle);
+    try {
+        const sel = window.getSelection?.();
+        const range = sel?.rangeCount ? sel.getRangeAt(0) : null;
+        const node = range?.startContainer;
+        const el = node?.nodeType === 1 ? node : node?.parentElement;
+        const block = el?.closest?.("[data-node-id]");
+        if (block && !block.classList?.contains("protyle-title")) {
+            return block.getAttribute("data-node-id");
+        }
+    } catch (error) {
+        // ignore
+    }
+    const focus = p?.wysiwyg?.element?.querySelector?.(".protyle-wysiwyg--select[data-node-id], [data-node-id].protyle-wysiwyg--select");
+    return focus?.getAttribute?.("data-node-id") || null;
+}
+
+function childNavBlockAttrs(childId) {
+    return {
+        [CHILD_NAV_FLAG_ATTR]: "1",
+        [CHILD_NAV_TARGET_ATTR]: childId,
+    };
+}
+
+async function applyChildNavAttrs(blockId, childId) {
+    if (!blockId || !childId) {
+        return;
+    }
+    await fetchSyncPost("/api/attr/setBlockAttrs", {
+        id: blockId,
+        attrs: childNavBlockAttrs(childId),
+    });
+}
+
+function clearSlashInput(protyle) {
+    const p = unwrapProtyle(protyle);
+    if (!p || typeof p.insert !== "function") {
+        return;
+    }
+    try {
+        const caret = window.Lute?.Caret || "\ufeff";
+        p.insert(caret, false, true);
+    } catch (error) {
+        console.warn(`${LOG_PREFIX} clearSlashInput failed`, error);
+    }
+}
+
+async function insertMarkdownBlockAtCursor({ previousID, parentID, markdown, attrs }) {
+    const payload = {
+        dataType: "markdown",
+        data: markdown,
+    };
+    if (previousID) {
+        payload.previousID = previousID;
+    } else if (parentID) {
+        payload.parentID = parentID;
+    } else {
+        throw new Error("insertMarkdownBlockAtCursor: missing previousID/parentID");
+    }
+    const response = await fetchSyncPost("/api/block/insertBlock", payload);
+    const newId = insertedBlockIdFromResponse(response);
+    if (!newId) {
+        console.warn(`${LOG_PREFIX} insertMarkdownBlockAtCursor: no new id`, response);
+        return null;
+    }
+    if (attrs) {
+        await fetchSyncPost("/api/attr/setBlockAttrs", {
+            id: newId,
+            attrs,
+        });
+    }
+    return newId;
+}
+
+async function replaceSlashLineWithChildNavRef({ blockId, parentID, childId, title }) {
+    const markdown = childNavRefMarkdown(childId, title);
+    if (blockId) {
+        await updateAutoChildNavBlockMarkdown(blockId, markdown);
+        await applyChildNavAttrs(blockId, childId);
+        return blockId;
+    }
+    return insertMarkdownBlockAtCursor({
+        parentID,
+        markdown,
+        attrs: childNavBlockAttrs(childId),
+    });
+}
+
+/** Mimic built-in「新建子文档并引用」, but mark the ref as auto child-nav. */
+async function createChildDocNavRefFromSlash(plugin, protyle) {
+    const p = unwrapProtyle(protyle);
+    const notebookId = p?.notebookId;
+    const docPath = p?.path;
+    const rootId = getProtyleDocId(p);
+    if (!notebookId || !docPath || !rootId) {
+        showMessage(plugin.i18n.cannotResolveDoc || "无法识别当前文档");
+        return;
+    }
+
+    const slashBlockId = getCurrentBlockIdFromProtyle(p);
+    clearSlashInput(p);
+    const newSubDocId = newSiYuanNodeId();
+    const createPath = buildChildDocCreatePath(docPath, newSubDocId);
+    const title = window.siyuan?.languages?.untitled
+        || plugin.i18n.newChildDocNavRefUntitled
+        || "未命名";
+
+    const created = await fetchSyncPost("/api/filetree/createDoc", {
+        notebook: notebookId,
+        path: createPath,
+        title: "",
+        md: "",
+    });
+    if (created?.code && created.code !== 0) {
+        throw new Error(created.msg || "createDoc failed");
+    }
+
+    await replaceSlashLineWithChildNavRef({
+        blockId: slashBlockId,
+        parentID: rootId,
+        childId: newSubDocId,
+        title,
+    });
+
+    scheduleRefreshChildNavRefIcons();
+
+    openTab({
+        app: plugin.app,
+        doc: {
+            id: newSubDocId,
+            action: [
+                Constants.CB_GET_CONTEXT || "cb-get-context",
+                Constants.CB_GET_OPENNEW || "cb-get-opennew",
+            ],
+        },
+    });
+}
+
+function registerNewChildDocNavRefSlash(plugin) {
+    const label = plugin.i18n.newChildDocNavRef
+        || "新建子文档块";
+    plugin.protyleSlash = [
+        {
+            id: NEW_CHILD_DOC_NAV_REF_SLASH_ID,
+            filter: [
+                label,
+                "新建子文档块",
+                "xinjianziwendangkuai",
+                "xjzwdk",
+                "create child doc block",
+                "new child doc block",
+                "child doc nav ref",
+            ],
+            html: `<div class="b3-list-item__first"><svg class="b3-list-item__graphic"><use xlink:href="#iconFile"></use></svg><span class="b3-list-item__text">${label}</span></div>`,
+            callback: (protyle) => {
+                createChildDocNavRefFromSlash(plugin, protyle).catch((error) => {
+                    console.warn(`${LOG_PREFIX} createChildDocNavRefFromSlash failed`, error);
+                    showMessage(plugin.i18n.newChildDocNavRefFailed || "新建子文档块失败");
+                });
+            },
+        },
+        ...(Array.isArray(plugin.protyleSlash)
+            ? plugin.protyleSlash.filter((item) => item?.id !== NEW_CHILD_DOC_NAV_REF_SLASH_ID)
+            : []),
+    ];
+}
+
+async function deleteAutoChildNavBlock(blockId) {
+    if (!blockId) {
+        return;
+    }
+    await fetchSyncPost("/api/block/deleteBlock", { id: blockId });
+}
+
+async function syncChildNavRefBlocks(docId) {
+    if (!docId || childNavSyncingDocs.has(docId)) {
+        return;
+    }
+    childNavSyncingDocs.add(docId);
+    try {
+        await syncChildNavRefBlocksUnlocked(docId);
+    } finally {
+        childNavSyncingDocs.delete(docId);
+    }
+}
+
+async function syncChildNavRefBlocksUnlocked(docId) {
+    if (!docId) {
+        return;
+    }
+    await deleteLegacyChildNavFences(docId);
+    const children = await buildChildNavTree(docId);
+    const childById = new Map(children.map((node) => [node.id, node]));
+    const childIds = new Set(childById.keys());
+    const autoBlocks = await queryAutoChildNavBlocks(docId);
+    for (const block of autoBlocks) {
+        if (!block.target || !childIds.has(block.target)) {
             try {
-                host.scrollIntoView({ block: "start", behavior: "instant" });
+                await deleteAutoChildNavBlock(block.id);
             } catch (error) {
-                host.scrollIntoView(true);
+                console.warn(`${LOG_PREFIX} deleteAutoChildNavBlock failed`, block.id, error);
             }
         }
     }
-}
-
-/**
- * Record the child-nav panel as the return anchor (no caret move).
- * Mouse-back restores this doc and scrolls to the nav view.
- */
-function pushChildNavReturnAnchor(protyle) {
-    const p = unwrapProtyle(protyle);
-    if (!p?.model || !Array.isArray(window.siyuan?.backStack)) {
-        return;
-    }
-    const rootId = getProtyleDocId(p);
-    if (!rootId) {
-        return;
-    }
-    const scrollTop = getChildNavScrollTop(p);
-    childNavReturnByRoot.set(rootId, { scrollTop, at: Date.now() });
-
-    const last = window.siyuan.backStack[window.siyuan.backStack.length - 1];
-    // Prefer rewriting the current doc's stack top so mouse-back lands once on nav,
-    // instead of stacking an extra history entry.
-    if (last && last.protyle === p) {
-        last.position = { start: 0, end: 0 };
-        last.id = rootId;
-        last.zoomId = undefined;
-        last.fhelperChildNav = true;
-        last.fhelperNavScrollTop = scrollTop;
-        return;
-    }
-    window.siyuan.backStack.push({
-        position: { start: 0, end: 0 },
-        // rootId → focusStack treats as doc/title restore; we then scroll to nav.
-        id: rootId,
-        protyle: p,
-        zoomId: undefined,
-        fhelperChildNav: true,
-        fhelperNavScrollTop: scrollTop,
-    });
-    if (window.siyuan.backStack.length > (Constants?.SIZE_UNDO || 200)) {
-        window.siyuan.backStack.shift();
-    }
-    if (window.siyuan.backStack.length > 1) {
-        document.querySelector("#barBack")?.classList.remove("toolbar__item--disabled");
-    }
-}
-
-function tryRestoreChildNavViewAfterBack() {
-    if (Date.now() > childNavBackRestorePendingUntil) {
-        return false;
-    }
-    const p = findActiveProtyleForChildNav();
-    const rootId = getProtyleDocId(p);
-    if (!rootId || !childNavReturnByRoot.has(rootId)) {
-        return false;
-    }
-    // Only restore when this doc is the one we just returned to (has our panel).
-    const host = p?.element?.querySelector?.(`.${CHILD_NAV_HOST_CLASS}`);
-    if (!host) {
-        return false;
-    }
-    const info = childNavReturnByRoot.get(rootId);
-    scrollProtyleToChildNav(p, info?.scrollTop);
-    childNavReturnByRoot.delete(rootId);
-    childNavBackRestorePendingUntil = 0;
-    return true;
-}
-
-function scheduleRestoreChildNavViewAfterBack(arm = false) {
-    // goBack is async (focusStack); retry a few times after mouse-back / toolbar back.
-    if (arm) {
-        childNavBackRestorePendingUntil = Date.now() + 1200;
-    }
-    if (Date.now() > childNavBackRestorePendingUntil) {
-        return;
-    }
-    [0, 50, 150, 320, 600, 1000].forEach((delay) => {
-        window.setTimeout(tryRestoreChildNavViewAfterBack, delay);
-    });
-}
-
-function installChildNavBackRestore(plugin) {
-    if (!plugin || plugin.childNavBackRestoreInstalled) {
-        return;
-    }
-    plugin.childNavBackMouseHandler = (event) => {
-        if (event.button === 3) {
-            scheduleRestoreChildNavViewAfterBack(true);
+    const remaining = await queryAutoChildNavBlocks(docId);
+    for (const block of remaining) {
+        if (isChildNavH5Block(block) || !block.target) {
+            continue;
         }
-    };
-    plugin.childNavBackClickHandler = (event) => {
-        const target = event.target;
-        if (target?.closest?.("#barBack")) {
-            scheduleRestoreChildNavViewAfterBack(true);
-        }
-    };
-    // Bubble after SiYuan's window mouseup goBack handler.
-    window.addEventListener("mouseup", plugin.childNavBackMouseHandler);
-    document.addEventListener("click", plugin.childNavBackClickHandler, true);
-    plugin.childNavBackRestoreInstalled = true;
-}
-
-function uninstallChildNavBackRestore(plugin) {
-    if (!plugin?.childNavBackRestoreInstalled) {
-        return;
-    }
-    if (plugin.childNavBackMouseHandler) {
-        window.removeEventListener("mouseup", plugin.childNavBackMouseHandler);
-        plugin.childNavBackMouseHandler = null;
-    }
-    if (plugin.childNavBackClickHandler) {
-        document.removeEventListener("click", plugin.childNavBackClickHandler, true);
-        plugin.childNavBackClickHandler = null;
-    }
-    plugin.childNavBackRestoreInstalled = false;
-    childNavReturnByRoot.clear();
-    childNavBackRestorePendingUntil = 0;
-}
-
-function openChildNavDoc(id, fromProtyle) {
-    if (!id) {
-        return;
-    }
-    const plugin = activeFhelperPlugin;
-    const source = unwrapProtyle(fromProtyle) || findActiveProtyleForChildNav();
-    // Treat the nav panel as the return anchor (no caret jump).
-    pushChildNavReturnAnchor(source);
-    // Prefetch target doc's child tree so the next page can paint without waiting.
-    prefetchChildNavTree(plugin, id);
-
-    if (plugin?.app && typeof openTab === "function") {
+        const child = childById.get(block.target);
+        const title = child?.title || titleFromChildNavContent(block.content, block.target);
         try {
-            openTab({
-                app: plugin.app,
-                doc: {
-                    id,
-                    action: [
-                        Constants?.CB_GET_FOCUS || "cb-get-focus",
-                        Constants?.CB_GET_SCROLL || "cb-get-scroll",
-                    ],
-                },
-            });
-            armChildNavPrimeForDoc(plugin, id);
-            return;
+            await updateAutoChildNavBlockMarkdown(block.id, childNavRefMarkdown(block.target, title));
         } catch (error) {
-            console.warn(`${LOG_PREFIX} openTab failed`, id, error);
+            console.warn(`${LOG_PREFIX} upgrade child-nav block to H5 failed`, block.id, error);
         }
     }
-    console.warn(`${LOG_PREFIX} openChildNavDoc: openTab unavailable`, id);
-}
-
-function renderChildNavNodeEl(node, onToggle, onOpen) {
-    const wrap = document.createElement("div");
-    wrap.className = "fhelper-child-nav__node";
-
-    const row = document.createElement("div");
-    row.className = "fhelper-child-nav__row";
-
-    const twist = document.createElement("button");
-    twist.type = "button";
-    twist.className = "fhelper-child-nav__twist"
-        + (node.children?.length ? "" : " is-placeholder")
-        + (node.open ? " is-open" : "");
-    twist.innerHTML = '<svg viewBox="0 0 16 16" fill="currentColor"><path d="M6 3l5 5-5 5z"/></svg>';
-    if (node.children?.length) {
-        twist.addEventListener("click", (event) => {
-            event.preventDefault();
-            event.stopPropagation();
-            onToggle(node);
-        });
-    }
-
-    const icon = document.createElement("span");
-    icon.className = "fhelper-child-nav__icon";
-    icon.textContent = "📄";
-
-    const label = document.createElement("span");
-    label.className = "fhelper-child-nav__label";
-    label.textContent = node.title;
-    label.title = node.title;
-
-    row.appendChild(twist);
-    row.appendChild(icon);
-    row.appendChild(label);
-    row.addEventListener("click", () => onOpen(node.id));
-    wrap.appendChild(row);
-
-    if (node.children?.length && node.open) {
-        const kids = document.createElement("div");
-        kids.className = "fhelper-child-nav__children";
-        node.children.forEach((child) => kids.appendChild(renderChildNavNodeEl(child, onToggle, onOpen)));
-        wrap.appendChild(kids);
-    }
-    return wrap;
-}
-
-function collectChildNavOpenIds(nodes, out = new Set()) {
-    (nodes || []).forEach((node) => {
-        if (node.open) {
-            out.add(node.id);
-        }
-        if (node.children?.length) {
-            collectChildNavOpenIds(node.children, out);
-        }
-    });
-    return out;
-}
-
-function setChildNavOpenAll(nodes, open) {
-    (nodes || []).forEach((node) => {
-        node.open = !!(open && node.children?.length);
-        if (node.children?.length) {
-            setChildNavOpenAll(node.children, open);
-        }
-    });
-}
-
-function applyChildNavOpenIds(nodes, openIds) {
-    (nodes || []).forEach((node) => {
-        if (openIds && openIds.size > 0) {
-            node.open = openIds.has(node.id);
-        } else {
-            // Nested default: all collapsed.
-            node.open = false;
-        }
-        if (node.children?.length) {
-            applyChildNavOpenIds(node.children, openIds);
-        }
-    });
-}
-
-function bindChildNavContextMenu(host, plugin, docId, tree) {
-    const shell = host.querySelector(".fhelper-child-nav__shell") || host;
-    shell.addEventListener("contextmenu", (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        const i18n = plugin?.i18n || {};
-        const menu = typeof Menu === "function"
-            ? new Menu("fhelper-child-nav")
-            : null;
-        if (!menu?.addItem) {
-            return;
-        }
-        const repaint = (nextTree) => {
-            host._fhelperTree = nextTree;
-            host.dataset.treeSig = childNavTreeSignature(nextTree);
-            paintChildNavHost(host, plugin, docId, nextTree, "");
-        };
-        menu.addItem({
-            id: "fhelper-child-nav-expand",
-            icon: "iconExpand",
-            label: i18n.childNavExpandAll || "全部展开",
-            click: () => {
-                const t = host._fhelperTree || tree || [];
-                setChildNavOpenAll(t, true);
-                repaint(t);
-            },
-        });
-        menu.addItem({
-            id: "fhelper-child-nav-collapse",
-            icon: "iconContract",
-            label: i18n.childNavCollapseAll || "全部折叠",
-            click: () => {
-                const t = host._fhelperTree || tree || [];
-                setChildNavOpenAll(t, false);
-                repaint(t);
-            },
-        });
-        menu.addItem({
-            id: "fhelper-child-nav-refresh",
-            icon: "iconRefresh",
-            label: i18n.childNavRefresh || "刷新",
-            click: () => {
-                host._fhelperFetchedAt = 0;
-                childNavTreeCache.delete(docId);
-                refreshChildNavHost(plugin, host, docId, { silent: true }).catch((error) => {
-                    console.warn(`${LOG_PREFIX} child-nav context refresh failed`, docId, error);
+    const afterUpgrade = await queryAutoChildNavBlocks(docId);
+    const have = new Set(afterUpgrade.map((block) => block.target).filter(Boolean));
+    const missing = children.filter((node) => !have.has(node.id));
+    if (missing.length) {
+        for (const child of missing) {
+            try {
+                await insertAutoChildNavBlock({
+                    parentID: docId,
+                    childId: child.id,
+                    title: child.title,
                 });
-            },
-        });
-        menu.open({
-            x: event.clientX,
-            y: event.clientY,
-        });
-    });
-}
-
-function childNavTreeSignature(nodes) {
-    const walk = (list) => (list || []).map((node) => [
-        node.id,
-        node.title,
-        node.open ? 1 : 0,
-        walk(node.children),
-    ]);
-    return JSON.stringify(walk(nodes));
-}
-
-function paintChildNavHost(host, plugin, docId, tree, errorText) {
-    const mode = getChildNavMode(plugin);
-    host.innerHTML = "";
-
-    const shell = document.createElement("div");
-    shell.className = "fhelper-child-nav__shell";
-
-    const treeEl = document.createElement("div");
-    treeEl.className = "fhelper-child-nav__tree";
-    if (errorText) {
-        const err = document.createElement("div");
-        err.className = "fhelper-child-nav__error";
-        err.textContent = errorText;
-        treeEl.appendChild(err);
-    } else if (!tree.length) {
-        const empty = document.createElement("div");
-        empty.className = "fhelper-child-nav__empty";
-        empty.textContent = "暂无子文档";
-        treeEl.appendChild(empty);
-    } else {
-        const onToggle = (node) => {
-            node.open = !node.open;
-            host._fhelperTree = tree;
-            host.dataset.treeSig = childNavTreeSignature(tree);
-            paintChildNavHost(host, plugin, docId, tree, "");
-        };
-        const onOpen = (targetId) => {
-            const source = findProtyleByElement(host) || findActiveProtyleForChildNav();
-            openChildNavDoc(targetId, source);
-        };
-        tree.forEach((node) => treeEl.appendChild(renderChildNavNodeEl(node, onToggle, onOpen)));
-    }
-    shell.appendChild(treeEl);
-    host.appendChild(shell);
-    host._fhelperTree = tree;
-    host.dataset.treeSig = childNavTreeSignature(tree);
-    host.dataset.paintedDocId = docId;
-    host.dataset.loading = "";
-    host.style.minHeight = "";
-    setCachedChildNavTree(docId, mode, tree, host.offsetHeight || 0);
-    bindChildNavContextMenu(host, plugin, docId, tree);
-}
-
-async function refreshChildNavHost(plugin, host, docId, options = {}) {
-    if (!host || !docId) {
-        return;
-    }
-    const silent = options.silent === true;
-    const mode = getChildNavMode(plugin);
-    const hasContent = host.dataset.paintedDocId === docId
-        && !!host.querySelector(".fhelper-child-nav__shell")
-        && host.dataset.loading !== "1";
-    // Keep current UI while fetching — avoids flash on tab switch.
-    if (!silent && !hasContent) {
-        const cached = getCachedChildNavTree(docId, mode);
-        if (cached) {
-            paintChildNavHost(host, plugin, docId, JSON.parse(JSON.stringify(cached.tree)), "");
-        } else {
-            paintChildNavSkeleton(host, plugin, docId);
+            } catch (error) {
+                console.warn(`${LOG_PREFIX} insertAutoChildNavBlock failed`, child.id, error);
+            }
         }
     }
-    try {
-        const tree = await buildChildNavTree(docId, mode);
-        if (host.dataset.docId !== docId || !host.isConnected) {
-            return;
-        }
-        const prevOpen = collectChildNavOpenIds(host._fhelperTree || []);
-        applyChildNavOpenIds(tree, prevOpen);
-        const nextSig = childNavTreeSignature(tree);
-        const painted = host.dataset.paintedDocId === docId && host.dataset.loading !== "1";
-        if (painted && host.dataset.treeSig === nextSig) {
-            host._fhelperFetchedAt = Date.now();
-            setCachedChildNavTree(docId, mode, tree, host.offsetHeight || 0);
-            return;
-        }
-        paintChildNavHost(host, plugin, docId, tree, "");
-        host._fhelperFetchedAt = Date.now();
-    } catch (error) {
-        console.warn(`${LOG_PREFIX} refreshChildNavHost failed`, docId, error);
-        if (host.isConnected && !hasContent) {
-            paintChildNavHost(host, plugin, docId, [], error?.message || String(error));
-        }
-    }
+    scheduleRefreshChildNavRefIcons();
 }
 
-async function mountChildNavForProtyle(plugin, protyle) {
-    const p = unwrapProtyle(protyle);
-    if (!p) {
-        return;
-    }
-    const docId = getProtyleDocId(p);
-    if (!plugin?.config?.childDocWidget?.enabled || !docId) {
-        p.element?.querySelectorAll?.(`.${CHILD_NAV_HOST_CLASS}`)?.forEach(removeChildNavHost);
-        return;
-    }
-    const host = primeChildNavHost(plugin, p) || ensureChildNavHost(p, docId);
-    if (!host) {
-        return;
-    }
-    syncChildNavHostLayout(host, p);
-    const hasContent = host.dataset.paintedDocId === docId
-        && !!host.querySelector(".fhelper-child-nav__shell")
-        && host.dataset.loading !== "1";
-    // Switch-back: reuse existing panel; skip refetch if freshly painted.
-    if (hasContent && host._fhelperFetchedAt && (Date.now() - host._fhelperFetchedAt) < 4000) {
-        return;
-    }
-    await refreshChildNavHost(plugin, host, docId, { silent: hasContent });
+function removeLegacyChildNavHosts(root = document) {
+    root.querySelectorAll?.(".fhelper-child-nav")?.forEach((el) => el.remove());
 }
 
-function scheduleMountChildNav(plugin, protyle) {
-    if (!plugin) {
+function scheduleSyncChildNavRefs(plugin, protyleOrDocId) {
+    if (!plugin?.config?.childDocWidget?.enabled) {
         return;
     }
-    const p = unwrapProtyle(protyle);
-    // Reserve space / paint cache immediately — do not wait for debounce or SQL.
-    primeChildNavHost(plugin, p);
-    const docId = getProtyleDocId(p) || "_";
+    const docId = typeof protyleOrDocId === "string"
+        ? protyleOrDocId
+        : getProtyleDocId(protyleOrDocId);
+    if (!docId) {
+        return;
+    }
     if (!plugin.childNavMountTimers) {
         plugin.childNavMountTimers = new Map();
     }
@@ -2733,36 +2531,29 @@ function scheduleMountChildNav(plugin, protyle) {
     }
     const timer = window.setTimeout(() => {
         plugin.childNavMountTimers.delete(docId);
-        mountChildNavForProtyle(plugin, p).catch((error) => {
-            console.warn(`${LOG_PREFIX} mountChildNavForProtyle failed`, docId, error);
+        syncChildNavRefBlocks(docId).catch((error) => {
+            console.warn(`${LOG_PREFIX} syncChildNavRefBlocks failed`, docId, error);
         });
-    }, CHILD_NAV_MOUNT_DEBOUNCE_MS);
+    }, CHILD_NAV_SYNC_DEBOUNCE_MS);
     plugin.childNavMountTimers.set(docId, timer);
 }
 
-function syncAllChildNavPanels(plugin) {
-    if (!plugin?.config?.childDocWidget?.enabled) {
-        removeAllChildNavHosts();
-        return;
-    }
-    getAllEditor().forEach(({ protyle }) => scheduleMountChildNav(plugin, protyle));
+function scheduleMountChildNav(plugin, protyle) {
+    scheduleSyncChildNavRefs(plugin, protyle);
 }
 
-function refreshOpenChildNavWidgets(plugin, docId = null) {
-    document.querySelectorAll(`.${CHILD_NAV_HOST_CLASS}`).forEach((host) => {
-        const hostDocId = host.dataset.docId;
-        if (docId && hostDocId && hostDocId !== docId) {
-            return;
-        }
-        if (!hostDocId) {
-            return;
-        }
-        // Force refresh after doc tree changes, but keep UI until data arrives.
-        host._fhelperFetchedAt = 0;
-        refreshChildNavHost(plugin, host, hostDocId, { silent: true }).catch((error) => {
-            console.warn(`${LOG_PREFIX} refreshOpenChildNavWidgets failed`, hostDocId, error);
-        });
-    });
+function syncAllChildNavPanels(plugin) {
+    removeLegacyChildNavHosts();
+    setChildNavRefStyleEnabled(plugin?.config?.docRefStyle?.enabled === true);
+    const enabled = plugin?.config?.childDocWidget?.enabled === true;
+    if (!enabled) {
+        return;
+    }
+    getAllEditor().forEach(({ protyle }) => scheduleSyncChildNavRefs(plugin, protyle));
+}
+
+function refreshOpenChildNavWidgets(plugin) {
+    syncAllChildNavPanels(plugin);
 }
 
 function shouldHandleChildNavWs(cmd) {
@@ -2798,20 +2589,20 @@ function scheduleChildNavWsRefresh(plugin, event) {
 }
 
 function handleProtyleChildNavStaticLoad(plugin, event) {
-    scheduleMountChildNav(plugin, getProtyleFromEvent(event));
-    // If user just hit back, retry scroll-to-nav after panel remount.
-    scheduleRestoreChildNavViewAfterBack(false);
+    removeLegacyChildNavHosts();
+    scheduleSyncChildNavRefs(plugin, getProtyleFromEvent(event));
+    scheduleRefreshChildNavRefIcons();
 }
 
 function handleProtyleChildNavSwitch(plugin, event) {
-    scheduleMountChildNav(plugin, getProtyleFromEvent(event));
-    scheduleRestoreChildNavViewAfterBack(false);
+    scheduleSyncChildNavRefs(plugin, getProtyleFromEvent(event));
+    scheduleRefreshChildNavRefIcons();
 }
 
-// Compatibility aliases used by settings/config save paths.
 function scheduleEnsureChildNavWidget(plugin, protyle) {
-    scheduleMountChildNav(plugin, protyle);
+    scheduleSyncChildNavRefs(plugin, protyle);
 }
+
 function unwrapProtyle(protyle) {
     if (!protyle) {
         return null;
@@ -2988,12 +2779,6 @@ function logChildDocIndexBuild(parentId, context) {
 }
 */
 
-function mapRawFilesToChildren(rawFiles, notebook) {
-    return (rawFiles || [])
-        .map((file) => mapListDocsFileToChild(file, notebook))
-        .filter(Boolean);
-}
-
 async function getDocPathById(docId) {
     if (!docId) {
         return null;
@@ -3013,108 +2798,6 @@ async function getDocPathById(docId) {
         return { notebook: docId, path: notebookBoxDocPath(docId) };
     }
     return null;
-}
-
-function mapListDocsFileToChild(file, notebook) {
-    if (!file?.id) {
-        return null;
-    }
-    const title = stripDocFileName(file.name1 || file.name || file.id);
-    const subFileCount = typeof file.subFileCount === "number" ? file.subFileCount : null;
-    return {
-        id: file.id,
-        content: title,
-        hpath: file.path || "",
-        path: file.path || "",
-        created: String(file.ctime || file.hCtime || ""),
-        box: notebook || "",
-        subFileCount,
-        sort: typeof file.sort === "number" ? file.sort : 0,
-    };
-}
-
-async function fetchDocsByPathRaw(notebook, path, options = {}) {
-    if (!notebook) {
-        return [];
-    }
-    const payload = {
-        notebook,
-        path: path || "/",
-        sort: typeof options.sort === "number" ? options.sort : LIST_DOCS_SORT_UNASSIGNED,
-        maxListCount: typeof options.maxListCount === "number" ? options.maxListCount : 0,
-    };
-    const response = await fetchSyncPost("/api/filetree/listDocsByPath", payload);
-    if (response && typeof response.code === "number" && response.code !== 0) {
-        throw new Error(response.msg || "listDocsByPath failed");
-    }
-    return response?.data?.files || response?.files || [];
-}
-
-async function queryDirectChildDocs(parentId) {
-    if (!parentId) {
-        return { children: [], notebookId: null };
-    }
-    const pathInfo = await getDocPathById(parentId);
-    if (!pathInfo) {
-        console.warn(`${LOG_PREFIX} queryDirectChildDocs: path not found`, parentId);
-        return { children: [], notebookId: null };
-    }
-    const isBox = isNotebookBoxDoc(parentId, pathInfo.notebook)
-        || isNotebookBoxDocPath(pathInfo.path, pathInfo.notebook);
-    const folderPath = isBox ? "/" : toListDocsFolderPath(pathInfo.path);
-    const dropBoxDoc = (files) => (files || []).filter((child) => child.id !== pathInfo.notebook);
-    try {
-        const rawFiles = await fetchDocsByPathRaw(pathInfo.notebook, folderPath, { sort: LIST_DOCS_SORT_UNASSIGNED });
-        return {
-            children: dropBoxDoc(mapRawFilesToChildren(rawFiles, pathInfo.notebook)),
-            notebookId: pathInfo.notebook,
-        };
-    } catch (error) {
-        console.warn(`${LOG_PREFIX} listDocsByPath failed`, parentId, folderPath, error);
-        try {
-            const fallbackPath = isBox ? "/" : pathInfo.path;
-            const rawFiles = await fetchDocsByPathRaw(pathInfo.notebook, fallbackPath, { sort: LIST_DOCS_SORT_UNASSIGNED });
-            return {
-                children: dropBoxDoc(mapRawFilesToChildren(rawFiles, pathInfo.notebook)),
-                notebookId: pathInfo.notebook,
-            };
-        } catch (fallbackError) {
-            console.warn(`${LOG_PREFIX} listDocsByPath fallback failed`, parentId, pathInfo.path, fallbackError);
-            return { children: [], notebookId: pathInfo.notebook };
-        }
-    }
-}
-
-function formatTemplateMessage(i18n, key, params = {}) {
-    let text = i18n[key] || key;
-    Object.entries(params).forEach(([name, value]) => {
-        text = text.replace(new RegExp(`\\$\\{${name}\\}`, "g"), String(value));
-    });
-    return text;
-}
-
-function toDocDirPath(path) {
-    if (!path || path === "/") {
-        return "/";
-    }
-    return String(path).replace(/\.sy$/i, "");
-}
-
-function isDocPathUnderParent(childPath, parentPath, notebook, childBox) {
-    if (!childPath || !parentPath) {
-        return false;
-    }
-    if (childPath === parentPath) {
-        return true;
-    }
-    if (notebook && isNotebookBoxDocPath(parentPath, notebook)) {
-        return childBox === notebook && !isNotebookBoxDocPath(childPath, notebook);
-    }
-    const parentDir = toDocDirPath(parentPath);
-    if (parentDir === "/") {
-        return childPath !== "/";
-    }
-    return childPath === parentDir || childPath.startsWith(`${parentDir}/`);
 }
 
 function openFileTreeDock() {
@@ -3176,248 +2859,13 @@ async function handleLocateDocInTreeForProtyle(plugin, protyle) {
     }
 }
 
-async function queryReferencedDocsOutsideChildren(parentId) {
-    if (!parentId) {
-        return [];
-    }
-    const parentPathInfo = await getDocPathById(parentId);
-    if (!parentPathInfo?.path) {
-        return [];
-    }
-    // Resolve referenced targets to their document ids (doc block itself, or containing root).
-    const idStmt = `
-SELECT DISTINCT
-  CASE WHEN b.type = 'd' THEN b.id ELSE b.root_id END AS id
-FROM refs r
-JOIN blocks b ON b.id = r.def_block_id
-WHERE r.root_id = '${escapeSqlId(parentId)}'
-`.replace(/\s+/g, " ").trim();
-    const idRows = await runSqlQuery(idStmt);
-    const candidateIds = [...new Set(
-        (idRows || [])
-            .map((row) => row?.id)
-            .filter((id) => id && id !== parentId),
-    )];
-    if (!candidateIds.length) {
-        return [];
-    }
-    const inList = candidateIds.map((id) => `'${escapeSqlId(id)}'`).join(",");
-    const metaStmt = `
-SELECT id, content AS title, path, box
-FROM blocks
-WHERE type = 'd' AND id IN (${inList})
-`.replace(/\s+/g, " ").trim();
-    const rows = await runSqlQuery(metaStmt);
-    const result = [];
-    for (const row of rows || []) {
-        const id = row?.id;
-        if (!id) {
-            continue;
-        }
-        const path = row.path || "";
-        // Already under this doc (incl. deeper descendants): skip.
-        if (isDocPathUnderParent(path, parentPathInfo.path, parentPathInfo.notebook, row.box)) {
-            continue;
-        }
-        // Would create a cycle if we move an ancestor under this doc.
-        if (isDocPathUnderParent(parentPathInfo.path, path, row.box, parentPathInfo.notebook)) {
-            continue;
-        }
-        result.push({
-            id,
-            title: row.title || id,
-            path,
-            box: row.box || "",
-        });
-    }
-    return result;
-}
-
-async function moveDocsAsChildren(parentId, docIds) {
-    if (!parentId || !docIds?.length) {
-        return { moved: 0, failed: 0 };
-    }
-    const response = await fetchSyncPost("/api/filetree/moveDocsByID", {
-        fromIDs: docIds,
-        toID: parentId,
-    });
-    if (response && typeof response.code === "number" && response.code !== 0) {
-        throw new Error(response.msg || "moveDocsByID failed");
-    }
-    return { moved: docIds.length, failed: 0 };
-}
-
-async function handleGatherReferencedDocsForProtyle(plugin, protyle) {
-    if (plugin.gatherRefsBusy) {
-        return;
-    }
-    plugin.gatherRefsBusy = true;
-    try {
-        const editor = unwrapProtyle(protyle) || findProtyleByElement(protyle?.element);
-        const { docId } = resolveProtyleDocId(editor);
-        if (!docId) {
-            showMessage(plugin.i18n.cannotResolveDoc);
-            return;
-        }
-        const candidates = await queryReferencedDocsOutsideChildren(docId);
-        if (!candidates.length) {
-            showMessage(plugin.i18n.gatherRefsNone);
-            return;
-        }
-        const preview = candidates
-            .slice(0, 8)
-            .map((item) => `· ${item.title}`)
-            .join("\n");
-        const extra = candidates.length > 8
-            ? formatTemplateMessage(plugin.i18n, "gatherRefsConfirmMore", {
-                count: candidates.length - 8,
-            })
-            : "";
-        const confirmed = window.confirm(
-            formatTemplateMessage(plugin.i18n, "gatherRefsConfirm", {
-                count: candidates.length,
-                list: `${preview}${extra ? `\n${extra}` : ""}`,
-            }),
-        );
-        if (!confirmed) {
-            return;
-        }
-        const { moved } = await moveDocsAsChildren(docId, candidates.map((item) => item.id));
-        showMessage(formatTemplateMessage(plugin.i18n, "gatherRefsDone", { count: moved }));
-    } catch (error) {
-        console.warn(`${LOG_PREFIX} gatherReferencedDocs failed`, error);
-        showMessage(plugin.i18n.gatherRefsFailed);
-    } finally {
-        plugin.gatherRefsBusy = false;
-    }
-}
-
-async function queryReferencedDocIds(rootId) {
-    const ids = new Set();
-    if (!rootId) {
-        return ids;
-    }
-    const stmt = `
-SELECT DISTINCT
-  CASE WHEN b.type = 'd' THEN b.id ELSE b.root_id END AS id
-FROM refs r
-JOIN blocks b ON b.id = r.def_block_id
-WHERE r.root_id = '${escapeSqlId(rootId)}'
-`.replace(/\s+/g, " ").trim();
-    try {
-        const rows = await runSqlQuery(stmt);
-        (rows || []).forEach((row) => {
-            if (row?.id) {
-                ids.add(row.id);
-            }
-        });
-    } catch (error) {
-        console.warn(`${LOG_PREFIX} queryReferencedDocIds failed`, error);
-    }
-    return ids;
-}
-
-async function queryUnreferencedChildDocs(parentId) {
-    if (!parentId) {
-        return [];
-    }
-    const { children } = await queryDirectChildDocs(parentId);
-    if (!children.length) {
-        return [];
-    }
-    const referenced = await queryReferencedDocIds(parentId);
-    return children.filter((child) => child?.id && !referenced.has(child.id));
-}
-
-async function removeDocById(docId) {
-    const response = await fetchSyncPost("/api/filetree/removeDocByID", { id: docId });
-    if (response && typeof response.code === "number" && response.code !== 0) {
-        throw new Error(response.msg || "removeDocByID failed");
-    }
-    return response;
-}
-
-async function handleDeleteUnreferencedChildrenForProtyle(plugin, protyle) {
-    if (plugin.deleteUnrefBusy) {
-        return;
-    }
-    plugin.deleteUnrefBusy = true;
-    try {
-        const editor = unwrapProtyle(protyle) || findProtyleByElement(protyle?.element);
-        const { docId } = resolveProtyleDocId(editor);
-        if (!docId) {
-            showMessage(plugin.i18n.cannotResolveDoc);
-            return;
-        }
-        const candidates = await queryUnreferencedChildDocs(docId);
-        if (!candidates.length) {
-            showMessage(plugin.i18n.deleteUnrefNone);
-            return;
-        }
-        const withSubtree = candidates.filter((item) => (item.subFileCount || 0) > 0).length;
-        const preview = candidates
-            .slice(0, 8)
-            .map((item) => {
-                const sub = (item.subFileCount || 0) > 0
-                    ? formatTemplateMessage(plugin.i18n, "deleteUnrefHasChildren", {
-                        count: item.subFileCount,
-                    })
-                    : "";
-                return `· ${item.content || item.id}${sub}`;
-            })
-            .join("\n");
-        const extra = candidates.length > 8
-            ? formatTemplateMessage(plugin.i18n, "deleteUnrefConfirmMore", {
-                count: candidates.length - 8,
-            })
-            : "";
-        const confirmed = window.confirm(
-            formatTemplateMessage(plugin.i18n, "deleteUnrefConfirm", {
-                count: candidates.length,
-                subtreeHint: withSubtree > 0
-                    ? formatTemplateMessage(plugin.i18n, "deleteUnrefSubtreeHint", {
-                        count: withSubtree,
-                    })
-                    : "",
-                list: `${preview}${extra ? `\n${extra}` : ""}`,
-            }),
-        );
-        if (!confirmed) {
-            return;
-        }
-        let deleted = 0;
-        let failed = 0;
-        for (const child of candidates) {
-            try {
-                await removeDocById(child.id);
-                deleted += 1;
-            } catch (error) {
-                failed += 1;
-                console.warn(`${LOG_PREFIX} removeDocByID failed`, child.id, error);
-            }
-        }
-        if (failed > 0) {
-            showMessage(formatTemplateMessage(plugin.i18n, "deleteUnrefPartial", {
-                deleted,
-                failed,
-            }));
-            return;
-        }
-        showMessage(formatTemplateMessage(plugin.i18n, "deleteUnrefDone", { count: deleted }));
-    } catch (error) {
-        console.warn(`${LOG_PREFIX} deleteUnreferencedChildren failed`, error);
-        showMessage(plugin.i18n.deleteUnrefFailed);
-    } finally {
-        plugin.deleteUnrefBusy = false;
-    }
-}
-
 const BREADCRUMB_BTN_LOCATE = "fhelper-locate-in-tree";
-const BREADCRUMB_BTN_GATHER = "fhelper-gather-refs";
-const BREADCRUMB_BTN_DELETE_UNREF = "fhelper-delete-unref-children";
-const FHELPER_ICON_GATHER_REFS = "iconFhelperGatherRefs";
-const FHELPER_ICON_DELETE_UNREF = "iconFhelperDeleteUnref";
 const LEGACY_BREADCRUMB_CHILD_INDEX = "fhelper-child-doc-index";
+const RETIRED_BREADCRUMB_BTN_TYPES = [
+    LEGACY_BREADCRUMB_CHILD_INDEX,
+    "fhelper-gather-refs",
+    "fhelper-delete-unref-children",
+];
 
 const BREADCRUMB_DOC_ACTIONS = [
     {
@@ -3426,20 +2874,6 @@ const BREADCRUMB_DOC_ACTIONS = [
         tipKey: "locateInTreeBreadcrumbTip",
         run: (plugin, editor) => handleLocateDocInTreeForProtyle(plugin, editor),
         failKey: "locateInTreeFailed",
-    },
-    {
-        type: BREADCRUMB_BTN_GATHER,
-        iconHref: `#${FHELPER_ICON_GATHER_REFS}`,
-        tipKey: "gatherRefsBreadcrumbTip",
-        run: (plugin, editor) => handleGatherReferencedDocsForProtyle(plugin, editor),
-        failKey: "gatherRefsFailed",
-    },
-    {
-        type: BREADCRUMB_BTN_DELETE_UNREF,
-        iconHref: `#${FHELPER_ICON_DELETE_UNREF}`,
-        tipKey: "deleteUnrefBreadcrumbTip",
-        run: (plugin, editor) => handleDeleteUnreferencedChildrenForProtyle(plugin, editor),
-        failKey: "deleteUnrefFailed",
     },
 ];
 
@@ -3475,10 +2909,14 @@ function bindDocActionBreadcrumbButton(plugin, btn, action) {
     return fresh;
 }
 
-function removeLegacyChildIndexBreadcrumbButtons(root = document) {
-    root.querySelectorAll?.(
-        `.protyle-breadcrumb [data-type="${LEGACY_BREADCRUMB_CHILD_INDEX}"], button[data-type="${LEGACY_BREADCRUMB_CHILD_INDEX}"]`,
-    )?.forEach((el) => el.remove());
+function removeRetiredBreadcrumbButtons(root = document) {
+    const selector = RETIRED_BREADCRUMB_BTN_TYPES
+        .flatMap((type) => [
+            `.protyle-breadcrumb [data-type="${type}"]`,
+            `button[data-type="${type}"]`,
+        ])
+        .join(", ");
+    root.querySelectorAll?.(selector)?.forEach((el) => el.remove());
 }
 
 function ensureDocActionBreadcrumbButtons(plugin, protyle) {
@@ -3486,7 +2924,7 @@ function ensureDocActionBreadcrumbButtons(plugin, protyle) {
     if (!root) {
         return;
     }
-    removeLegacyChildIndexBreadcrumbButtons(root);
+    removeRetiredBreadcrumbButtons(root);
     const lockBtn = root.querySelector('[data-type="readonly"]');
     let insertBefore = lockBtn;
     BREADCRUMB_DOC_ACTIONS.forEach((action) => {
@@ -3509,7 +2947,7 @@ function ensureDocActionBreadcrumbButtons(plugin, protyle) {
 }
 
 function patchDocActionBreadcrumbButtons(plugin) {
-    removeLegacyChildIndexBreadcrumbButtons(document);
+    removeRetiredBreadcrumbButtons(document);
     getAllEditor().forEach((editor) => {
         const protyle = unwrapProtyle(editor?.protyle || editor);
         if (protyle) {
@@ -3519,32 +2957,23 @@ function patchDocActionBreadcrumbButtons(plugin) {
 }
 
 function syncDocRefStyleFeature(plugin) {
-    const enabled = plugin.config.docRefStyle?.enabled === true;
-    setDocRefStyleCssEnabled(enabled);
-    if (!enabled) {
-        clearAllDocRefRetries(plugin);
-        unwatchAllDocRefMutations(plugin);
-        unwatchOutlineDocRefs(plugin);
-        undecorateAllDocRefs();
-        plugin.docRefByDoc.clear();
-        plugin.docRefDirtyDocs.clear();
-        plugin.docRefRebuildTimers?.forEach((timer) => window.clearTimeout(timer));
-        plugin.docRefRebuildTimers?.clear();
-        plugin.docRefRestoreTimer?.forEach((timer) => window.clearTimeout(timer));
-        plugin.docRefRestoreTimer?.clear();
-        if (plugin.docRefWsTimer) {
-            window.clearTimeout(plugin.docRefWsTimer);
-            plugin.docRefWsTimer = null;
-        }
-        plugin.docRefWsPending = null;
-        return;
+    setDocRefStyleCssEnabled(false);
+    clearAllDocRefRetries(plugin);
+    unwatchAllDocRefMutations(plugin);
+    unwatchOutlineDocRefs(plugin);
+    undecorateAllDocRefs();
+    plugin.docRefByDoc.clear();
+    plugin.docRefDirtyDocs.clear();
+    plugin.docRefRebuildTimers?.forEach((timer) => window.clearTimeout(timer));
+    plugin.docRefRebuildTimers?.clear();
+    plugin.docRefRestoreTimer?.forEach((timer) => window.clearTimeout(timer));
+    plugin.docRefRestoreTimer?.clear();
+    if (plugin.docRefWsTimer) {
+        window.clearTimeout(plugin.docRefWsTimer);
+        plugin.docRefWsTimer = null;
     }
-    watchAllDocRefEditors(plugin);
-    ensureOutlineDocRefWatch(plugin);
-    decorateAllOpenEditors(plugin).catch((error) => {
-        console.warn(`${LOG_PREFIX} decorateAllOpenEditors failed`, error);
-    });
-    scheduleDecorateOutlineDocRefs(plugin);
+    plugin.docRefWsPending = null;
+    setChildNavRefStyleEnabled(plugin.config.docRefStyle?.enabled === true);
 }
 
 const RE_CJK_CHAR = /[\u4E00-\u9FFF\u3400-\u4DBF\uF900-\uFAFF]/;
@@ -4616,7 +4045,6 @@ function scheduleLayoutRefresh(plugin) {
     window.clearTimeout(plugin.layoutRefreshTimer);
     plugin.layoutRefreshTimer = window.setTimeout(() => {
         getAllEditor().forEach(({ protyle }) => refreshAllImagesInProtyle(plugin, protyle));
-        syncAllChildNavHostLayouts(plugin);
     }, 150);
 }
 
@@ -4785,6 +4213,31 @@ function getSlashItemKey(item) {
     return null;
 }
 
+function isNewChildDocNavRefSlashItem(item) {
+    if (!item || isSeparatorItem(item)) {
+        return false;
+    }
+    if (item.id === NEW_CHILD_DOC_NAV_REF_SLASH_ID) {
+        return true;
+    }
+    const key = getSlashItemKey(item);
+    return typeof key === "string" && key.endsWith(`:${NEW_CHILD_DOC_NAV_REF_SLASH_ID}`);
+}
+
+function pinNewChildDocNavRefSlash(items) {
+    if (!Array.isArray(items) || items.length < 2) {
+        return items;
+    }
+    const idx = items.findIndex(isNewChildDocNavRefSlashItem);
+    if (idx <= 0) {
+        return items;
+    }
+    const next = items.slice();
+    const [pinned] = next.splice(idx, 1);
+    next.unshift(pinned);
+    return next;
+}
+
 function extractSlashItemLabel(item) {
     if (item.name) {
         return item.name;
@@ -4820,7 +4273,7 @@ function buildSlashMenuItems(app) {
     } else if (items.length > 0 && items[items.length - 1].html === "separator") {
         items.pop();
     }
-    return items;
+    return pinNewChildDocNavRefSlash(items);
 }
 
 function buildSlashCatalog(app) {
@@ -4988,7 +4441,7 @@ function filterSlashItems(data, plugin, protyleArg = null) {
     } else {
         result = data.filter((item) => !isSeparatorItem(item) && isEnabled(item));
     }
-    return stripOrphanSeparators(result, isEnabled);
+    return pinNewChildDocNavRefSlash(stripOrphanSeparators(result, isEnabled));
 }
 
 function createDefaultConfig() {
@@ -5112,12 +4565,6 @@ function patchAllEditors(plugin) {
     watchAllEditorLayouts(plugin);
     syncPanguSpacingWatchers(plugin);
     patchDocActionBreadcrumbButtons(plugin);
-    if (plugin.config.docRefStyle?.enabled) {
-        watchAllDocRefEditors(plugin);
-        decorateAllOpenEditors(plugin).catch((error) => {
-            console.warn(`${LOG_PREFIX} decorateAllOpenEditors failed`, error);
-        });
-    }
 }
 
 module.exports = class FhelperPlugin extends Plugin {
@@ -5143,7 +4590,6 @@ module.exports = class FhelperPlugin extends Plugin {
     panguSpacingEnableEl = null;
     docRefStyleEnableEl = null;
     childDocWidgetEnableEl = null;
-    childDocWidgetModeEl = null;
     fileTreeHideNewSubDocEl = null;
     protyleLayoutWatchers = new Map();
     panguSpacingWatchers = new Map();
@@ -5160,8 +4606,6 @@ module.exports = class FhelperPlugin extends Plugin {
     childNavMountTimers = null;
     layoutRefreshTimer = null;
     windowResizeHandler = null;
-    gatherRefsBusy = false;
-    deleteUnrefBusy = false;
     breadcrumbMoreHandler = null;
 
     updateProtyleToolbar(toolbar) {
@@ -5179,32 +4623,6 @@ module.exports = class FhelperPlugin extends Plugin {
                 });
             },
         });
-        toolbar.push({
-            name: "fhelper-gather-refs",
-            icon: FHELPER_ICON_GATHER_REFS,
-            hotkey: "",
-            tipPosition: "n",
-            tip: this.i18n.gatherRefsToolbarTip,
-            click: (protyle) => {
-                handleGatherReferencedDocsForProtyle(this, protyle).catch((error) => {
-                    console.warn(`${LOG_PREFIX} handleGatherReferencedDocsForProtyle failed`, error);
-                    showMessage(this.i18n.gatherRefsFailed);
-                });
-            },
-        });
-        toolbar.push({
-            name: "fhelper-delete-unref-children",
-            icon: FHELPER_ICON_DELETE_UNREF,
-            hotkey: "",
-            tipPosition: "n",
-            tip: this.i18n.deleteUnrefToolbarTip,
-            click: (protyle) => {
-                handleDeleteUnreferencedChildrenForProtyle(this, protyle).catch((error) => {
-                    console.warn(`${LOG_PREFIX} handleDeleteUnreferencedChildrenForProtyle failed`, error);
-                    showMessage(this.i18n.deleteUnrefFailed);
-                });
-            },
-        });
         return toolbar;
     }
 
@@ -5213,18 +4631,7 @@ module.exports = class FhelperPlugin extends Plugin {
         this.config = this.data[STORAGE_NAME];
         activeFhelperPlugin = this;
         syncFileTreeFeature(this);
-
-        this.addIcons(`
-<symbol id="${FHELPER_ICON_GATHER_REFS}" viewBox="0 0 32 32">
-  <path d="M6 4.5h11v7H6zm0 11h8v7H6zm14-5.5h6.5v17H20z" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"></path>
-  <path d="M17 8h4v2.2h-4zM14 19h4v2.2h-4z" fill="currentColor"></path>
-</symbol>
-<symbol id="${FHELPER_ICON_DELETE_UNREF}" viewBox="0 0 32 32">
-  <path d="M7 6h18v2.4H7zm3.2 4.2h11.6v16.2H10.2z" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"></path>
-  <path d="M13 13.2v9M19 13.2v9M12.2 6V4.2h7.6V6" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"></path>
-  <path d="M22.5 20.5l5 5M27.5 20.5l-5 5" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"></path>
-</symbol>
-`);
+        registerNewChildDocNavRefSlash(this);
 
         this.addCommand({
             langKey: "openFhelperSetting",
@@ -5241,28 +4648,6 @@ module.exports = class FhelperPlugin extends Plugin {
                 handleLocateDocInTreeForProtyle(this, protyle).catch((error) => {
                     console.warn(`${LOG_PREFIX} handleLocateDocInTreeForProtyle failed`, error);
                     showMessage(this.i18n.locateInTreeFailed);
-                });
-            },
-        });
-
-        this.addCommand({
-            langKey: "gatherRefsCurrentDoc",
-            hotkey: "",
-            editorCallback: (protyle) => {
-                handleGatherReferencedDocsForProtyle(this, protyle).catch((error) => {
-                    console.warn(`${LOG_PREFIX} handleGatherReferencedDocsForProtyle failed`, error);
-                    showMessage(this.i18n.gatherRefsFailed);
-                });
-            },
-        });
-
-        this.addCommand({
-            langKey: "deleteUnrefCurrentDoc",
-            hotkey: "",
-            editorCallback: (protyle) => {
-                handleDeleteUnreferencedChildrenForProtyle(this, protyle).catch((error) => {
-                    console.warn(`${LOG_PREFIX} handleDeleteUnreferencedChildrenForProtyle failed`, error);
-                    showMessage(this.i18n.deleteUnrefFailed);
                 });
             },
         });
@@ -5349,28 +4734,6 @@ module.exports = class FhelperPlugin extends Plugin {
                     });
                 },
             });
-            topMenu.addItem({
-                id: "fhelper-gather-refs",
-                icon: FHELPER_ICON_GATHER_REFS,
-                label: this.i18n.gatherRefsMenuLabel,
-                click: () => {
-                    handleGatherReferencedDocsForProtyle(this, protyle).catch((error) => {
-                        console.warn(`${LOG_PREFIX} breadcrumbmore gather failed`, error);
-                        showMessage(this.i18n.gatherRefsFailed);
-                    });
-                },
-            });
-            topMenu.addItem({
-                id: "fhelper-delete-unref-children",
-                icon: FHELPER_ICON_DELETE_UNREF,
-                label: this.i18n.deleteUnrefMenuLabel,
-                click: () => {
-                    handleDeleteUnreferencedChildrenForProtyle(this, protyle).catch((error) => {
-                        console.warn(`${LOG_PREFIX} breadcrumbmore delete unref failed`, error);
-                        showMessage(this.i18n.deleteUnrefFailed);
-                    });
-                },
-            });
         };
         this.eventBus.on("open-menu-breadcrumbmore", this.breadcrumbMoreHandler);
 
@@ -5384,7 +4747,6 @@ module.exports = class FhelperPlugin extends Plugin {
 
         this.registerBazaarSettingWatcher();
         this.scheduleBazaarSettingButtonFix();
-        installChildNavBackRestore(this);
     }
 
     onLayoutReady() {
@@ -5396,7 +4758,7 @@ module.exports = class FhelperPlugin extends Plugin {
         syncDocRefStyleFeature(this);
         patchDocActionBreadcrumbButtons(this);
         syncFileTreeFeature(this);
-        installChildNavBackRestore(this);
+        syncAllChildNavPanels(this);
         // Import is manual only; watchers only push on theme change / settings close.
         if (isConfigSyncActive()) {
             installConfigSyncWatchers(this);
@@ -5442,7 +4804,6 @@ module.exports = class FhelperPlugin extends Plugin {
             this.eventBus.off("ws-main", this.docRefWsHandler);
             this.docRefWsHandler = null;
         }
-        uninstallChildNavBackRestore(this);
         setFileTreeHideNewSubDocCssEnabled(false);
         if (this.childNavWsTimer) {
             window.clearTimeout(this.childNavWsTimer);
@@ -5453,11 +4814,13 @@ module.exports = class FhelperPlugin extends Plugin {
             this.childNavMountTimers.clear();
             this.childNavMountTimers = null;
         }
-        removeAllChildNavHosts();
+        removeLegacyChildNavHosts();
+        setChildNavRefStyleEnabled(false);
         if (this.breadcrumbMoreHandler) {
             this.eventBus.off("open-menu-breadcrumbmore", this.breadcrumbMoreHandler);
             this.breadcrumbMoreHandler = null;
         }
+        removeRetiredBreadcrumbButtons(document);
         if (this.windowResizeHandler) {
             window.removeEventListener("resize", this.windowResizeHandler);
             this.windowResizeHandler = null;
@@ -5706,12 +5069,7 @@ module.exports = class FhelperPlugin extends Plugin {
             this.config.childDocWidget = {
                 ...(this.config.childDocWidget || createDefaultChildDocWidgetConfig()),
                 enabled: this.childDocWidgetEnableEl.checked,
-            };
-        }
-        if (this.childDocWidgetModeEl) {
-            this.config.childDocWidget = {
-                ...(this.config.childDocWidget || createDefaultChildDocWidgetConfig()),
-                mode: normalizeChildNavMode(this.childDocWidgetModeEl.value),
+                mode: "direct",
             };
         }
         if (this.fileTreeHideNewSubDocEl) {
@@ -5806,7 +5164,30 @@ module.exports = class FhelperPlugin extends Plugin {
         const imageScale = this.config.imageScale || createDefaultImageScaleConfig();
         const panguSpacing = this.config.panguSpacing || createDefaultPanguSpacingConfig();
         const docRefStyle = this.config.docRefStyle || createDefaultDocRefStyleConfig();
+        const childDocWidget = this.config.childDocWidget || createDefaultChildDocWidgetConfig();
         const dpiAvailable = canUseImageScale();
+
+        const childNavSection = this.createSettingSection(this.i18n.sectionChildDocWidget);
+        this.childDocWidgetEnableEl = this.createSettingSwitch(childDocWidget.enabled === true);
+        childNavSection.appendChild(this.createSettingRow({
+            title: this.i18n.childDocWidgetEnable,
+            description: this.i18n.childDocWidgetEnableDesc,
+            control: this.childDocWidgetEnableEl,
+        }));
+        this.docRefStyleEnableEl = this.createSettingSwitch(docRefStyle.enabled === true);
+        childNavSection.appendChild(this.createSettingRow({
+            title: this.i18n.docRefStyleEnable,
+            description: this.i18n.docRefStyleEnableDesc,
+            control: this.docRefStyleEnableEl,
+        }));
+        const fileTree = this.config.fileTree || createDefaultFileTreeConfig();
+        this.fileTreeHideNewSubDocEl = this.createSettingSwitch(fileTree.hideNewSubDoc !== false);
+        childNavSection.appendChild(this.createSettingRow({
+            title: this.i18n.fileTreeHideNewSubDoc,
+            description: this.i18n.fileTreeHideNewSubDocDesc,
+            control: this.fileTreeHideNewSubDocEl,
+        }));
+        panel.appendChild(childNavSection);
 
         const imageSection = this.createSettingSection(this.i18n.sectionImage);
         this.imageScaleEnableEl = this.createSettingSwitch(imageScale.enabled === true, !dpiAvailable);
@@ -5831,23 +5212,7 @@ module.exports = class FhelperPlugin extends Plugin {
             description: this.i18n.panguSpacingEnableDesc,
             control: this.panguSpacingEnableEl,
         }));
-        this.docRefStyleEnableEl = this.createSettingSwitch(docRefStyle.enabled === true);
-        panguSection.appendChild(this.createSettingRow({
-            title: this.i18n.docRefStyleEnable,
-            description: this.i18n.docRefStyleEnableDesc,
-            control: this.docRefStyleEnableEl,
-        }));
         panel.appendChild(panguSection);
-
-        const fileTree = this.config.fileTree || createDefaultFileTreeConfig();
-        const fileTreeSection = this.createSettingSection(this.i18n.sectionFileTree);
-        this.fileTreeHideNewSubDocEl = this.createSettingSwitch(fileTree.hideNewSubDoc !== false);
-        fileTreeSection.appendChild(this.createSettingRow({
-            title: this.i18n.fileTreeHideNewSubDoc,
-            description: this.i18n.fileTreeHideNewSubDocDesc,
-            control: this.fileTreeHideNewSubDocEl,
-        }));
-        panel.appendChild(fileTreeSection);
 
         const configSyncSection = this.createSettingSection(
             this.i18n.sectionConfigSync,
@@ -5894,33 +5259,6 @@ module.exports = class FhelperPlugin extends Plugin {
             control: syncActions,
         }));
         panel.appendChild(configSyncSection);
-
-        const childDocWidget = this.config.childDocWidget || createDefaultChildDocWidgetConfig();
-        const childNavSection = this.createSettingSection(this.i18n.sectionChildDocWidget);
-        this.childDocWidgetEnableEl = this.createSettingSwitch(childDocWidget.enabled === true);
-        childNavSection.appendChild(this.createSettingRow({
-            title: this.i18n.childDocWidgetEnable,
-            description: this.i18n.childDocWidgetEnableDesc,
-            control: this.childDocWidgetEnableEl,
-        }));
-        this.childDocWidgetModeEl = document.createElement("select");
-        this.childDocWidgetModeEl.className = "b3-select";
-        [
-            { value: "direct", label: this.i18n.childDocWidgetModeDirect },
-            { value: "nested", label: this.i18n.childDocWidgetModeNested },
-        ].forEach(({ value, label }) => {
-            const opt = document.createElement("option");
-            opt.value = value;
-            opt.textContent = label;
-            this.childDocWidgetModeEl.appendChild(opt);
-        });
-        this.childDocWidgetModeEl.value = normalizeChildNavMode(childDocWidget.mode);
-        childNavSection.appendChild(this.createSettingRow({
-            title: this.i18n.childDocWidgetMode,
-            description: this.i18n.childDocWidgetModeDesc,
-            control: this.childDocWidgetModeEl,
-        }));
-        panel.appendChild(childNavSection);
 
         const aboutSection = this.createSettingSection(this.i18n.sectionAbout);
         aboutSection.appendChild(this.createSettingRow({
@@ -6205,128 +5543,6 @@ module.exports = class FhelperPlugin extends Plugin {
     padding: 12px 16px;
     border-top: 1px solid var(--b3-border-color);
 }
-.fhelper-child-nav {
-    margin: 4px 0 10px;
-    user-select: none;
-    /* Avoid a second visual pop when skeleton → tree swaps. */
-    contain: layout;
-}
-.fhelper-child-nav__shell {
-    padding: 8px 10px;
-    border: 1px solid var(--b3-border-color);
-    border-radius: 8px;
-    /* Match editor pane, not app chrome (--b3-theme-background). */
-    background: transparent;
-    box-shadow: none;
-}
-.fhelper-child-nav__head {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 10px;
-    margin-bottom: 8px;
-}
-.fhelper-child-nav__title {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    font-weight: 650;
-}
-.fhelper-child-nav__badge {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    min-width: 22px;
-    height: 20px;
-    padding: 0 6px;
-    border-radius: 999px;
-    background: rgba(15, 118, 110, 0.14);
-    color: #0f766e;
-    font-size: 11px;
-    font-weight: 700;
-}
-.fhelper-child-nav__meta {
-    color: var(--b3-theme-on-surface);
-    opacity: 0.75;
-    font-size: 12px;
-}
-.fhelper-child-nav__tree {
-    display: flex;
-    flex-direction: column;
-    gap: 0;
-}
-.fhelper-child-nav__row {
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    min-height: 28px;
-    padding: 3px 6px;
-    border-radius: 6px;
-    cursor: pointer;
-    font-size: inherit;
-    line-height: inherit;
-}
-.fhelper-child-nav__row:hover {
-    background: var(--b3-list-hover);
-}
-.fhelper-child-nav__twist {
-    width: 16px;
-    height: 16px;
-    border: 0;
-    background: transparent;
-    color: var(--b3-theme-on-surface);
-    border-radius: 4px;
-    cursor: pointer;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    padding: 0;
-    flex: 0 0 auto;
-}
-.fhelper-child-nav__twist.is-placeholder {
-    visibility: hidden;
-}
-.fhelper-child-nav__twist svg {
-    width: 10px;
-    height: 10px;
-    transition: transform .15s ease;
-}
-.fhelper-child-nav__twist.is-open svg {
-    transform: rotate(90deg);
-}
-.fhelper-child-nav__icon {
-    width: 16px;
-    flex: 0 0 auto;
-    text-align: center;
-    font-size: 12px;
-    line-height: 1;
-}
-.fhelper-child-nav__label {
-    flex: 1 1 auto;
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-}
-.fhelper-child-nav__children {
-    margin-left: 12px;
-    padding-left: 8px;
-    border-left: 1px dashed var(--b3-border-color);
-    display: flex;
-    flex-direction: column;
-    gap: 0;
-}
-.fhelper-child-nav__empty,
-.fhelper-child-nav__error {
-    padding: 10px 8px;
-    font-size: 12.5px;
-    color: var(--b3-theme-on-surface);
-    opacity: 0.8;
-}
-.fhelper-child-nav__error {
-    color: var(--b3-theme-error);
-    opacity: 1;
-}
 `;
     }
 
@@ -6349,7 +5565,6 @@ module.exports = class FhelperPlugin extends Plugin {
         this.panguSpacingEnableEl = null;
         this.docRefStyleEnableEl = null;
         this.childDocWidgetEnableEl = null;
-        this.childDocWidgetModeEl = null;
         this.slashSearchEl = null;
         this.slashListEl = null;
         this.slashEmptyEl = null;

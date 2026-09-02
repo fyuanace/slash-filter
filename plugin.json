@@ -1,7 +1,7 @@
 {
   "name": "fhelper",
   "author": "fyuan",
-  "version": "1.18.0",
+  "version": "1.24.5",
   "minAppVersion": "3.1.27",
   "backends": ["all"],
   "frontends": ["all"],
@@ -11,9 +11,9 @@
     "zh_CN": "fhelper"
   },
   "description": {
-    "default": "Slash menu filter, image DPI scale, CJK-Latin spacing, document ref styling, child nav inject, file-tree tweaks, and config/theme sync",
-    "zh_CN": "斜杠菜单过滤、图片 DPI 缩放、中英文自动空格、文档引用美化、子文档导航植入、文档树调整、配置与主题同步"
+    "default": "Slash menu filter, image DPI scale, CJK-Latin spacing, child doc ref styling, child nav inject, new child doc block slash, file-tree tweaks, and config/theme sync",
+    "zh_CN": "斜杠菜单过滤、图片 DPI 缩放、中英文自动空格、子文档引用美化、子文档导航植入、新建子文档块、文档树调整、配置与主题同步"
   },
-  "keywords": ["fhelper", "slash", "filter", "pangu", "doc-ref", "child-nav", "file-tree", "config-sync", "theme-sync", "斜杠", "过滤", "空格", "引用", "子文档", "导航", "植入", "定位", "归集", "同步", "主题"],
+  "keywords": ["fhelper", "slash", "filter", "pangu", "doc-ref", "child-nav", "file-tree", "config-sync", "theme-sync", "斜杠", "过滤", "空格", "引用", "子文档", "导航", "植入", "定位", "同步", "主题"],
   "i18n": ["zh_CN", "en_US"]
 }

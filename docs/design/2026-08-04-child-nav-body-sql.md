@@ -22,6 +22,7 @@ tags:
 
 | 时间 | 说明 |
 |------|------|
+| 2026-09-02 | 删除未引用已移除；`listDocsByPath` 不再用于文档树辅助 |
 | 2026-08-04 | 固化约束：导航展示仅 SQL，禁止用 listDocsByPath 探活 |
 | 2026-08-31 | 子文档索引已移除；顶层笔记本文档改用逻辑父子 |
 | 2026-08-31 | 正文子文档导航已废弃，本文只约束现行导航植入 |
@@ -37,9 +38,8 @@ tags:
 | 场景 | 查子文档方式 |
 |------|----------------|
 | 子文档导航植入（`childDocWidget`） | **仅 SQL**；顶层笔记本文档按虚拟父子，不按 `/<boxID>/` 物理前缀 |
-| 删除未引用等文档树辅助 | 可用 `listDocsByPath`；笔记本根文档用路径 `/`，并排除笔记本自身 |
 
-工程锚点：`queryChildNavDescendants` / `buildChildNavTree` 为 SQL only；`queryDirectChildDocs` 仅用于删除未引用等文档树辅助，勿在导航热路径调用。
+工程锚点：`queryChildNavDescendants` / `buildChildNavTree` 为 SQL only。不要在导航热路径调用 `listDocsByPath`。
 
 ## 其他模块引用约束
 
