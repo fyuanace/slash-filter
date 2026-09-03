@@ -62,7 +62,7 @@
   "defaultIconRestore": "Restore",
   "defaultIconPickerUnavailable": "This SiYuan version does not expose the icon picker. Please upgrade.",
   "newChildDocNavRef": "New child doc block",
-  "newChildDocNavRefUntitled": "Untitled",
+  "newChildDocNavRefUntitled": "Untitled document",
   "newChildDocNavRefFailed": "Failed to create child doc block",
   "cannotResolveDoc": "Cannot resolve current document",
   "locateInTreeToolbarTip": "Expand and select this document in the file tree",

@@ -2453,13 +2453,39 @@ function setChildNavRefStyleEnabled(enabled) {
     scheduleRefreshChildNavRefIcons();
 }
 
+function untitledChildNavTitle() {
+    return activeFhelperPlugin?.i18n?.newChildDocNavRefUntitled
+        || "未命名文档";
+}
+
+function isGenericUntitledTitle(title) {
+    const text = String(title || "").replace(/[\u200b\ufeff]/g, "").trim();
+    if (!text) {
+        return true;
+    }
+    const aliases = new Set(["未命名", "未命名文档", "Untitled", "Untitled document"]);
+    const siyuanUntitled = String(window.siyuan?.languages?.untitled || "").trim();
+    if (siyuanUntitled) {
+        aliases.add(siyuanUntitled);
+    }
+    aliases.add(untitledChildNavTitle());
+    return aliases.has(text);
+}
+
+function childNavAnchorTitle(title) {
+    if (isGenericUntitledTitle(title)) {
+        return untitledChildNavTitle();
+    }
+    return String(title || "").replace(/[\u200b\ufeff]/g, "").trim();
+}
+
 function escapeChildNavTitle(title) {
     return String(title || "").replace(/'/g, "’").replace(/\r?\n/g, " ");
 }
 
 function childNavRefMarkdown(childId, title) {
     // H5 heading wrapping a document block-ref; appears natively in outline.
-    return `##### ((${childId} '${escapeChildNavTitle(title)}'))`;
+    return `##### ((${childId} '${escapeChildNavTitle(childNavAnchorTitle(title))}'))`;
 }
 
 function insertedBlockIdFromResponse(response) {
@@ -2710,9 +2736,7 @@ async function createChildDocNavRefFromSlash(plugin, protyle) {
     clearSlashInput(p);
     const newSubDocId = newSiYuanNodeId();
     const createPath = buildChildDocCreatePath(docPath, newSubDocId);
-    const title = window.siyuan?.languages?.untitled
-        || plugin.i18n.newChildDocNavRefUntitled
-        || "未命名";
+    const title = untitledChildNavTitle();
 
     const created = await fetchSyncPost("/api/filetree/createDoc", {
         notebook: notebookId,
@@ -2833,15 +2857,21 @@ async function syncChildNavRefBlocksUnlocked(plugin, docId) {
     }
     const remaining = await queryAutoChildNavBlocks(docId);
     for (const block of remaining) {
-        if (isChildNavH5Block(block) || !block.target) {
+        if (!block.target) {
             continue;
         }
         const child = childById.get(block.target);
-        const title = child?.title || titleFromChildNavContent(block.content, block.target);
+        const currentTitle = titleFromChildNavContent(block.content, "");
+        const title = childNavAnchorTitle(child?.title || currentTitle || block.target);
+        const needH5 = !isChildNavH5Block(block);
+        const needUntitledFix = isGenericUntitledTitle(currentTitle) && title !== currentTitle;
+        if (!needH5 && !needUntitledFix) {
+            continue;
+        }
         try {
             await updateAutoChildNavBlockMarkdown(block.id, childNavRefMarkdown(block.target, title));
         } catch (error) {
-            console.warn(`${LOG_PREFIX} upgrade child-nav block to H5 failed`, block.id, error);
+            console.warn(`${LOG_PREFIX} upgrade child-nav block failed`, block.id, error);
         }
     }
     const afterUpgrade = await queryAutoChildNavBlocks(docId);
