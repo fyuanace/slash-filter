@@ -55,5 +55,16 @@
   "locateInTreeCurrentDoc": "定位到文档树",
   "locateInTreeMenuLabel": "定位到文档树",
   "locateInTreeDone": "已在文档树中定位当前文档",
-  "locateInTreeFailed": "定位到文档树失败"
+  "locateInTreeFailed": "定位到文档树失败",
+  "moveDocsByNavBlocksBreadcrumbTip": "根据文档块将对应文档移为子文档\n将文档块移动之后, 点击此按钮将文档移动到该文档中作为子文档(不要切换页面, 否则会自动识别子文档没在该文档下导致自动删除文档块)",
+  "moveDocsByNavBlocksNone": "「${doc}」没有可移动的文档：正文里的自动导航块都已指向当前层子文档，或没有这类块",
+  "moveDocsByNavBlocksDone": "「${doc}」已将 ${count} 个文档移为子文档",
+  "moveDocsByNavBlocksFailed": "根据文档块移动文档失败",
+  "deleteChildrenWithoutNavBreadcrumbTip": "删除没有文档块的子文档\n先删掉不想保留的文档块，不要切换页面，再点此按钮删除对应子文档（切走会自动补回文档块）",
+  "deleteChildrenWithoutNavNone": "「${doc}」没有可删除的子文档：当前层子文档都已有自动导航块",
+  "deleteChildrenWithoutNavDone": "「${doc}」已删除 ${count} 个没有文档块的子文档",
+  "deleteChildrenWithoutNavFailed": "删除没有文档块的子文档失败",
+  "childNavAutoCreated": "「${doc}」已自动创建 ${count} 个文档块",
+  "childNavAutoDeleted": "「${doc}」已自动删除 ${count} 个文档块",
+  "childNavAutoCreatedAndDeleted": "「${doc}」已自动创建 ${created} 个、删除 ${deleted} 个文档块"
 }

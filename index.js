@@ -23,6 +23,7 @@ const SCREEN_DPI = 96;
 const SIYUAN_LOCAL_ZOOM_KEY = "local-zoom";
 const IMAGE_CENTER_STYLE_ID = "fhelper-img-center-css";
 const SETTING_STYLE_ID = "fhelper-setting-css";
+const FHELPER_TOOLTIP_STYLE_ID = "fhelper-tooltip-css";
 const DOC_REF_STYLE_ID = "fhelper-doc-ref-css";
 const FILE_TREE_STYLE_ID = "fhelper-file-tree-css";
 const CHILD_NAV_FLAG_ATTR = "custom-fhelper-child-nav";
@@ -31,6 +32,7 @@ const CHILD_NAV_END_ATTR = "custom-fhelper-child-nav-end";
 const CHILD_NAV_STYLE_ID = "fhelper-child-nav-css";
 const CHILD_NAV_ICON_STYLE_ID = "fhelper-child-nav-icon-css";
 const CHILD_NAV_HTML_CLASS = "fhelper-child-nav-style";
+const CHILD_NAV_SQL_LIMIT = 4096;
 const NEW_CHILD_DOC_NAV_REF_SLASH_ID = "newChildDocNavRef";
 const DOC_REF_CLASS = "fhelper-doc-ref";
 const DOC_REF_BROKEN_CLASS = "fhelper-doc-ref-broken";
@@ -830,7 +832,7 @@ async function queryBlockMetaByIds(ids) {
     for (let i = 0; i < unique.length; i += chunkSize) {
         const chunk = unique.slice(i, i + chunkSize);
         const inList = chunk.map((id) => `'${escapeSqlId(id)}'`).join(",");
-        const stmt = `SELECT id, type, ial FROM blocks WHERE id IN (${inList})`;
+        const stmt = `SELECT id, type, ial FROM blocks WHERE id IN (${inList}) LIMIT ${chunk.length}`;
         try {
             const response = await fetchSyncPost("/api/query/sql", { stmt });
             const rows = parseSqlQueryRows(response);
@@ -1910,7 +1912,7 @@ async function queryChildNavDescendants(notebook, parentDocPath, parentDocId) {
         : "";
     try {
         const rows = await runSqlQuery(
-            `SELECT id, content, path FROM blocks WHERE type = 'd' AND box = '${escapeSqlId(notebook)}'${pathClause}${excludeSelf} ORDER BY path ASC LIMIT 2000`,
+            `SELECT id, content, path FROM blocks WHERE type = 'd' AND box = '${escapeSqlId(notebook)}'${pathClause}${excludeSelf} ORDER BY path ASC LIMIT ${CHILD_NAV_SQL_LIMIT}`,
         );
         return Array.isArray(rows) ? rows : [];
     } catch (error) {
@@ -2180,7 +2182,7 @@ async function queryChildNavEndFenceIds(docId) {
     }
     try {
         const rows = await runSqlQuery(
-            `SELECT b.id AS id FROM attributes a JOIN blocks b ON b.id = a.block_id WHERE a.name = '${CHILD_NAV_END_ATTR}' AND a.value = '1' AND b.root_id = '${escapeSqlId(docId)}' ORDER BY b.sort ASC`,
+            `SELECT b.id AS id FROM attributes a JOIN blocks b ON b.id = a.block_id WHERE a.name = '${CHILD_NAV_END_ATTR}' AND a.value = '1' AND b.root_id = '${escapeSqlId(docId)}' ORDER BY b.sort ASC LIMIT ${CHILD_NAV_SQL_LIMIT}`,
         );
         return (Array.isArray(rows) ? rows : []).map((row) => row?.id).filter(Boolean);
     } catch (error) {
@@ -2206,14 +2208,14 @@ async function queryAutoChildNavBlocks(docId) {
     }
     try {
         const rows = await runSqlQuery(
-            `SELECT b.id AS id, b.sort AS sort, b.content AS content, b.type AS type, b.subtype AS subtype, t.value AS target FROM attributes f JOIN blocks b ON b.id = f.block_id LEFT JOIN attributes t ON t.block_id = f.block_id AND t.name = '${CHILD_NAV_TARGET_ATTR}' WHERE f.name = '${CHILD_NAV_FLAG_ATTR}' AND f.value = '1' AND b.root_id = '${escapeSqlId(docId)}' ORDER BY b.sort ASC, b.created ASC`,
+            `SELECT b.id AS id, b.sort AS sort, b.content AS content, b.type AS type, b.subtype AS subtype, t.value AS target FROM attributes f JOIN blocks b ON b.id = f.block_id LEFT JOIN attributes t ON t.block_id = f.block_id AND t.name = '${CHILD_NAV_TARGET_ATTR}' WHERE f.name = '${CHILD_NAV_FLAG_ATTR}' AND f.value = '1' AND b.root_id = '${escapeSqlId(docId)}' ORDER BY b.sort ASC, b.created ASC LIMIT ${CHILD_NAV_SQL_LIMIT}`,
         );
         const list = Array.isArray(rows) ? rows : [];
         const missing = list.filter((row) => row?.id && !row.target);
         if (missing.length) {
             const inList = missing.map((row) => `'${escapeSqlId(row.id)}'`).join(",");
             const refs = await runSqlQuery(
-                `SELECT block_id, def_block_id FROM refs WHERE block_id IN (${inList})`,
+                `SELECT block_id, def_block_id FROM refs WHERE block_id IN (${inList}) LIMIT ${CHILD_NAV_SQL_LIMIT}`,
             );
             const byBlock = new Map((Array.isArray(refs) ? refs : []).map((row) => [row.block_id, row.def_block_id]));
             list.forEach((row) => {
@@ -2446,19 +2448,36 @@ async function deleteAutoChildNavBlock(blockId) {
     await fetchSyncPost("/api/block/deleteBlock", { id: blockId });
 }
 
-async function syncChildNavRefBlocks(docId) {
+async function syncChildNavRefBlocks(plugin, docId) {
     if (!docId || childNavSyncingDocs.has(docId)) {
         return;
     }
     childNavSyncingDocs.add(docId);
     try {
-        await syncChildNavRefBlocksUnlocked(docId);
+        await syncChildNavRefBlocksUnlocked(plugin, docId);
     } finally {
         childNavSyncingDocs.delete(docId);
     }
 }
 
-async function syncChildNavRefBlocksUnlocked(docId) {
+async function notifyChildNavAutoSync(plugin, docId, created, deleted) {
+    const i18n = plugin?.i18n;
+    if (!i18n || (created <= 0 && deleted <= 0)) {
+        return;
+    }
+    const doc = await getDocDisplayTitle(docId);
+    if (created > 0 && deleted > 0) {
+        showMessage(formatTemplateMessage(i18n, "childNavAutoCreatedAndDeleted", { doc, created, deleted }));
+        return;
+    }
+    if (created > 0) {
+        showMessage(formatTemplateMessage(i18n, "childNavAutoCreated", { doc, count: created }));
+        return;
+    }
+    showMessage(formatTemplateMessage(i18n, "childNavAutoDeleted", { doc, count: deleted }));
+}
+
+async function syncChildNavRefBlocksUnlocked(plugin, docId) {
     if (!docId) {
         return;
     }
@@ -2467,10 +2486,13 @@ async function syncChildNavRefBlocksUnlocked(docId) {
     const childById = new Map(children.map((node) => [node.id, node]));
     const childIds = new Set(childById.keys());
     const autoBlocks = await queryAutoChildNavBlocks(docId);
+    let deleted = 0;
+    let created = 0;
     for (const block of autoBlocks) {
         if (!block.target || !childIds.has(block.target)) {
             try {
                 await deleteAutoChildNavBlock(block.id);
+                deleted += 1;
             } catch (error) {
                 console.warn(`${LOG_PREFIX} deleteAutoChildNavBlock failed`, block.id, error);
             }
@@ -2495,17 +2517,21 @@ async function syncChildNavRefBlocksUnlocked(docId) {
     if (missing.length) {
         for (const child of missing) {
             try {
-                await insertAutoChildNavBlock({
+                const newId = await insertAutoChildNavBlock({
                     parentID: docId,
                     childId: child.id,
                     title: child.title,
                 });
+                if (newId) {
+                    created += 1;
+                }
             } catch (error) {
                 console.warn(`${LOG_PREFIX} insertAutoChildNavBlock failed`, child.id, error);
             }
         }
     }
     scheduleRefreshChildNavRefIcons();
+    await notifyChildNavAutoSync(plugin, docId, created, deleted);
 }
 
 function removeLegacyChildNavHosts(root = document) {
@@ -2531,7 +2557,7 @@ function scheduleSyncChildNavRefs(plugin, protyleOrDocId) {
     }
     const timer = window.setTimeout(() => {
         plugin.childNavMountTimers.delete(docId);
-        syncChildNavRefBlocks(docId).catch((error) => {
+        syncChildNavRefBlocks(plugin, docId).catch((error) => {
             console.warn(`${LOG_PREFIX} syncChildNavRefBlocks failed`, docId, error);
         });
     }, CHILD_NAV_SYNC_DEBOUNCE_MS);
@@ -2629,6 +2655,67 @@ function getProtyleDocId(protyle) {
         || fromTitle
         || p.options?.rootId
         || null;
+}
+
+function clipToastDocTitle(title) {
+    const text = String(title || "").replace(/[\u200b\ufeff]/g, "").replace(/\s+/g, " ").trim();
+    if (!text) {
+        return "";
+    }
+    if (text.length <= 40) {
+        return text;
+    }
+    return `${text.slice(0, 38)}…`;
+}
+
+function getDocTitleFromOpenEditor(docId, protyle) {
+    const seen = new Set();
+    const queue = [];
+    const push = (item) => {
+        const p = unwrapProtyle(item);
+        if (p && !seen.has(p)) {
+            seen.add(p);
+            queue.push(p);
+        }
+    };
+    push(protyle);
+    getAllEditor()?.forEach((editor) => push(editor?.protyle || editor));
+    for (const p of queue) {
+        if (getProtyleDocId(p) !== docId) {
+            continue;
+        }
+        const raw = p.title?.editElement?.textContent
+            || p.title?.element?.querySelector?.('[contenteditable="true"]')?.textContent
+            || p.title?.element?.textContent;
+        const clipped = clipToastDocTitle(raw);
+        if (clipped) {
+            return clipped;
+        }
+    }
+    return "";
+}
+
+async function getDocDisplayTitle(docId, protyle) {
+    const fromEditor = getDocTitleFromOpenEditor(docId, protyle);
+    if (fromEditor) {
+        return fromEditor;
+    }
+    if (!docId) {
+        return "";
+    }
+    try {
+        const rows = await runSqlQuery(
+            `SELECT content FROM blocks WHERE id = '${escapeSqlId(docId)}' AND type = 'd' LIMIT 1`,
+        );
+        const fromSql = clipToastDocTitle(rows?.[0]?.content);
+        if (fromSql) {
+            return fromSql;
+        }
+    } catch (error) {
+        console.warn(`${LOG_PREFIX} getDocDisplayTitle failed`, docId, error);
+    }
+    const notebook = getNotebookById(docId);
+    return clipToastDocTitle(notebook?.name) || docId;
 }
 
 function findProtyleByElement(el) {
@@ -2859,7 +2946,264 @@ async function handleLocateDocInTreeForProtyle(plugin, protyle) {
     }
 }
 
+function formatTemplateMessage(i18n, key, params = {}) {
+    let text = i18n[key] || key;
+    Object.entries(params).forEach(([name, value]) => {
+        text = text.replace(new RegExp(`\\$\\{${name}\\}`, "g"), String(value));
+    });
+    return text;
+}
+
+function sleepMs(ms) {
+    return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+async function flushChildNavSqlite(reason) {
+    try {
+        await fetchSyncPost("/api/sqlite/flushTransaction", {});
+    } catch (error) {
+        console.warn(`${LOG_PREFIX} flushTransaction ${reason} failed`, error);
+    }
+}
+
+function collectNavBlockTargetsFromDom(protyle) {
+    const root = unwrapProtyle(protyle)?.wysiwyg?.element;
+    if (!root?.querySelectorAll) {
+        return [];
+    }
+    const targets = [];
+    root.querySelectorAll(`[${CHILD_NAV_FLAG_ATTR}="1"]`).forEach((el) => {
+        const fromAttr = el.getAttribute(CHILD_NAV_TARGET_ATTR);
+        const fromRef = el.querySelector?.('span[data-type~="block-ref"][data-id]')?.getAttribute("data-id");
+        const id = fromAttr || fromRef;
+        if (id) {
+            targets.push(id);
+        }
+    });
+    return targets;
+}
+
+function toDocDirPath(path) {
+    if (!path || path === "/") {
+        return "/";
+    }
+    return String(path).replace(/\.sy$/i, "");
+}
+
+function isDocPathUnderParent(childPath, parentPath, notebook, childBox) {
+    if (!childPath || !parentPath) {
+        return false;
+    }
+    if (childPath === parentPath) {
+        return true;
+    }
+    if (notebook && isNotebookBoxDocPath(parentPath, notebook)) {
+        return childBox === notebook && !isNotebookBoxDocPath(childPath, notebook);
+    }
+    const parentDir = toDocDirPath(parentPath);
+    if (parentDir === "/") {
+        return childPath !== "/";
+    }
+    return childPath === parentDir || childPath.startsWith(`${parentDir}/`);
+}
+
+async function queryDocPathsByIds(ids) {
+    const unique = [...new Set((ids || []).filter(Boolean))];
+    const result = new Map();
+    if (!unique.length) {
+        return result;
+    }
+    const inList = unique.map((id) => `'${escapeSqlId(id)}'`).join(",");
+    try {
+        const rows = await runSqlQuery(
+            `SELECT id, path, box FROM blocks WHERE type = 'd' AND id IN (${inList}) LIMIT ${CHILD_NAV_SQL_LIMIT}`,
+        );
+        (rows || []).forEach((row) => {
+            if (row?.id) {
+                result.set(row.id, { path: row.path || "", box: row.box || "" });
+            }
+        });
+    } catch (error) {
+        console.warn(`${LOG_PREFIX} queryDocPathsByIds failed`, error);
+    }
+    return result;
+}
+
+async function collectNavBlockDocsToMove(parentId, protyle) {
+    if (!parentId) {
+        return [];
+    }
+    const [autoBlocks, children, parentPathInfo] = await Promise.all([
+        queryAutoChildNavBlocks(parentId),
+        buildChildNavTree(parentId),
+        getDocPathById(parentId),
+    ]);
+    const childIds = new Set(children.map((node) => node.id));
+    const targets = [...new Set([
+        ...(autoBlocks || []).map((block) => block.target),
+        ...collectNavBlockTargetsFromDom(protyle),
+    ].filter((id) => id && id !== parentId && !childIds.has(id)))];
+    if (!targets.length) {
+        return [];
+    }
+    const meta = await queryDocPathsByIds(targets);
+    return targets.filter((id) => {
+        const info = meta.get(id);
+        if (!info) {
+            return false;
+        }
+        if (parentPathInfo && isDocPathUnderParent(parentPathInfo.path, info.path, info.box, parentPathInfo.notebook)) {
+            return false;
+        }
+        return true;
+    });
+}
+
+async function collectNavBlockDocsToMoveReady(parentId, protyle) {
+    let toMove = await collectNavBlockDocsToMove(parentId, protyle);
+    if (toMove.length) {
+        return toMove;
+    }
+    await flushChildNavSqlite("before move-by-nav");
+    for (const delay of [350, 700, 1200]) {
+        await sleepMs(delay);
+        toMove = await collectNavBlockDocsToMove(parentId, protyle);
+        if (toMove.length) {
+            return toMove;
+        }
+    }
+    return [];
+}
+
+async function moveDocsAsChildren(parentId, docIds) {
+    if (!parentId || !docIds?.length) {
+        return 0;
+    }
+    const response = await fetchSyncPost("/api/filetree/moveDocsByID", {
+        fromIDs: docIds,
+        toID: parentId,
+    });
+    if (response && typeof response.code === "number" && response.code !== 0) {
+        throw new Error(response.msg || "moveDocsByID failed");
+    }
+    await flushChildNavSqlite("after moveDocsByID");
+    return docIds.length;
+}
+
+async function handleMoveDocsByNavBlocksForProtyle(plugin, protyle) {
+    if (plugin.moveDocsByNavBusy) {
+        return;
+    }
+    plugin.moveDocsByNavBusy = true;
+    try {
+        const editor = unwrapProtyle(protyle) || findProtyleByElement(protyle?.element);
+        const { docId } = resolveProtyleDocId(editor);
+        if (!docId) {
+            showMessage(plugin.i18n.cannotResolveDoc);
+            return;
+        }
+        const doc = await getDocDisplayTitle(docId, editor);
+        const toMove = await collectNavBlockDocsToMoveReady(docId, editor);
+        if (!toMove.length) {
+            showMessage(formatTemplateMessage(plugin.i18n, "moveDocsByNavBlocksNone", { doc }));
+            return;
+        }
+        const moved = await moveDocsAsChildren(docId, toMove);
+        scheduleSyncChildNavRefs(plugin, editor);
+        showMessage(formatTemplateMessage(plugin.i18n, "moveDocsByNavBlocksDone", { doc, count: moved }));
+    } catch (error) {
+        console.warn(`${LOG_PREFIX} moveDocsByNavBlocks failed`, error);
+        showMessage(plugin.i18n.moveDocsByNavBlocksFailed);
+    } finally {
+        plugin.moveDocsByNavBusy = false;
+    }
+}
+
+function collectPresentChildNavTargets(autoBlocks, protyle) {
+    return new Set([
+        ...(autoBlocks || []).map((block) => block.target),
+        ...collectNavBlockTargetsFromDom(protyle),
+    ].filter(Boolean));
+}
+
+function shouldTrustDomNavTargets(children, autoBlocks, protyle) {
+    if (!unwrapProtyle(protyle)?.wysiwyg?.element) {
+        return false;
+    }
+    const childIds = new Set((children || []).map((node) => node.id));
+    const sql = new Set((autoBlocks || []).map((block) => block.target).filter((id) => childIds.has(id)));
+    const dom = new Set(collectNavBlockTargetsFromDom(protyle).filter((id) => childIds.has(id)));
+    if (!sql.size) {
+        return true;
+    }
+    const missing = [...sql].filter((id) => !dom.has(id)).length;
+    return missing <= Math.max(3, Math.ceil(sql.size * 0.15));
+}
+
+async function collectChildrenWithoutNavBlocksReady(parentId, protyle) {
+    if (!parentId) {
+        return [];
+    }
+    await flushChildNavSqlite("before delete-children-without-nav");
+    await sleepMs(350);
+    const [children, autoBlocks] = await Promise.all([
+        buildChildNavTree(parentId),
+        queryAutoChildNavBlocks(parentId),
+    ]);
+    const have = shouldTrustDomNavTargets(children, autoBlocks, protyle)
+        ? new Set(collectNavBlockTargetsFromDom(protyle).filter(Boolean))
+        : collectPresentChildNavTargets(autoBlocks, protyle);
+    return children.filter((node) => node?.id && !have.has(node.id));
+}
+
+async function removeDocsById(ids) {
+    let removed = 0;
+    for (const id of ids || []) {
+        if (!id) {
+            continue;
+        }
+        const response = await fetchSyncPost("/api/filetree/removeDocByID", { id });
+        if (response && typeof response.code === "number" && response.code !== 0) {
+            throw new Error(response.msg || "removeDocByID failed");
+        }
+        removed += 1;
+    }
+    await flushChildNavSqlite("after removeDocByID");
+    return removed;
+}
+
+async function handleDeleteChildrenWithoutNavForProtyle(plugin, protyle) {
+    if (plugin.deleteChildrenWithoutNavBusy) {
+        return;
+    }
+    plugin.deleteChildrenWithoutNavBusy = true;
+    try {
+        const editor = unwrapProtyle(protyle) || findProtyleByElement(protyle?.element);
+        const { docId } = resolveProtyleDocId(editor);
+        if (!docId) {
+            showMessage(plugin.i18n.cannotResolveDoc);
+            return;
+        }
+        const doc = await getDocDisplayTitle(docId, editor);
+        const toDelete = await collectChildrenWithoutNavBlocksReady(docId, editor);
+        if (!toDelete.length) {
+            showMessage(formatTemplateMessage(plugin.i18n, "deleteChildrenWithoutNavNone", { doc }));
+            return;
+        }
+        const deleted = await removeDocsById(toDelete.map((node) => node.id));
+        scheduleSyncChildNavRefs(plugin, editor);
+        showMessage(formatTemplateMessage(plugin.i18n, "deleteChildrenWithoutNavDone", { doc, count: deleted }));
+    } catch (error) {
+        console.warn(`${LOG_PREFIX} deleteChildrenWithoutNav failed`, error);
+        showMessage(plugin.i18n.deleteChildrenWithoutNavFailed);
+    } finally {
+        plugin.deleteChildrenWithoutNavBusy = false;
+    }
+}
+
 const BREADCRUMB_BTN_LOCATE = "fhelper-locate-in-tree";
+const BREADCRUMB_BTN_MOVE_BY_NAV = "fhelper-move-docs-by-nav";
+const BREADCRUMB_BTN_DELETE_WITHOUT_NAV = "fhelper-delete-children-without-nav";
 const LEGACY_BREADCRUMB_CHILD_INDEX = "fhelper-child-doc-index";
 const RETIRED_BREADCRUMB_BTN_TYPES = [
     LEGACY_BREADCRUMB_CHILD_INDEX,
@@ -2875,6 +3219,20 @@ const BREADCRUMB_DOC_ACTIONS = [
         run: (plugin, editor) => handleLocateDocInTreeForProtyle(plugin, editor),
         failKey: "locateInTreeFailed",
     },
+    {
+        type: BREADCRUMB_BTN_MOVE_BY_NAV,
+        iconHref: "#iconMove",
+        tipKey: "moveDocsByNavBlocksBreadcrumbTip",
+        run: (plugin, editor) => handleMoveDocsByNavBlocksForProtyle(plugin, editor),
+        failKey: "moveDocsByNavBlocksFailed",
+    },
+    {
+        type: BREADCRUMB_BTN_DELETE_WITHOUT_NAV,
+        iconHref: "#iconTrashcan",
+        tipKey: "deleteChildrenWithoutNavBreadcrumbTip",
+        run: (plugin, editor) => handleDeleteChildrenWithoutNavForProtyle(plugin, editor),
+        failKey: "deleteChildrenWithoutNavFailed",
+    },
 ];
 
 function getBreadcrumbRoot(protyle) {
@@ -2887,6 +3245,16 @@ function getBreadcrumbRoot(protyle) {
     }
     root = p?.element?.querySelector?.(".protyle-breadcrumb");
     return root || null;
+}
+
+function ensureFhelperTooltipCss() {
+    let style = document.getElementById(FHELPER_TOOLTIP_STYLE_ID);
+    if (!style) {
+        style = document.createElement("style");
+        style.id = FHELPER_TOOLTIP_STYLE_ID;
+        document.head.appendChild(style);
+    }
+    style.textContent = "#tooltip { white-space: pre-wrap; max-width: min(22rem, 72vw); }";
 }
 
 function bindDocActionBreadcrumbButton(plugin, btn, action) {
@@ -2920,6 +3288,7 @@ function removeRetiredBreadcrumbButtons(root = document) {
 }
 
 function ensureDocActionBreadcrumbButtons(plugin, protyle) {
+    ensureFhelperTooltipCss();
     const root = getBreadcrumbRoot(protyle);
     if (!root) {
         return;
@@ -4606,6 +4975,8 @@ module.exports = class FhelperPlugin extends Plugin {
     childNavMountTimers = null;
     layoutRefreshTimer = null;
     windowResizeHandler = null;
+    moveDocsByNavBusy = false;
+    deleteChildrenWithoutNavBusy = false;
     breadcrumbMoreHandler = null;
 
     updateProtyleToolbar(toolbar) {

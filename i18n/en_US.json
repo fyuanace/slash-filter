@@ -55,5 +55,16 @@
   "locateInTreeCurrentDoc": "Reveal in file tree",
   "locateInTreeMenuLabel": "Reveal in file tree",
   "locateInTreeDone": "Located current document in the file tree",
-  "locateInTreeFailed": "Failed to locate document in the file tree"
+  "locateInTreeFailed": "Failed to locate document in the file tree",
+  "moveDocsByNavBlocksBreadcrumbTip": "Move documents from nav blocks under this page\nAfter moving document-ref blocks here, click to move those documents under this page as children. Do not switch pages first, or missing-child sync will delete those blocks.",
+  "moveDocsByNavBlocksNone": "“${doc}”: nothing to move — auto nav blocks already point at direct children, or there are none",
+  "moveDocsByNavBlocksDone": "“${doc}”: moved ${count} document(s) as children",
+  "moveDocsByNavBlocksFailed": "Failed to move documents from nav blocks",
+  "deleteChildrenWithoutNavBreadcrumbTip": "Delete child docs that have no nav block\nFirst delete the nav blocks you do not want, stay on this page, then click to remove those child documents. Switching pages first will auto-recreate the blocks.",
+  "deleteChildrenWithoutNavNone": "“${doc}”: nothing to delete — every direct child already has an auto nav block",
+  "deleteChildrenWithoutNavDone": "“${doc}”: deleted ${count} child document(s) that had no nav block",
+  "deleteChildrenWithoutNavFailed": "Failed to delete child documents without nav blocks",
+  "childNavAutoCreated": "“${doc}”: auto-created ${count} document block(s)",
+  "childNavAutoDeleted": "“${doc}”: auto-deleted ${count} document block(s)",
+  "childNavAutoCreatedAndDeleted": "“${doc}”: auto-created ${created} and deleted ${deleted} document block(s)"
 }
