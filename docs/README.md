@@ -1,6 +1,6 @@
 # fhelper 文档入口
 
-思源笔记插件：斜杠菜单过滤、图片 DPI 缩放、中英文空格、子文档引用美化、子文档导航植入、文档树辅助。
+思源笔记插件：斜杠菜单过滤、图片 DPI 缩放、中英文空格、子文档引用美化、子文档导航植入、文档树辅助、配置与主题同步。
 
 主入口：`index.js`；配置持久化：`fhelper-config.json`；文案：`i18n/zh_CN.json`、`i18n/en_US.json`。
 
@@ -13,7 +13,8 @@
 | 中英文空格 | `panguSpacing` | 输入与粘贴时 CJK-Latin 自动空格 | — |
 | 子文档引用美化 | `docRefStyle` | 仅对自动子文档导航引用做图标/加粗/下划线；不改手写引用 | [design/2026-09-02-child-nav-body-refs.md](design/2026-09-02-child-nav-body-refs.md)、[design/2026-07-08-doc-ref-style.md](design/2026-07-08-doc-ref-style.md)（已 superseded） |
 | 子文档导航植入 | `childDocWidget` | 打开文档时若缺当前层子文档的自动引用则补到文末（H5 包裹文档引用 + 自定义属性，与手动引用分开）；斜杠「新建子文档块」同形态；原生进大纲，无大纲注入；顶层笔记本文档按虚拟父子列举；查子文档仅 SQL | [design/2026-09-02-child-nav-body-refs.md](design/2026-09-02-child-nav-body-refs.md)、[design/2026-08-31-child-nav-box-doc.md](design/2026-08-31-child-nav-box-doc.md) |
-| 文档树辅助 | — | 定位到文档树；面包屑「根据文档块移动文档」「删除没有文档块的子文档」 | — |
+| 文档树辅助 | — | 定位到文档树；面包屑「根据文档块移动文档」「删除没有文档块的子文档」；设置默认图标 | [design/2026-09-03-file-tree-default-icons.md](design/2026-09-03-file-tree-default-icons.md) |
+| 配置同步 | `configSync` | 导出设置与自定义主题到 petal 缓存，随思源同步；拉取前先等云端同步成功再写入 conf | [design/2026-09-03-config-sync.md](design/2026-09-03-config-sync.md) |
 
 ## 整体架构
 
@@ -24,7 +25,8 @@
 
 docRefStyle ←── 自动导航引用样式表（不改 span）
 childDocWidget ←── 正文 H5+文档引用（缺则补文末；原生大纲；仅 SQL；自动块带自定义属性）
-文档树辅助 ←── 定位到文档树；按自动导航块把对应文档收为子文档；删除没有自动导航块的当前层子文档
+文档树辅助 ←── 定位到文档树；按自动导航块把对应文档收为子文档；删除没有自动导航块的当前层子文档；设置默认图标
+配置同步 ←── 导出设置 + 拷贝主题到 data/storage/petal/fhelper/config-sync；拉取前先 performSync
 ```
 
 关系约定：

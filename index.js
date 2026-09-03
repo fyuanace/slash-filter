@@ -12,12 +12,16 @@ const {
     getFrontend,
     confirm,
     exitSiYuan,
+    openEmoji,
 } = require("siyuan");
 
 const STORAGE_NAME = "fhelper-config.json";
 const LEGACY_STORAGE_NAMES = ["slash-filter-config.json", "slash-filter-config"];
 const CONFIG_SYNC_DIR_NAME = "config-sync";
 const CONFIG_SYNC_BUILTIN_THEMES = new Set(["daylight", "midnight"]);
+const CONFIG_SYNC_WAIT_MS = 180000;
+const CONFIG_SYNC_QUIET_MS = 12000;
+const CONFIG_SYNC_AFTER_SYNC_MS = 400;
 const ZWSP = "\u200b";
 const SCREEN_DPI = 96;
 const SIYUAN_LOCAL_ZOOM_KEY = "local-zoom";
@@ -25,7 +29,7 @@ const IMAGE_CENTER_STYLE_ID = "fhelper-img-center-css";
 const SETTING_STYLE_ID = "fhelper-setting-css";
 const FHELPER_TOOLTIP_STYLE_ID = "fhelper-tooltip-css";
 const DOC_REF_STYLE_ID = "fhelper-doc-ref-css";
-const FILE_TREE_STYLE_ID = "fhelper-file-tree-css";
+const LEGACY_FILE_TREE_STYLE_ID = "fhelper-file-tree-css";
 const CHILD_NAV_FLAG_ATTR = "custom-fhelper-child-nav";
 const CHILD_NAV_TARGET_ATTR = "custom-fhelper-child-nav-target";
 const CHILD_NAV_END_ATTR = "custom-fhelper-child-nav-end";
@@ -101,39 +105,161 @@ function createDefaultDocRefStyleConfig() {
     };
 }
 
-function createDefaultFileTreeConfig() {
+function removeLegacyFileTreeHideCss() {
+    document.getElementById(LEGACY_FILE_TREE_STYLE_ID)?.remove();
+}
+
+const LOCAL_IMAGES_STORAGE_KEY = (typeof Constants !== "undefined" && Constants.LOCAL_IMAGES) || "local-images";
+const DEFAULT_LOCAL_IMAGES = {
+    file: "1f4c4",
+    folder: "1f4d1",
+    note: "1f5c3",
+};
+
+function getSiyuanAppId() {
+    return (typeof Constants !== "undefined" && Constants.SIYUAN_APPID) || "";
+}
+
+function getLocalImages() {
+    const stored = window.siyuan?.storage?.[LOCAL_IMAGES_STORAGE_KEY] || {};
     return {
-        // Hide the file-tree row "+" (新建子文档) button.
-        hideNewSubDoc: true,
+        file: stored.file || DEFAULT_LOCAL_IMAGES.file,
+        folder: stored.folder || DEFAULT_LOCAL_IMAGES.folder,
+        note: stored.note || DEFAULT_LOCAL_IMAGES.note,
     };
 }
 
-const FILE_TREE_HIDE_NEW_SUBDOC_CSS = `
-.sy__file .b3-list-item__action[data-type="new"],
-.file-tree .b3-list-item__action[data-type="new"],
-.layout-tab-container .b3-list-item[data-type="navigation-file"] > .b3-list-item__action[data-type="new"],
-.layout-tab-container .b3-list-item[data-type="navigation-root"] > .b3-list-item__action[data-type="new"] {
-    display: none !important;
+function localImageToHtml(unicode) {
+    const raw = String(unicode || "").trim();
+    if (!raw) {
+        return "";
+    }
+    if (raw.startsWith("api/icon/getDynamicIcon")) {
+        return `<img src="${raw}">`;
+    }
+    if (raw.includes(".")) {
+        return `<img src="/emojis/${raw}">`;
+    }
+    return unicodeHexToEmoji(raw) || raw;
 }
-`;
 
-function setFileTreeHideNewSubDocCssEnabled(enabled) {
-    let styleEl = document.getElementById(FILE_TREE_STYLE_ID);
-    if (enabled) {
-        if (!styleEl) {
-            styleEl = document.createElement("style");
-            styleEl.id = FILE_TREE_STYLE_ID;
-            document.head.appendChild(styleEl);
+function refreshFileTreeDefaultIcons(prev, next) {
+    const selectors = [
+        ".sy__file .b3-list-item__icon",
+        ".file-tree .b3-list-item__icon",
+        '[data-type="sidebar-file"] .b3-list-item__icon',
+    ].join(",");
+    ["file", "folder", "note"].forEach((key) => {
+        if (!prev?.[key] || prev[key] === next[key]) {
+            return;
         }
-        styleEl.textContent = FILE_TREE_HIDE_NEW_SUBDOC_CSS;
+        const oldHtml = localImageToHtml(prev[key]);
+        const newHtml = localImageToHtml(next[key]);
+        document.querySelectorAll(selectors).forEach((el) => {
+            if (el.innerHTML === oldHtml) {
+                el.innerHTML = newHtml;
+            }
+        });
+    });
+    scheduleRefreshChildNavRefIcons();
+}
+
+async function persistLocalImages(partial) {
+    const prev = getLocalImages();
+    const next = {
+        ...prev,
+        ...partial,
+    };
+    Object.keys(DEFAULT_LOCAL_IMAGES).forEach((key) => {
+        if (!next[key]) {
+            next[key] = DEFAULT_LOCAL_IMAGES[key];
+        }
+    });
+    if (!window.siyuan.storage) {
+        window.siyuan.storage = {};
+    }
+    window.siyuan.storage[LOCAL_IMAGES_STORAGE_KEY] = next;
+    const payload = {
+        key: LOCAL_IMAGES_STORAGE_KEY,
+        val: next,
+    };
+    const appId = getSiyuanAppId();
+    if (appId) {
+        payload.app = appId;
+    }
+    await fetchSyncPost("/api/storage/setLocalStorageVal", payload);
+    refreshFileTreeDefaultIcons(prev, next);
+    return next;
+}
+
+function paintDefaultIconButton(btn, unicode) {
+    btn.innerHTML = localImageToHtml(unicode) || localImageToHtml(DEFAULT_LOCAL_IMAGES.file);
+    btn.dataset.unicode = unicode || "";
+}
+
+function openDefaultIconPicker(anchor, currentUnicode, onPick) {
+    if (typeof openEmoji !== "function") {
+        showMessage(activeFhelperPlugin?.i18n?.defaultIconPickerUnavailable || "当前思源版本不支持图标选择器");
         return;
     }
-    styleEl?.remove();
+    const rect = anchor.getBoundingClientRect();
+    const options = {
+        position: {
+            x: rect.left,
+            y: rect.bottom,
+            h: rect.height,
+            w: rect.width,
+        },
+        selectedCB: (unicode) => {
+            onPick(String(unicode || "").trim());
+        },
+    };
+    if (String(currentUnicode || "").startsWith("api/icon/getDynamicIcon")) {
+        options.dynamicIconURL = currentUnicode;
+    }
+    openEmoji(options);
 }
 
-function syncFileTreeFeature(plugin) {
-    const hide = plugin?.config?.fileTree?.hideNewSubDoc !== false;
-    setFileTreeHideNewSubDocCssEnabled(!!plugin && hide);
+function createDefaultIconRow(plugin, key, title, description) {
+    const row = plugin.createSettingRow({ title, description });
+    const actions = document.createElement("div");
+    actions.className = "fhelper-setting__icon-actions";
+    const pickBtn = document.createElement("button");
+    pickBtn.type = "button";
+    pickBtn.className = "fhelper-setting__icon-pick";
+    pickBtn.setAttribute("aria-label", title);
+    paintDefaultIconButton(pickBtn, getLocalImages()[key]);
+    pickBtn.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        openDefaultIconPicker(pickBtn, pickBtn.dataset.unicode, (unicode) => {
+            const value = unicode || DEFAULT_LOCAL_IMAGES[key];
+            persistLocalImages({ [key]: value }).then((images) => {
+                paintDefaultIconButton(pickBtn, images[key]);
+            }).catch((error) => {
+                console.warn(`${LOG_PREFIX} persistLocalImages failed`, key, error);
+            });
+        });
+    });
+    const restoreBtn = document.createElement("button");
+    restoreBtn.type = "button";
+    restoreBtn.className = "b3-button b3-button--outline";
+    restoreBtn.textContent = plugin.i18n.defaultIconRestore;
+    restoreBtn.addEventListener("click", (event) => {
+        event.preventDefault();
+        persistLocalImages({ [key]: DEFAULT_LOCAL_IMAGES[key] }).then((images) => {
+            paintDefaultIconButton(pickBtn, images[key]);
+        }).catch((error) => {
+            console.warn(`${LOG_PREFIX} restore local image failed`, key, error);
+        });
+    });
+    actions.appendChild(pickBtn);
+    actions.appendChild(restoreBtn);
+    const actionWrap = document.createElement("div");
+    actionWrap.className = "fhelper-setting__action";
+    actionWrap.appendChild(actions);
+    row.appendChild(actionWrap);
+    return row;
 }
 
 function createDefaultConfigSyncConfig() {
@@ -154,14 +280,200 @@ function isMobileFrontend() {
     }
 }
 
-/** Desktop always active; mobile never runs cache logic. */
+/** Cache lives under data/storage/petal, so desktop and mobile both use kernel APIs. */
 function isConfigSyncActive() {
-    return !isMobileFrontend();
+    return true;
+}
+
+function isSiyuanCloudSyncEnabled() {
+    return window.siyuan?.config?.sync?.enabled === true;
+}
+
+function parseConfigSyncWsEvent(event) {
+    const detail = event?.detail ?? event;
+    const nested = detail?.data && typeof detail.data === "object" ? detail.data : null;
+    const code = typeof detail?.code === "number"
+        ? detail.code
+        : (typeof nested?.code === "number" ? nested.code : undefined);
+    return {
+        cmd: String(detail?.cmd || nested?.cmd || "").toLowerCase(),
+        code,
+        msg: String(detail?.msg || nested?.msg || ""),
+    };
+}
+
+/**
+ * Trigger SiYuan cloud sync and wait until it succeeds.
+ * Pull must not import petal cache until the workspace has the latest files.
+ */
+async function triggerAndWaitSiyuanSync(plugin, timeoutMs = CONFIG_SYNC_WAIT_MS) {
+    if (!isSiyuanCloudSyncEnabled()) {
+        return { ok: false, reason: "disabled" };
+    }
+    return new Promise((resolve) => {
+        let settled = false;
+        let sawStart = false;
+        const cleanups = [];
+        const done = (result) => {
+            if (settled) {
+                return;
+            }
+            settled = true;
+            cleanups.forEach((fn) => {
+                try {
+                    fn();
+                } catch (error) {
+                    // ignore
+                }
+            });
+            resolve(result);
+        };
+
+        const onEnd = () => done({ ok: true });
+        const onFail = (event) => {
+            const msg = parseConfigSyncWsEvent(event).msg;
+            done({ ok: false, reason: "error", msg });
+        };
+        const onWs = (event) => {
+            const { cmd, code, msg } = parseConfigSyncWsEvent(event);
+            if (cmd !== "syncing") {
+                return;
+            }
+            if (code === 0) {
+                sawStart = true;
+                return;
+            }
+            if (code === 1) {
+                done({ ok: true });
+                return;
+            }
+            if (code === 2) {
+                done({ ok: false, reason: "error", msg });
+            }
+        };
+        const onWindowSuccess = () => done({ ok: true });
+
+        if (plugin?.eventBus) {
+            plugin.eventBus.on("sync-end", onEnd);
+            plugin.eventBus.on("sync-fail", onFail);
+            plugin.eventBus.on("ws-main", onWs);
+            cleanups.push(() => {
+                plugin.eventBus.off("sync-end", onEnd);
+                plugin.eventBus.off("sync-fail", onFail);
+                plugin.eventBus.off("ws-main", onWs);
+            });
+        }
+        window.addEventListener("siyuan-sync-success", onWindowSuccess);
+        cleanups.push(() => window.removeEventListener("siyuan-sync-success", onWindowSuccess));
+
+        const timeoutId = window.setTimeout(() => done({ ok: false, reason: "timeout" }), timeoutMs);
+        cleanups.push(() => window.clearTimeout(timeoutId));
+
+        const mode = Number(window.siyuan?.config?.sync?.mode);
+        const body = mode === 3 ? { upload: false } : {};
+        fetchSyncPost("/api/sync/performSync", body).then((res) => {
+            if (res && typeof res.code === "number" && res.code !== 0) {
+                done({ ok: false, reason: "start-failed", msg: res.msg || "" });
+                return;
+            }
+            if (settled || sawStart) {
+                return;
+            }
+            const quietId = window.setTimeout(() => {
+                if (!sawStart) {
+                    done({ ok: true, reason: "quiet" });
+                }
+            }, CONFIG_SYNC_QUIET_MS);
+            cleanups.push(() => window.clearTimeout(quietId));
+        }).catch((error) => {
+            done({ ok: false, reason: "start-failed", msg: String(error?.message || error) });
+        });
+    });
+}
+
+function notifyConfigSyncSyncResult(plugin, syncResult) {
+    const i18n = plugin?.i18n || {};
+    if (syncResult?.reason === "disabled") {
+        showMessage(i18n.configSyncSyncDisabled || "未开启云端同步，无法拉取缓存");
+        return;
+    }
+    if (syncResult?.reason === "timeout") {
+        showMessage(i18n.configSyncSyncTimeout || "同步超时，已取消写入配置");
+        return;
+    }
+    showMessage(i18n.configSyncSyncFailed || "同步失败，已取消写入配置");
 }
 
 function getConfigSyncRoot(plugin) {
     const name = plugin?.name || "fhelper";
     return `/data/storage/petal/${name}/${CONFIG_SYNC_DIR_NAME}`;
+}
+
+function getPluginPetalRoot(plugin) {
+    const name = plugin?.name || "fhelper";
+    return `/data/storage/petal/${name}`;
+}
+
+function getSiyuanDataDir() {
+    return String(window.siyuan?.config?.system?.dataDir || "").replace(/[/\\]+$/, "");
+}
+
+function joinLocalPath(...segments) {
+    const isWin = String(window.siyuan?.config?.system?.os || "").toLowerCase() === "windows";
+    const sep = isWin ? "\\" : "/";
+    return segments
+        .map((part) => String(part || "").trim())
+        .filter(Boolean)
+        .map((part, index) => {
+            const normalized = part.replace(/[/\\]+/g, sep);
+            if (index === 0) {
+                return normalized.replace(/[/\\]+$/, "");
+            }
+            return normalized.replace(/^[/\\]+|[/\\]+$/g, "");
+        })
+        .join(sep);
+}
+
+function getConfigFileAbsDir(plugin) {
+    return joinLocalPath(getSiyuanDataDir(), "storage", "petal", plugin?.name || "fhelper");
+}
+
+function getConfigSyncAbsDir(plugin) {
+    return joinLocalPath(getSiyuanDataDir(), "storage", "petal", plugin?.name || "fhelper", CONFIG_SYNC_DIR_NAME);
+}
+
+function getConfigSyncPathDisplay(plugin) {
+    return `data/storage/petal/${plugin?.name || "fhelper"}/${CONFIG_SYNC_DIR_NAME}`;
+}
+
+async function openLocalFolder(absPath, plugin) {
+    if (!absPath || !(/^[a-zA-Z]:[\\/]/.test(absPath) || absPath.startsWith("/") || absPath.startsWith("\\\\"))) {
+        showMessage(plugin?.i18n?.openFolderFailed || "无法打开文件夹");
+        return;
+    }
+    try {
+        const { ipcRenderer } = require("electron");
+        ipcRenderer.send((Constants && Constants.SIYUAN_CMD) || "siyuan-cmd", {
+            cmd: "openPath",
+            filePath: absPath,
+        });
+        return;
+    } catch (error) {
+        // Browser / mobile: no Electron IPC.
+    }
+    try {
+        const { shell } = require("electron");
+        if (shell && typeof shell.openPath === "function") {
+            const err = await shell.openPath(absPath);
+            if (err) {
+                throw new Error(err);
+            }
+            return;
+        }
+    } catch (error) {
+        console.warn(`${LOG_PREFIX} openLocalFolder failed`, error);
+    }
+    showMessage(plugin?.i18n?.openFolderFailed || "无法打开文件夹");
 }
 
 async function apiReadDir(path) {
@@ -519,9 +831,6 @@ async function importThemesFromPetal(plugin) {
 }
 
 async function pushConfigSync(plugin, options = {}) {
-    if (!isConfigSyncActive()) {
-        return { skipped: true, reason: "mobile" };
-    }
     if (plugin.configSyncBusy) {
         return { skipped: true, reason: "busy" };
     }
@@ -570,14 +879,22 @@ async function pushConfigSync(plugin, options = {}) {
 }
 
 async function pullConfigSync(plugin, options = {}) {
-    if (!isConfigSyncActive()) {
-        return { skipped: true, reason: "mobile" };
-    }
     if (plugin.configSyncBusy) {
         return { skipped: true, reason: "busy" };
     }
     plugin.configSyncBusy = true;
     try {
+        if (options.notify) {
+            showMessage(plugin.i18n.configSyncSyncing || "正在同步…", 0);
+        }
+        const syncResult = await triggerAndWaitSiyuanSync(plugin);
+        if (!syncResult.ok) {
+            if (options.notify) {
+                notifyConfigSyncSyncResult(plugin, syncResult);
+            }
+            return { skipped: true, reason: `sync-${syncResult.reason}` };
+        }
+        await sleepMs(CONFIG_SYNC_AFTER_SYNC_MS);
         const manifest = await loadConfigSyncManifest(plugin);
         if (!manifest) {
             if (options.notify) {
@@ -590,6 +907,9 @@ async function pullConfigSync(plugin, options = {}) {
         const needConf = manifest.conf?.hash && (options.force || manifest.conf.hash !== localConfHash);
         const needThemes = manifest.themes?.hash && (options.force || manifest.themes.hash !== localThemesHash);
         if (!needConf && !needThemes) {
+            if (options.notify) {
+                showMessage(plugin.i18n.configSyncUpToDate || "缓存已是最新，无需更新");
+            }
             return { skipped: true, reason: "up-to-date" };
         }
         if (needConf) {
@@ -609,8 +929,11 @@ async function pullConfigSync(plugin, options = {}) {
 
 function promptConfigSyncRestart(plugin) {
     const title = plugin?.i18n?.configSyncRestartTitle || "缓存已写入配置";
-    const text = plugin?.i18n?.configSyncRestartDesc
-        || "配置与主题已从缓存写入。点击确定后将自动重启思源以生效。重启后主题可能不会自动切换为同步的主题。";
+    const text = isMobileFrontend()
+        ? (plugin?.i18n?.configSyncRestartDescMobile
+            || "配置与主题已从缓存写入。点击确定后将刷新界面。若部分设置未生效，请完全退出后重新打开思源。请在设置中手动选择主题。")
+        : (plugin?.i18n?.configSyncRestartDesc
+            || "配置与主题已从缓存写入。点击确定后将自动重启思源以生效。重启后请在设置中手动选择主题。");
     if (typeof confirm === "function") {
         confirm(title, text, () => {
             restartSiYuanApp();
@@ -624,11 +947,21 @@ function promptConfigSyncRestart(plugin) {
 }
 
 /**
- * Restart desktop SiYuan: schedule relaunch, then use official exitSiYuan()
- * so kernel flush / sync / layout save still run. Do NOT call app.exit()
- * directly — that skips SiYuan's shutdown prep.
+ * Desktop: schedule Electron relaunch, then official exitSiYuan() so kernel
+ * flush / sync / layout save still run. Do NOT call app.exit() directly.
+ * Mobile has no relaunch; exitSiYuan would quit without reopening, so reload UI.
  */
 async function restartSiYuanApp() {
+    if (isMobileFrontend()) {
+        try {
+            await fetchSyncPost("/api/ui/reloadUI", {});
+        } catch (error) {
+            console.warn(`${LOG_PREFIX} mobile reloadUI failed`, error);
+            window.location.reload();
+        }
+        return;
+    }
+
     let relaunchScheduled = false;
     try {
         // Schedule relaunch first; it does not quit by itself.
@@ -4820,7 +5153,6 @@ function createDefaultConfig() {
         panguSpacing: createDefaultPanguSpacingConfig(),
         docRefStyle: createDefaultDocRefStyleConfig(),
         childDocWidget: createDefaultChildDocWidgetConfig(),
-        fileTree: createDefaultFileTreeConfig(),
         configSync: createDefaultConfigSyncConfig(),
     };
 }
@@ -4959,7 +5291,6 @@ module.exports = class FhelperPlugin extends Plugin {
     panguSpacingEnableEl = null;
     docRefStyleEnableEl = null;
     childDocWidgetEnableEl = null;
-    fileTreeHideNewSubDocEl = null;
     protyleLayoutWatchers = new Map();
     panguSpacingWatchers = new Map();
     docRefByDoc = new Map();
@@ -5001,8 +5332,13 @@ module.exports = class FhelperPlugin extends Plugin {
         this.data[STORAGE_NAME] = createDefaultConfig();
         this.config = this.data[STORAGE_NAME];
         activeFhelperPlugin = this;
-        syncFileTreeFeature(this);
+        removeLegacyFileTreeHideCss();
         registerNewChildDocNavRefSlash(this);
+        this.addIcons(`
+<symbol id="iconFhelper" viewBox="0 0 24 24">
+  <path fill="currentColor" d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"></path>
+</symbol>
+`);
 
         this.addCommand({
             langKey: "openFhelperSetting",
@@ -5128,7 +5464,7 @@ module.exports = class FhelperPlugin extends Plugin {
         this.scheduleBazaarSettingButtonFix();
         syncDocRefStyleFeature(this);
         patchDocActionBreadcrumbButtons(this);
-        syncFileTreeFeature(this);
+        removeLegacyFileTreeHideCss();
         syncAllChildNavPanels(this);
         // Import is manual only; watchers only push on theme change / settings close.
         if (isConfigSyncActive()) {
@@ -5175,7 +5511,7 @@ module.exports = class FhelperPlugin extends Plugin {
             this.eventBus.off("ws-main", this.docRefWsHandler);
             this.docRefWsHandler = null;
         }
-        setFileTreeHideNewSubDocCssEnabled(false);
+        removeLegacyFileTreeHideCss();
         if (this.childNavWsTimer) {
             window.clearTimeout(this.childNavWsTimer);
             this.childNavWsTimer = null;
@@ -5267,10 +5603,6 @@ module.exports = class FhelperPlugin extends Plugin {
                     ...(data.childDocWidget || {}),
                     mode: normalizeChildNavMode(data.childDocWidget?.mode),
                 },
-                fileTree: {
-                    ...createDefaultFileTreeConfig(),
-                    ...(data.fileTree || {}),
-                },
                 configSync: createDefaultConfigSyncConfig(),
             };
             this.data[STORAGE_NAME] = this.config;
@@ -5282,7 +5614,7 @@ module.exports = class FhelperPlugin extends Plugin {
             }
             syncAllChildNavPanels(this);
             patchDocActionBreadcrumbButtons(this);
-            syncFileTreeFeature(this);
+            removeLegacyFileTreeHideCss();
             if (isConfigSyncActive()) {
                 installConfigSyncWatchers(this);
             } else {
@@ -5304,7 +5636,6 @@ module.exports = class FhelperPlugin extends Plugin {
                     || data.panguSpacing
                     || data.docRefStyle
                     || data.childDocWidget
-                    || data.fileTree
                     || data.configSync);
             if (hasNewConfig) {
                 this.applyConfig(data);
@@ -5342,6 +5673,27 @@ module.exports = class FhelperPlugin extends Plugin {
         return `data/storage/petal/${this.name}/${STORAGE_NAME}`;
     }
 
+    createOpenFolderButton(resolveAbsPath, ensureKernelDir) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "b3-button b3-button--outline";
+        btn.textContent = this.i18n.openFolder || "打开文件夹";
+        btn.addEventListener("click", () => {
+            const run = async () => {
+                if (ensureKernelDir) {
+                    await apiEnsureDir(ensureKernelDir);
+                }
+                const absPath = typeof resolveAbsPath === "function" ? resolveAbsPath() : resolveAbsPath;
+                await openLocalFolder(absPath, this);
+            };
+            run().catch((error) => {
+                console.warn(`${LOG_PREFIX} open folder failed`, error);
+                showMessage(this.i18n.openFolderFailed || "无法打开文件夹");
+            });
+        });
+        return btn;
+    }
+
     isSlashItemEnabled(key) {
         return this.config?.disabled?.[key] !== true;
     }
@@ -5361,7 +5713,6 @@ module.exports = class FhelperPlugin extends Plugin {
             panguSpacing: { ...(this.config.panguSpacing || createDefaultPanguSpacingConfig()) },
             docRefStyle: { ...(this.config.docRefStyle || createDefaultDocRefStyleConfig()) },
             childDocWidget: { ...(this.config.childDocWidget || createDefaultChildDocWidgetConfig()) },
-            fileTree: { ...(this.config.fileTree || createDefaultFileTreeConfig()) },
             configSync: { ...(this.config.configSync || createDefaultConfigSyncConfig()) },
         };
         this.settingToggleEls.forEach((input) => {
@@ -5374,7 +5725,7 @@ module.exports = class FhelperPlugin extends Plugin {
             return;
         }
         this.topBarEntry = this.addTopBar({
-            icon: "iconSettings",
+            icon: "iconFhelper",
             title: this.i18n.topBarTitle,
             position: "right",
             callback: () => {
@@ -5443,12 +5794,7 @@ module.exports = class FhelperPlugin extends Plugin {
                 mode: "direct",
             };
         }
-        if (this.fileTreeHideNewSubDocEl) {
-            this.config.fileTree = {
-                ...(this.config.fileTree || createDefaultFileTreeConfig()),
-                hideNewSubDoc: this.fileTreeHideNewSubDocEl.checked,
-            };
-        }
+        delete this.config.fileTree;
         // Config/theme cache is always on (desktop); persist defaults for older configs.
         this.config.configSync = createDefaultConfigSyncConfig();
     }
@@ -5468,7 +5814,7 @@ module.exports = class FhelperPlugin extends Plugin {
         scheduleLayoutRefresh(this);
         syncAllChildNavPanels(this);
         patchDocActionBreadcrumbButtons(this);
-        syncFileTreeFeature(this);
+        removeLegacyFileTreeHideCss();
         if (isConfigSyncActive()) {
             installConfigSyncWatchers(this);
         } else {
@@ -5551,14 +5897,31 @@ module.exports = class FhelperPlugin extends Plugin {
             description: this.i18n.docRefStyleEnableDesc,
             control: this.docRefStyleEnableEl,
         }));
-        const fileTree = this.config.fileTree || createDefaultFileTreeConfig();
-        this.fileTreeHideNewSubDocEl = this.createSettingSwitch(fileTree.hideNewSubDoc !== false);
-        childNavSection.appendChild(this.createSettingRow({
-            title: this.i18n.fileTreeHideNewSubDoc,
-            description: this.i18n.fileTreeHideNewSubDocDesc,
-            control: this.fileTreeHideNewSubDocEl,
-        }));
         panel.appendChild(childNavSection);
+
+        const defaultIconSection = this.createSettingSection(
+            this.i18n.sectionDefaultIcons,
+            this.i18n.sectionDefaultIconsDesc,
+        );
+        defaultIconSection.appendChild(createDefaultIconRow(
+            this,
+            "note",
+            this.i18n.defaultIconNotebook,
+            this.i18n.defaultIconNotebookDesc,
+        ));
+        defaultIconSection.appendChild(createDefaultIconRow(
+            this,
+            "folder",
+            this.i18n.defaultIconFolder,
+            this.i18n.defaultIconFolderDesc,
+        ));
+        defaultIconSection.appendChild(createDefaultIconRow(
+            this,
+            "file",
+            this.i18n.defaultIconFile,
+            this.i18n.defaultIconFileDesc,
+        ));
+        panel.appendChild(defaultIconSection);
 
         const imageSection = this.createSettingSection(this.i18n.sectionImage);
         this.imageScaleEnableEl = this.createSettingSwitch(imageScale.enabled === true, !dpiAvailable);
@@ -5587,9 +5950,7 @@ module.exports = class FhelperPlugin extends Plugin {
 
         const configSyncSection = this.createSettingSection(
             this.i18n.sectionConfigSync,
-            isMobileFrontend()
-                ? (this.i18n.configSyncMobileDisabledDesc || this.i18n.sectionConfigSyncDesc)
-                : this.i18n.sectionConfigSyncDesc,
+            this.i18n.sectionConfigSyncDesc,
         );
         const syncActions = document.createElement("div");
         syncActions.className = "fhelper-setting__toolbar";
@@ -5597,30 +5958,32 @@ module.exports = class FhelperPlugin extends Plugin {
         pushBtn.type = "button";
         pushBtn.className = "b3-button b3-button--outline";
         pushBtn.textContent = this.i18n.configSyncPushNow;
-        pushBtn.disabled = isMobileFrontend();
-        pushBtn.addEventListener("click", () => {
-            if (isMobileFrontend()) {
-                return;
-            }
-            this.syncSettingFormToConfig();
-            pushConfigSync(this, { force: true, notify: true }).catch((error) => {
-                console.warn(`${LOG_PREFIX} manual pushConfigSync failed`, error);
-                showMessage(this.i18n.configSyncFailed);
-            });
-        });
         const pullBtn = document.createElement("button");
         pullBtn.type = "button";
         pullBtn.className = "b3-button b3-button--outline";
         pullBtn.textContent = this.i18n.configSyncPullNow;
-        pullBtn.disabled = isMobileFrontend();
-        pullBtn.addEventListener("click", () => {
-            if (isMobileFrontend()) {
-                return;
-            }
+        const setSyncButtonsBusy = (busy) => {
+            pushBtn.disabled = busy;
+            pullBtn.disabled = busy;
+        };
+        pushBtn.addEventListener("click", () => {
             this.syncSettingFormToConfig();
+            setSyncButtonsBusy(true);
+            pushConfigSync(this, { force: true, notify: true }).catch((error) => {
+                console.warn(`${LOG_PREFIX} manual pushConfigSync failed`, error);
+                showMessage(this.i18n.configSyncFailed);
+            }).finally(() => {
+                setSyncButtonsBusy(false);
+            });
+        });
+        pullBtn.addEventListener("click", () => {
+            this.syncSettingFormToConfig();
+            setSyncButtonsBusy(true);
             pullConfigSync(this, { force: true, notify: true }).catch((error) => {
                 console.warn(`${LOG_PREFIX} manual pullConfigSync failed`, error);
                 showMessage(this.i18n.configSyncFailed);
+            }).finally(() => {
+                setSyncButtonsBusy(false);
             });
         });
         syncActions.appendChild(pushBtn);
@@ -5635,6 +5998,18 @@ module.exports = class FhelperPlugin extends Plugin {
         aboutSection.appendChild(this.createSettingRow({
             title: this.i18n.configPathLabel,
             description: this.getStoragePathDisplay(),
+            control: this.createOpenFolderButton(
+                () => getConfigFileAbsDir(this),
+                getPluginPetalRoot(this),
+            ),
+        }));
+        aboutSection.appendChild(this.createSettingRow({
+            title: this.i18n.cachePathLabel,
+            description: getConfigSyncPathDisplay(this),
+            control: this.createOpenFolderButton(
+                () => getConfigSyncAbsDir(this),
+                getConfigSyncRoot(this),
+            ),
         }));
         panel.appendChild(aboutSection);
 
@@ -5811,12 +6186,12 @@ module.exports = class FhelperPlugin extends Plugin {
     flex: 1;
     min-height: 0;
     overflow: auto;
-    padding: 12px 16px 8px;
+    padding: 16px 16px 12px;
 }
 .fhelper-setting__panel {
     display: flex;
     flex-direction: column;
-    gap: 16px;
+    gap: 28px;
 }
 .fhelper-setting__section,
 .fhelper-setting__group {
@@ -5876,6 +6251,31 @@ module.exports = class FhelperPlugin extends Plugin {
 .fhelper-setting__action {
     flex-shrink: 0;
 }
+.fhelper-setting__icon-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.fhelper-setting__icon-pick {
+    width: 32px;
+    height: 32px;
+    padding: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 20px;
+    line-height: 1;
+    border: 1px solid var(--b3-border-color);
+    border-radius: 6px;
+    background: var(--b3-theme-background);
+    color: var(--b3-theme-on-background);
+    cursor: pointer;
+}
+.fhelper-setting__icon-pick img {
+    width: 20px;
+    height: 20px;
+    object-fit: contain;
+}
 .fhelper-setting__toolbar {
     display: flex;
     gap: 10px;
@@ -5899,7 +6299,7 @@ module.exports = class FhelperPlugin extends Plugin {
 .fhelper-setting__list {
     display: flex;
     flex-direction: column;
-    gap: 12px;
+    gap: 20px;
 }
 .fhelper-setting__empty {
     padding: 28px 12px;
