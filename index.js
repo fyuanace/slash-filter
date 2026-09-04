@@ -116,6 +116,33 @@ const DEFAULT_LOCAL_IMAGES = {
     note: "1f5c3",
 };
 
+const FILE_TREE_SVG_ICON_IDS = {
+    notebook: "iconNotebook",
+    folder: "iconFileText",
+    file: "iconFile",
+};
+
+function isSiyuanSvgDefaultIconEnabled() {
+    return window.siyuan?.config?.fileTree?.useSVGDefaultIcon === true;
+}
+
+function getSiyuanIconMaskImage(symbolId) {
+    const symbol = document.getElementById(symbolId);
+    if (!symbol) {
+        return "";
+    }
+    const viewBox = symbol.getAttribute("viewBox") || "0 0 32 32";
+    const dims = String(viewBox).split(/[\s,]+/).map(Number);
+    const vbSize = dims[2] || 32;
+    const strokeW = Math.max(vbSize / 18, 1.25);
+    const inner = String(symbol.innerHTML)
+        .replace(/\sfill="[^"]*"/gi, "")
+        .replace(/\sstroke="[^"]*"/gi, "")
+        .replace(/\sstroke-width="[^"]*"/gi, "");
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${viewBox}" fill="none" stroke="#000" stroke-width="${strokeW}" stroke-linejoin="round" stroke-linecap="round">${inner}</svg>`;
+    return `url("data:image/svg+xml,${encodeURIComponent(svg)}")`;
+}
+
 function getSiyuanAppId() {
     return (typeof Constants !== "undefined" && Constants.SIYUAN_APPID) || "";
 }
@@ -228,10 +255,20 @@ function createDefaultIconRow(plugin, key, title, description) {
     pickBtn.type = "button";
     pickBtn.className = "fhelper-setting__icon-pick";
     pickBtn.setAttribute("aria-label", title);
+    const svgLocked = isSiyuanSvgDefaultIconEnabled();
     paintDefaultIconButton(pickBtn, getLocalImages()[key]);
+    if (svgLocked) {
+        pickBtn.disabled = true;
+        pickBtn.style.opacity = "0.45";
+        pickBtn.style.cursor = "not-allowed";
+    }
     pickBtn.addEventListener("click", (event) => {
         event.preventDefault();
         event.stopPropagation();
+        if (isSiyuanSvgDefaultIconEnabled()) {
+            showMessage(plugin.i18n.defaultIconSvgActiveHint || "思源正在使用 SVG 默认图标，请先在「设置 → 文档树」关闭该项");
+            return;
+        }
         openDefaultIconPicker(pickBtn, pickBtn.dataset.unicode, (unicode) => {
             const value = unicode || DEFAULT_LOCAL_IMAGES[key];
             persistLocalImages({ [key]: value }).then((images) => {
@@ -245,8 +282,15 @@ function createDefaultIconRow(plugin, key, title, description) {
     restoreBtn.type = "button";
     restoreBtn.className = "b3-button b3-button--outline";
     restoreBtn.textContent = plugin.i18n.defaultIconRestore;
+    if (svgLocked) {
+        restoreBtn.disabled = true;
+    }
     restoreBtn.addEventListener("click", (event) => {
         event.preventDefault();
+        if (isSiyuanSvgDefaultIconEnabled()) {
+            showMessage(plugin.i18n.defaultIconSvgActiveHint || "思源正在使用 SVG 默认图标，请先在「设置 → 文档树」关闭该项");
+            return;
+        }
         persistLocalImages({ [key]: DEFAULT_LOCAL_IMAGES[key] }).then((images) => {
             paintDefaultIconButton(pickBtn, images[key]);
         }).catch((error) => {
@@ -1119,7 +1163,13 @@ function defaultDocFileGlyph() {
 function resolveDocIconDisplay(icon) {
     const raw = String(icon || "").trim();
     if (!raw) {
+        if (isSiyuanSvgDefaultIconEnabled()) {
+            return { kind: "svg", value: FILE_TREE_SVG_ICON_IDS.file };
+        }
         return { kind: "emoji", value: defaultDocFileGlyph() };
+    }
+    if (raw.startsWith("api/") || raw.startsWith("/api/")) {
+        return { kind: "img", value: raw.startsWith("/") ? raw : `/${raw}` };
     }
     if (raw.includes("/") || raw.includes(".") || raw.startsWith("http") || raw.startsWith("data:")) {
         const src = raw.startsWith("http") || raw.startsWith("data:") || raw.startsWith("/")
@@ -1149,6 +1199,53 @@ function parseSqlQueryRows(response) {
 
 function createBrokenDocRefMeta() {
     return { exists: false, isDoc: false, icon: "" };
+}
+
+function officialFileTreeItem(id) {
+    if (!id) {
+        return null;
+    }
+    return document.querySelector(`#layouts .sy__file ul[data-url] .b3-list-item[data-node-id="${id}"]`);
+}
+
+function metaFromFileTree(id) {
+    const li = officialFileTreeItem(id);
+    if (!li) {
+        return null;
+    }
+    const wrap = li.querySelector(":scope > .b3-list-item__icon");
+    const img = wrap?.querySelector("img");
+    const src = img?.getAttribute("src") || "";
+    if (src.includes("/emojis/")) {
+        return { exists: true, isDoc: true, icon: src.split("/emojis/")[1].split("?")[0] };
+    }
+    if (src.includes("api/icon")) {
+        return {
+            exists: true,
+            isDoc: true,
+            icon: src.replace(/^https?:\/\/[^/]+/, "").replace(/^\//, ""),
+        };
+    }
+    if (wrap?.querySelector("use")) {
+        return { exists: true, isDoc: true, icon: "" };
+    }
+    const emoji = wrap?.textContent?.trim() || "";
+    return { exists: true, isDoc: true, icon: emoji };
+}
+
+async function queryDocIconViaApi(id) {
+    try {
+        const res = await fetchSyncPost("/api/block/getBlockInfo", { id });
+        if (res?.code === 0 && res.data?.rootID === id) {
+            return { exists: true, isDoc: true, icon: res.data.rootIcon || "" };
+        }
+        if (res?.code === 0) {
+            return { exists: true, isDoc: false, icon: "" };
+        }
+    } catch (error) {
+        console.warn(`${LOG_PREFIX} queryDocIconViaApi failed`, error);
+    }
+    return metaFromFileTree(id) || createBrokenDocRefMeta();
 }
 
 function escapeSqlId(id) {
@@ -2077,7 +2174,12 @@ function scheduleDocRefWsUpdate(plugin, event) {
 }
 
 function handleDocRefWsMain(plugin, event) {
+    const detail = event.detail ?? event;
     scheduleChildNavWsRefresh(plugin, event);
+    const iconIds = collectChildNavUpdatedIconIds(detail);
+    if (iconIds.length) {
+        onChildNavDocIconsChanged(iconIds, { forceApi: true });
+    }
 }
 
 function handleProtyleDocRefStaticLoad(plugin, event) {
@@ -2271,6 +2373,14 @@ const CHILD_NAV_SYNC_DEBOUNCE_MS = 200;
 const childNavSyncingDocs = new Set();
 let childNavIconRefreshTimer = 0;
 let childNavIconRefreshSeq = 0;
+let childNavSvgRetryCount = 0;
+const CHILD_NAV_SVG_RETRY_MAX = 8;
+const childNavForceIconIds = new Set();
+let childNavDocIconWatchObs = null;
+let childNavDocIconWatchRaf = 0;
+let childNavDocIconWatchRetry = 0;
+let childNavDocIconWatchTries = 0;
+const childNavDocIconWatchIds = new Set();
 
 function cssQuotedContent(value) {
     return `"${String(value).replace(/\\/g, "\\\\").replace(/"/g, "\\\"")}"`;
@@ -2280,10 +2390,14 @@ function escCssIdent(id) {
     return window.CSS?.escape ? CSS.escape(String(id)) : String(id).replace(/[^a-zA-Z0-9_-]/g, "\\$&");
 }
 
+function childNavHtmlSel() {
+    return `html.${CHILD_NAV_HTML_CLASS}.${CHILD_NAV_HTML_CLASS}`;
+}
+
 function childNavRefScope(inner) {
     return [
-        `html.${CHILD_NAV_HTML_CLASS} .b3-typography [${CHILD_NAV_FLAG_ATTR}="1"] ${inner}`,
-        `html.${CHILD_NAV_HTML_CLASS} .protyle-wysiwyg [data-node-id][${CHILD_NAV_FLAG_ATTR}="1"] ${inner}`,
+        `${childNavHtmlSel()} .b3-typography [${CHILD_NAV_FLAG_ATTR}="1"] ${inner}`,
+        `${childNavHtmlSel()} .protyle-wysiwyg [data-node-id][${CHILD_NAV_FLAG_ATTR}="1"] ${inner}`,
     ].join(",\n");
 }
 
@@ -2291,66 +2405,270 @@ function childNavRefIdSels(ids, pseudo = "") {
     return (ids || []).flatMap((id) => {
         const escaped = escCssIdent(id);
         return [
-            `html.${CHILD_NAV_HTML_CLASS} .b3-typography [${CHILD_NAV_FLAG_ATTR}="1"] span[data-type~="block-ref"][data-id="${escaped}"]${pseudo}`,
-            `html.${CHILD_NAV_HTML_CLASS} .protyle-wysiwyg [data-node-id][${CHILD_NAV_FLAG_ATTR}="1"] span[data-type~="block-ref"][data-id="${escaped}"]${pseudo}`,
+            `${childNavHtmlSel()} .b3-typography [${CHILD_NAV_FLAG_ATTR}="1"] span[data-type~="block-ref"][data-id="${escaped}"]${pseudo}`,
+            `${childNavHtmlSel()} .protyle-wysiwyg [data-node-id][${CHILD_NAV_FLAG_ATTR}="1"] span[data-type~="block-ref"][data-id="${escaped}"]${pseudo}`,
         ];
     }).join(",\n");
 }
 
-function buildChildNavBaseCss() {
-    const glyph = cssQuotedContent(defaultDocFileGlyph());
-    const span = "span[data-type~=\"block-ref\"][data-id]";
+function childNavBeforeBoxCss() {
     return `
-${childNavRefScope(span)} {
-    position: relative;
-    padding-left: 1.28em;
-    padding-bottom: 0.14em;
-    font-weight: 700;
-    color: var(--b3-theme-on-background);
-    text-decoration: none;
-    border-bottom: none;
-    background-image: linear-gradient(var(--b3-border-color), var(--b3-border-color));
-    background-repeat: no-repeat;
-    background-size: 100% 1px;
-    background-position: 0 100%;
-    background-origin: content-box;
-    background-clip: content-box;
-    box-decoration-break: clone;
-    -webkit-box-decoration-break: clone;
-    transition: none;
-}
-${childNavRefScope(`${span}::before`)} {
-    content: ${glyph};
     position: absolute;
     left: 0;
     top: 50%;
     transform: translateY(-50%);
-    display: block;
-    width: 1.05em;
+    display: block !important;
+    width: 1.05em !important;
+    height: 1.05em !important;
     margin: 0;
     pointer-events: none;
-    background-image: none;
     font-weight: 400;
-    font-family: var(--b3-font-family-emoji);
     line-height: 1;
     text-align: center;
-    speak: never;
+    speak: never;`;
+}
+
+function childNavEmojiBeforeCss(glyph) {
+    return `
+    content: ${cssQuotedContent(glyph)} !important;
+    font-family: var(--b3-font-family-emoji);
+    background: none !important;
+    background-color: transparent !important;
+    -webkit-mask: none !important;
+    mask: none !important;
+${childNavBeforeBoxCss()}`;
+}
+
+function childNavSvgBeforeCss(uri) {
+    return `
+    content: "" !important;
+    background-color: currentColor !important;
+    background-image: none !important;
+    -webkit-mask: ${uri} center / contain no-repeat !important;
+    mask: ${uri} center / contain no-repeat !important;
+    -webkit-mask-mode: alpha;
+    mask-mode: alpha;
+${childNavBeforeBoxCss()}`;
+}
+
+function buildChildNavDefaultBeforeCss(span) {
+    return `
+${childNavRefScope(`${span}::before`)} {
+    content: "" !important;
+    background: none !important;
+    background-color: transparent !important;
+    -webkit-mask: none !important;
+    mask: none !important;
+${childNavBeforeBoxCss()}
 }
 `;
 }
 
-function setChildNavIconCss(cssText) {
-    let styleEl = document.getElementById(CHILD_NAV_ICON_STYLE_ID);
+function buildChildNavBaseCss() {
+    const span = "span[data-type~=\"block-ref\"][data-id]";
+    return `
+${childNavRefScope(span)} {
+    position: relative;
+    padding-left: 1.28em !important;
+    padding-bottom: 0.14em !important;
+    font-weight: 700 !important;
+    color: var(--b3-theme-on-background) !important;
+    text-decoration: none !important;
+    border-bottom: none !important;
+    background-image: linear-gradient(var(--b3-border-color), var(--b3-border-color)) !important;
+    background-repeat: no-repeat !important;
+    background-size: 100% 1px !important;
+    background-position: 0 100% !important;
+    background-origin: content-box !important;
+    background-clip: content-box !important;
+    box-decoration-break: clone;
+    -webkit-box-decoration-break: clone;
+    transition: none;
+}
+${buildChildNavDefaultBeforeCss(span)}
+`;
+}
+
+function upsertHeadStyle(id, cssText) {
+    let styleEl = document.getElementById(id);
     if (!cssText) {
         styleEl?.remove();
-        return;
+        return null;
     }
     if (!styleEl) {
         styleEl = document.createElement("style");
-        styleEl.id = CHILD_NAV_ICON_STYLE_ID;
-        document.head.appendChild(styleEl);
+        styleEl.id = id;
     }
     styleEl.textContent = cssText;
+    document.head.appendChild(styleEl);
+    return styleEl;
+}
+
+function setChildNavIconCss(cssText) {
+    upsertHeadStyle(CHILD_NAV_ICON_STYLE_ID, cssText);
+}
+
+function collectChildNavUpdatedIconIds(msg) {
+    const ids = [];
+    const visitOp = (op) => {
+        if (!op || op.action !== "updateAttrs") {
+            return;
+        }
+        const data = op.data && typeof op.data === "object" ? op.data : {};
+        const next = data.new && typeof data.new === "object" ? data.new : data;
+        const prev = data.old && typeof data.old === "object" ? data.old : {};
+        if (!Object.prototype.hasOwnProperty.call(next, "icon")
+            && !Object.prototype.hasOwnProperty.call(prev, "icon")) {
+            return;
+        }
+        if (String(next.icon || "") === String(prev.icon || "") && "icon" in next && "icon" in prev) {
+            return;
+        }
+        if (op.id) {
+            ids.push(op.id);
+        }
+    };
+    if (!msg || typeof msg !== "object") {
+        return ids;
+    }
+    if (msg.cmd === "transactions" && Array.isArray(msg.data)) {
+        msg.data.forEach((tx) => {
+            (tx?.doOperations || []).forEach(visitOp);
+        });
+    }
+    if ((msg.cmd === "setBlockAttrs" || msg.cmd === "updateAttrs") && msg.data) {
+        const attrs = msg.data.attrs || msg.data.new || msg.data;
+        if (attrs && typeof attrs === "object" && Object.prototype.hasOwnProperty.call(attrs, "icon") && msg.data.id) {
+            ids.push(msg.data.id);
+        }
+        visitOp(msg.data);
+    }
+    return ids;
+}
+
+function onChildNavDocIconsChanged(ids, opts) {
+    const unique = [...new Set((ids || []).filter(Boolean))];
+    if (!unique.length) {
+        return;
+    }
+    const shown = new Set(collectChildNavRefTargetIds());
+    const hit = unique.filter((id) => shown.has(id));
+    if (!hit.length) {
+        return;
+    }
+    if (opts?.forceApi) {
+        hit.forEach((id) => childNavForceIconIds.add(id));
+    }
+    scheduleRefreshChildNavRefIcons();
+}
+
+function flushChildNavDocIconWatch() {
+    childNavDocIconWatchRaf = 0;
+    const ids = [...childNavDocIconWatchIds];
+    childNavDocIconWatchIds.clear();
+    onChildNavDocIconsChanged(ids);
+}
+
+function queueChildNavDocIconId(id) {
+    if (!id) {
+        return;
+    }
+    childNavDocIconWatchIds.add(id);
+    if (!childNavDocIconWatchRaf) {
+        childNavDocIconWatchRaf = window.requestAnimationFrame(flushChildNavDocIconWatch);
+    }
+}
+
+function startChildNavDocIconWatch() {
+    if (childNavDocIconWatchObs) {
+        return;
+    }
+    const host = document.querySelector("#layouts .sy__file");
+    if (!host) {
+        if (childNavDocIconWatchTries >= 40) {
+            return;
+        }
+        if (!childNavDocIconWatchRetry) {
+            childNavDocIconWatchTries += 1;
+            childNavDocIconWatchRetry = window.setTimeout(() => {
+                childNavDocIconWatchRetry = 0;
+                startChildNavDocIconWatch();
+            }, 400);
+        }
+        return;
+    }
+    childNavDocIconWatchTries = 0;
+    if (childNavDocIconWatchRetry) {
+        window.clearTimeout(childNavDocIconWatchRetry);
+        childNavDocIconWatchRetry = 0;
+    }
+    childNavDocIconWatchObs = new MutationObserver((mutations) => {
+        for (const m of mutations) {
+            const el = m.target instanceof Element ? m.target : m.target.parentElement;
+            const li = el?.closest?.("#layouts .sy__file ul[data-url] .b3-list-item[data-node-id]");
+            if (!li) {
+                continue;
+            }
+            if (m.type === "attributes" && m.attributeName === "data-default-icon") {
+                queueChildNavDocIconId(li.getAttribute("data-node-id"));
+                continue;
+            }
+            if (el?.closest?.(".b3-list-item__icon")) {
+                queueChildNavDocIconId(li.getAttribute("data-node-id"));
+            }
+        }
+    });
+    childNavDocIconWatchObs.observe(host, {
+        subtree: true,
+        childList: true,
+        characterData: true,
+        attributes: true,
+        attributeFilter: ["data-default-icon", "src", "href", "xlink:href"],
+    });
+}
+
+function stopChildNavDocIconWatch() {
+    childNavDocIconWatchObs?.disconnect();
+    childNavDocIconWatchObs = null;
+    if (childNavDocIconWatchRetry) {
+        window.clearTimeout(childNavDocIconWatchRetry);
+        childNavDocIconWatchRetry = 0;
+    }
+    childNavDocIconWatchTries = 0;
+    if (childNavDocIconWatchRaf) {
+        window.cancelAnimationFrame(childNavDocIconWatchRaf);
+        childNavDocIconWatchRaf = 0;
+    }
+    childNavDocIconWatchIds.clear();
+    childNavForceIconIds.clear();
+}
+
+async function queryChildNavIconMetas(ids) {
+    const unique = [...new Set((ids || []).filter(Boolean))];
+    const result = new Map();
+    const needApi = [];
+    const needSql = [];
+    unique.forEach((id) => {
+        if (childNavForceIconIds.has(id)) {
+            needApi.push(id);
+            return;
+        }
+        const tree = metaFromFileTree(id);
+        if (tree) {
+            result.set(id, tree);
+            return;
+        }
+        needSql.push(id);
+    });
+    if (needApi.length) {
+        const apiRows = await Promise.all(needApi.map(async (id) => [id, await queryDocIconViaApi(id)]));
+        apiRows.forEach(([id, meta]) => result.set(id, meta));
+    }
+    if (needSql.length) {
+        const sqlRows = await queryBlockMetaByIds(needSql);
+        sqlRows.forEach((meta, id) => result.set(id, meta));
+    }
+    return { metas: result, usedForce: needApi };
 }
 
 function collectChildNavRefTargetIds() {
@@ -2367,11 +2685,18 @@ function collectChildNavRefTargetIds() {
 function renderChildNavIconSheet(metasById) {
     const icons = new Map();
     const imgs = new Map();
+    const svgs = new Map();
     (metasById || new Map()).forEach((meta, id) => {
         if (!id || !meta?.exists || !meta.isDoc) {
             return;
         }
         const display = resolveDocIconDisplay(meta.icon);
+        if (display.kind === "svg") {
+            const list = svgs.get(display.value) || [];
+            list.push(id);
+            svgs.set(display.value, list);
+            return;
+        }
         if (display.kind === "img") {
             const list = imgs.get(display.value) || [];
             list.push(id);
@@ -2385,23 +2710,37 @@ function renderChildNavIconSheet(metasById) {
     });
     const parts = [];
     for (const [glyph, ids] of icons) {
-        if (glyph === defaultDocFileGlyph()) {
-            continue;
-        }
         parts.push(`${childNavRefIdSels(ids, "::before")} {
-    content: ${cssQuotedContent(glyph)};
+${childNavEmojiBeforeCss(glyph)}
 }`);
     }
     for (const [src, ids] of imgs) {
         const url = String(src).replace(/\\/g, "/").replace(/"/g, "%22");
         parts.push(`${childNavRefIdSels(ids, "::before")} {
-    content: "";
-    width: 1.05em;
-    height: 1.05em;
-    background: url("${url}") center / contain no-repeat;
+    content: "" !important;
+    background: url("${url}") center / contain no-repeat !important;
+    background-color: transparent !important;
+    -webkit-mask: none !important;
+    mask: none !important;
+${childNavBeforeBoxCss()}
+}`);
+    }
+    let missingSvg = false;
+    for (const [svgId, ids] of svgs) {
+        const uri = getSiyuanIconMaskImage(svgId);
+        if (!uri) {
+            missingSvg = true;
+            parts.push(`${childNavRefIdSels(ids, "::before")} {
+${childNavEmojiBeforeCss(defaultDocFileGlyph())}
+}`);
+            continue;
+        }
+        parts.push(`${childNavRefIdSels(ids, "::before")} {
+${childNavSvgBeforeCss(uri)}
 }`);
     }
     setChildNavIconCss(parts.join("\n"));
+    return missingSvg;
 }
 
 async function refreshChildNavRefIcons() {
@@ -2416,11 +2755,22 @@ async function refreshChildNavRefIcons() {
         setChildNavIconCss("");
         return;
     }
-    const metas = await queryBlockMetaByIds(ids);
+    const { metas, usedForce } = await queryChildNavIconMetas(ids);
     if (seq !== childNavIconRefreshSeq) {
         return;
     }
-    renderChildNavIconSheet(metas);
+    usedForce.forEach((id) => childNavForceIconIds.delete(id));
+    const missingSvg = renderChildNavIconSheet(metas);
+    if (missingSvg && childNavSvgRetryCount < CHILD_NAV_SVG_RETRY_MAX) {
+        childNavSvgRetryCount += 1;
+        window.setTimeout(() => {
+            if (seq === childNavIconRefreshSeq) {
+                scheduleRefreshChildNavRefIcons();
+            }
+        }, 300);
+        return;
+    }
+    childNavSvgRetryCount = 0;
 }
 
 function scheduleRefreshChildNavRefIcons() {
@@ -2439,17 +2789,13 @@ function setChildNavRefStyleEnabled(enabled) {
     document.documentElement.classList.toggle(CHILD_NAV_HTML_CLASS, !!enabled);
     window.clearTimeout(childNavIconRefreshTimer);
     if (!enabled) {
+        stopChildNavDocIconWatch();
         document.getElementById(CHILD_NAV_STYLE_ID)?.remove();
         setChildNavIconCss("");
         return;
     }
-    let styleEl = document.getElementById(CHILD_NAV_STYLE_ID);
-    if (!styleEl) {
-        styleEl = document.createElement("style");
-        styleEl.id = CHILD_NAV_STYLE_ID;
-        document.head.appendChild(styleEl);
-    }
-    styleEl.textContent = buildChildNavBaseCss();
+    upsertHeadStyle(CHILD_NAV_STYLE_ID, buildChildNavBaseCss());
+    startChildNavDocIconWatch();
     scheduleRefreshChildNavRefIcons();
 }
 
@@ -2933,7 +3279,7 @@ function scheduleMountChildNav(plugin, protyle) {
 
 function syncAllChildNavPanels(plugin) {
     removeLegacyChildNavHosts();
-    setChildNavRefStyleEnabled(plugin?.config?.docRefStyle?.enabled === true);
+    setChildNavRefStyleEnabled(true);
     const enabled = plugin?.config?.childDocWidget?.enabled === true;
     if (!enabled) {
         return;
@@ -3688,7 +4034,7 @@ function patchDocActionBreadcrumbButtons(plugin) {
     });
 }
 
-function syncDocRefStyleFeature(plugin) {
+function syncDocRefStyleFeature(plugin, childNavStyleOn = true) {
     setDocRefStyleCssEnabled(false);
     clearAllDocRefRetries(plugin);
     unwatchAllDocRefMutations(plugin);
@@ -3705,7 +4051,7 @@ function syncDocRefStyleFeature(plugin) {
         plugin.docRefWsTimer = null;
     }
     plugin.docRefWsPending = null;
-    setChildNavRefStyleEnabled(plugin.config.docRefStyle?.enabled === true);
+    setChildNavRefStyleEnabled(childNavStyleOn !== false);
 }
 
 const RE_CJK_CHAR = /[\u4E00-\u9FFF\u3400-\u4DBF\uF900-\uFAFF]/;
@@ -5552,7 +5898,6 @@ module.exports = class FhelperPlugin extends Plugin {
             this.childNavMountTimers = null;
         }
         removeLegacyChildNavHosts();
-        setChildNavRefStyleEnabled(false);
         if (this.breadcrumbMoreHandler) {
             this.eventBus.off("open-menu-breadcrumbmore", this.breadcrumbMoreHandler);
             this.breadcrumbMoreHandler = null;
@@ -5565,8 +5910,7 @@ module.exports = class FhelperPlugin extends Plugin {
         unwatchAllProtyleLayouts(this);
         unwatchAllPanguSpacing(this);
         clearAllDocRefRetries(this);
-        this.config.docRefStyle = { enabled: false };
-        syncDocRefStyleFeature(this);
+        syncDocRefStyleFeature(this, false);
         setImageCenterCssEnabled(false);
         this.settingDialog?.destroy();
         this.settingDialog = null;
@@ -5814,9 +6158,6 @@ module.exports = class FhelperPlugin extends Plugin {
         if (this.panguSpacingEnableEl) {
             this.config.panguSpacing.enabled = this.panguSpacingEnableEl.checked;
         }
-        if (this.docRefStyleEnableEl) {
-            this.config.docRefStyle.enabled = this.docRefStyleEnableEl.checked;
-        }
         if (this.childDocWidgetEnableEl) {
             this.config.childDocWidget = {
                 ...(this.config.childDocWidget || createDefaultChildDocWidgetConfig()),
@@ -5910,7 +6251,6 @@ module.exports = class FhelperPlugin extends Plugin {
 
         const imageScale = this.config.imageScale || createDefaultImageScaleConfig();
         const panguSpacing = this.config.panguSpacing || createDefaultPanguSpacingConfig();
-        const docRefStyle = this.config.docRefStyle || createDefaultDocRefStyleConfig();
         const childDocWidget = this.config.childDocWidget || createDefaultChildDocWidgetConfig();
         const dpiAvailable = canUseImageScale();
 
@@ -5921,17 +6261,13 @@ module.exports = class FhelperPlugin extends Plugin {
             description: this.i18n.childDocWidgetEnableDesc,
             control: this.childDocWidgetEnableEl,
         }));
-        this.docRefStyleEnableEl = this.createSettingSwitch(docRefStyle.enabled === true);
-        childNavSection.appendChild(this.createSettingRow({
-            title: this.i18n.docRefStyleEnable,
-            description: this.i18n.docRefStyleEnableDesc,
-            control: this.docRefStyleEnableEl,
-        }));
         panel.appendChild(childNavSection);
 
         const defaultIconSection = this.createSettingSection(
             this.i18n.sectionDefaultIcons,
-            this.i18n.sectionDefaultIconsDesc,
+            isSiyuanSvgDefaultIconEnabled()
+                ? (this.i18n.sectionDefaultIconsDescSvg || this.i18n.sectionDefaultIconsDesc)
+                : this.i18n.sectionDefaultIconsDesc,
         );
         defaultIconSection.appendChild(createDefaultIconRow(
             this,

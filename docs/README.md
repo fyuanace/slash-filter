@@ -11,7 +11,7 @@
 | 斜杠过滤 | `disabled` | 按项禁用斜杠菜单命令 | — |
 | 图片缩放 | `imageScale` | 图片 DPI / 居中等显示处理 | — |
 | 中英文空格 | `panguSpacing` | 输入与粘贴时 CJK-Latin 自动空格 | — |
-| 子文档引用美化 | `docRefStyle` | 仅对自动子文档导航引用做图标/加粗/下划线；不改手写引用 | [design/2026-09-02-child-nav-body-refs.md](design/2026-09-02-child-nav-body-refs.md)、[design/2026-07-08-doc-ref-style.md](design/2026-07-08-doc-ref-style.md)（已 superseded） |
+| 子文档引用美化 | `docRefStyle` | 始终开启：仅对自动子文档导航引用做图标/加粗/下划线；不改手写引用；无设置开关 | [design/2026-09-02-child-nav-body-refs.md](design/2026-09-02-child-nav-body-refs.md)、[design/2026-07-08-doc-ref-style.md](design/2026-07-08-doc-ref-style.md)（已 superseded） |
 | 子文档导航植入 | `childDocWidget` | 打开文档时若缺当前层子文档的自动引用则补到文末（H5 包裹文档引用 + 自定义属性，与手动引用分开）；斜杠「新建子文档块」同形态；原生进大纲，无大纲注入；顶层笔记本文档按虚拟父子列举；查子文档仅 SQL | [design/2026-09-02-child-nav-body-refs.md](design/2026-09-02-child-nav-body-refs.md)、[design/2026-08-31-child-nav-box-doc.md](design/2026-08-31-child-nav-box-doc.md) |
 | 文档树辅助 | — | 定位到文档树；面包屑「根据文档块移动文档」「删除没有文档块的子文档」；设置默认图标 | [design/2026-09-03-file-tree-default-icons.md](design/2026-09-03-file-tree-default-icons.md) |
 | 配置同步 | `configSync` | 导出设置与自定义主题到 petal 缓存，随思源同步；拉取前先等云端同步成功再写入 conf | [design/2026-09-03-config-sync.md](design/2026-09-03-config-sync.md) |
@@ -31,7 +31,7 @@ childDocWidget ←── 正文 H5+文档引用（缺则补文末；原生大纲
 
 关系约定：
 
-- **子文档引用美化**（设置名；配置键仍为 `docRefStyle`）只给自动导航引用加样式表外观，不装饰手写引用，也不再给任意文档块引用打标。
+- **子文档引用美化**只给自动导航引用加样式表外观，不装饰手写引用；无独立设置开关，插件加载即开启。
 - **导航植入**查子文档必须走 SQL，禁止对可能无子文档的路径调用 `listDocsByPath`（见 [body-sql 设计](design/2026-08-04-child-nav-body-sql.md)）。
 - **顶层笔记本文档**的子文档在磁盘上仍位于笔记本根，导航按虚拟父子列举（见 [box-doc 设计](design/2026-08-31-child-nav-box-doc.md)）。
 - **导航面板**已改为正文 H5 包裹的文档引用：缺则补到文末；块上有 `custom-fhelper-child-nav` 标记，只增删/升级自动块；大纲原生收录，不再注入大纲 DOM（见 [body-refs 设计](design/2026-09-02-child-nav-body-refs.md)）。
