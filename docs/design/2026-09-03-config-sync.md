@@ -5,7 +5,7 @@ module: config-sync
 date: 2026-09-03
 status: implemented
 summary: >
-  配置与主题经 petal 缓存随思源同步；拉取前必须先等云端同步成功。桌面与移动端都可用。
+  覆盖云端：先清空 data 缓存再全量拷贝并立刻上传同步；下载云端：先清空本地 data 缓存，再只拉云端，再写入 conf 并重启。桌面与移动端都可用。
 related: []
 tags: [config-sync, theme-sync]
 ---
@@ -18,6 +18,10 @@ tags: [config-sync, theme-sync]
 |------|------|
 | 2026-09-03 | 移动端开放推送/拉取；拉取前先触发并等待思源云端同步成功；设置说明改为同步内容 / 原理 / 使用方法。 |
 | 2026-09-03 | 设置「关于」展示缓存保存路径；配置文件路径与缓存路径均可打开系统文件夹。 |
+| 2026-09-07 | 配置写入缓存拷贝主题时跳过 `.git`，以及主题内 `.gitignore` 忽略的文件 |
+| 2026-09-07 | 按钮改名为「覆盖云端配置」「下载云端配置」 |
+| 2026-09-07 | 覆盖云端前先清空 data 缓存再全量拷贝并立刻上传同步；下载前先下载同步 |
+| 2026-09-07 | 下载云端改为：先清空本地 data 缓存，再只拉云端，再写入 conf 并重启 |
 
 ## 背景信息
 
@@ -29,8 +33,8 @@ tags: [config-sync, theme-sync]
 
 缓存根目录：`/data/storage/petal/fhelper/config-sync`。
 
-- **配置写入缓存**：调用 `/api/system/exportConf`（与「设置 / 关于 / 导出设置」相同），把 zip 与 JSON 放到 petal 的 `conf/`；再把 `/conf/appearance/themes/` 下非内置主题（排除 daylight / midnight）拷到 petal 的 `themes/`。
-- **缓存写入配置**：先 `POST /api/sync/performSync`（完全手动模式则 `upload: false` 以下载），监听 `sync-end` / `sync-fail` 与 `ws-main` 的 `syncing`。成功后再读 manifest，调用 `/api/system/importConf`，并把主题拷回 `/conf/appearance/themes/`。未开云端同步、同步失败或超时则中止，不写 conf。
+- **覆盖云端配置**：先删除 `config-sync` 下已有配置 zip / JSON 与主题目录，再全量重新导出 conf、拷贝自定义主题（跳过 `.git` 与 `.gitignore`），然后 `performSync` 上传并等到成功。
+- **下载云端配置**：未开同步则中止且不删缓存。已开同步则先删除 `config-sync` 下旧缓存，再 `POST /api/sync/performSync`（`upload: false` 只拉不推），监听 `sync-end` / `sync-fail` 与 `ws-main` 的 `syncing`。成功后把云端落到 data 的配置 zip / 主题拷进 `/conf`（`importConf` + 主题目录），然后弹出重启确认。同步失败或超时则中止，不写 conf。
 - **生效**：桌面用 Electron `relaunch` + `exitSiYuan()`；移动端没有宿主重启，改为 `/api/ui/reloadUI`。主题选择不会随 importConf 自动切过去，需在设置里手动选。
 
 插件系统本身走思源 petal 同步，不经本缓存。
@@ -38,14 +42,15 @@ tags: [config-sync, theme-sync]
 ## 其他模块引用约束
 
 - 不要在未等待同步成功时读取 petal 缓存当「对端最新」。
+- 下载前先清空本地缓存时必须 `upload: false`，禁止把空缓存上传覆盖云端。
 - 不要在移动端对配置导入走 `exitSiYuan()`：会退出且不会自动重开。
 - 不要把内置主题 daylight / midnight 写入缓存。
 
 ## 工程师测试验收方法
 
-- 桌面 A：改设置或主题后点「配置写入缓存」，确认 `data/storage/petal/fhelper/config-sync` 有 zip / 主题目录。
-- 桌面 B：点「缓存写入配置」，应先出现同步提示；同步成功后才导入并弹出重启确认。未开同步时应提示并停止。
-- 移动端：两个按钮可点；拉取同样先同步；确认后刷新界面，再在设置中手动选主题。若部分 conf 未生效，完全退出后重开。
+- 桌面 A：点「覆盖云端配置」后，`config-sync` 应被清空再重写，并触发一次上传同步；成功后提示已覆盖并完成同步。
+- 桌面 B：点「下载云端配置」，应先清空本地 `config-sync`，再只拉同步；成功后把 data 写入 conf 并弹出重启确认。未开同步时应提示并停止，且不得删缓存。
+- 移动端：两个按钮可点；下载同样先同步；确认后刷新界面，再在设置中手动选主题。若部分 conf 未生效，完全退出后重开。
 - 回归：同步失败或超时不得改本地 conf / 主题。
 
 ## 其他说明

@@ -14,7 +14,7 @@
 | 子文档引用美化 | `docRefStyle` | 始终开启：仅对自动子文档导航引用做图标/加粗/下划线；不改手写引用；无设置开关 | [design/2026-09-02-child-nav-body-refs.md](design/2026-09-02-child-nav-body-refs.md)、[design/2026-07-08-doc-ref-style.md](design/2026-07-08-doc-ref-style.md)（已 superseded） |
 | 子文档导航植入 | `childDocWidget` | 打开文档时若缺当前层子文档的自动引用则补到文末（H5 包裹文档引用 + 自定义属性，与手动引用分开）；斜杠「新建子文档块」同形态；原生进大纲，无大纲注入；顶层笔记本文档按虚拟父子列举；查子文档仅 SQL | [design/2026-09-02-child-nav-body-refs.md](design/2026-09-02-child-nav-body-refs.md)、[design/2026-08-31-child-nav-box-doc.md](design/2026-08-31-child-nav-box-doc.md) |
 | 文档树辅助 | — | 定位到文档树；面包屑「根据文档块移动文档」「删除没有文档块的子文档」；设置默认图标 | [design/2026-09-03-file-tree-default-icons.md](design/2026-09-03-file-tree-default-icons.md) |
-| 配置同步 | `configSync` | 导出设置与自定义主题到 petal 缓存，随思源同步；拉取前先等云端同步成功再写入 conf | [design/2026-09-03-config-sync.md](design/2026-09-03-config-sync.md) |
+| 配置同步 | `configSync` | 覆盖云端：清空 data 缓存后全量拷贝并立刻上传同步；下载云端：先清空本地 data 缓存，再只拉云端，再写入 conf 并重启 | [design/2026-09-03-config-sync.md](design/2026-09-03-config-sync.md) |
 
 ## 整体架构
 
@@ -26,7 +26,7 @@
 docRefStyle ←── 自动导航引用样式表（不改 span）
 childDocWidget ←── 正文 H5+文档引用（缺则补文末；原生大纲；仅 SQL；自动块带自定义属性）
 文档树辅助 ←── 定位到文档树；按自动导航块把对应文档收为子文档；删除没有自动导航块的当前层子文档；设置默认图标
-配置同步 ←── 导出设置 + 拷贝主题到 data/storage/petal/fhelper/config-sync；拉取前先 performSync
+配置同步 ←── 覆盖：清空 petal 缓存后全量拷贝并 performSync 上传；下载：先清空本地缓存，再 performSync 只拉，再 importConf
 ```
 
 关系约定：

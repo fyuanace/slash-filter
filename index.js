@@ -348,9 +348,11 @@ function parseConfigSyncWsEvent(event) {
 
 /**
  * Trigger SiYuan cloud sync and wait until it succeeds.
- * Pull must not import petal cache until the workspace has the latest files.
+ * upload:true 覆盖云端（上传）；upload:false 下载云端，避免先把本地旧缓存传上去。
  */
-async function triggerAndWaitSiyuanSync(plugin, timeoutMs = CONFIG_SYNC_WAIT_MS) {
+async function triggerAndWaitSiyuanSync(plugin, options = {}) {
+    const timeoutMs = options.timeoutMs || CONFIG_SYNC_WAIT_MS;
+    const upload = options.upload;
     if (!isSiyuanCloudSyncEnabled()) {
         return { ok: false, reason: "disabled" };
     }
@@ -413,8 +415,14 @@ async function triggerAndWaitSiyuanSync(plugin, timeoutMs = CONFIG_SYNC_WAIT_MS)
         const timeoutId = window.setTimeout(() => done({ ok: false, reason: "timeout" }), timeoutMs);
         cleanups.push(() => window.clearTimeout(timeoutId));
 
-        const mode = Number(window.siyuan?.config?.sync?.mode);
-        const body = mode === 3 ? { upload: false } : {};
+        let body = {};
+        if (upload === true) {
+            body = { upload: true };
+        } else if (upload === false) {
+            body = { upload: false };
+        } else if (Number(window.siyuan?.config?.sync?.mode) === 3) {
+            body = { upload: false };
+        }
         fetchSyncPost("/api/sync/performSync", body).then((res) => {
             if (res && typeof res.code === "number" && res.code !== 0) {
                 done({ ok: false, reason: "start-failed", msg: res.msg || "" });
@@ -435,22 +443,37 @@ async function triggerAndWaitSiyuanSync(plugin, timeoutMs = CONFIG_SYNC_WAIT_MS)
     });
 }
 
-function notifyConfigSyncSyncResult(plugin, syncResult) {
+function notifyConfigSyncSyncResult(plugin, syncResult, action = "pull") {
     const i18n = plugin?.i18n || {};
+    const isPush = action === "push";
     if (syncResult?.reason === "disabled") {
-        showMessage(i18n.configSyncSyncDisabled || "未开启云端同步，无法拉取缓存");
+        showMessage(isPush
+            ? (i18n.configSyncSyncDisabledPush || "未开启云端同步，无法覆盖到云端")
+            : (i18n.configSyncSyncDisabled || "未开启云端同步，无法下载云端配置"));
         return;
     }
     if (syncResult?.reason === "timeout") {
-        showMessage(i18n.configSyncSyncTimeout || "同步超时，已取消写入配置");
+        showMessage(isPush
+            ? (i18n.configSyncSyncTimeoutPush || "本地已重新拷贝，但同步超时，未能覆盖云端")
+            : (i18n.configSyncSyncTimeout || "同步超时，已取消下载云端配置"));
         return;
     }
-    showMessage(i18n.configSyncSyncFailed || "同步失败，已取消写入配置");
+    showMessage(isPush
+        ? (i18n.configSyncSyncFailedPush || "本地已重新拷贝，但同步失败，未能覆盖云端")
+        : (i18n.configSyncSyncFailed || "同步失败，已取消下载云端配置"));
 }
 
 function getConfigSyncRoot(plugin) {
     const name = plugin?.name || "fhelper";
     return `/data/storage/petal/${name}/${CONFIG_SYNC_DIR_NAME}`;
+}
+
+async function wipeConfigSyncCache(plugin) {
+    const root = getConfigSyncRoot(plugin);
+    await apiRemovePath(root);
+    await apiEnsureDir(root);
+    await apiEnsureDir(`${root}/conf`);
+    await apiEnsureDir(`${root}/themes`);
 }
 
 function getPluginPetalRoot(plugin) {
@@ -716,11 +739,151 @@ async function listCustomThemeNames() {
         .sort();
 }
 
-async function copyDirRecursive(srcDir, destDir) {
-    await apiEnsureDir(destDir);
+function parseGitignoreLines(text) {
+    return String(text || "")
+        .split(/\r?\n/)
+        .map((line) => line.replace(/\s+$/, ""))
+        .filter((line) => line && !line.startsWith("#"));
+}
+
+function gitignoreGlobToRegExp(pattern) {
+    let i = 0;
+    let out = "";
+    while (i < pattern.length) {
+        if (pattern.startsWith("**/", i)) {
+            out += "(?:.*/)?";
+            i += 3;
+            continue;
+        }
+        if (pattern.slice(i, i + 2) === "**") {
+            out += ".*";
+            i += 2;
+            continue;
+        }
+        const c = pattern[i];
+        if (c === "*") {
+            out += "[^/]*";
+        } else if (c === "?") {
+            out += "[^/]";
+        } else if ("\\^$+{}()|[]".includes(c)) {
+            out += `\\${c}`;
+        } else if (c === ".") {
+            out += "\\.";
+        } else {
+            out += c;
+        }
+        i += 1;
+    }
+    return out;
+}
+
+function matchGitignorePattern(relPath, isDir, rawPattern) {
+    let pattern = String(rawPattern || "").replace(/\\/g, "/");
+    if (!pattern) {
+        return false;
+    }
+    const dirOnly = pattern.endsWith("/");
+    if (dirOnly) {
+        pattern = pattern.replace(/\/+$/, "");
+    }
+    const anchored = pattern.startsWith("/") || pattern.slice(0, -1).includes("/");
+    if (pattern.startsWith("/")) {
+        pattern = pattern.slice(1);
+    }
+    if (!pattern) {
+        return false;
+    }
+    if (dirOnly && !isDir && (relPath === pattern || !relPath.startsWith(`${pattern}/`))) {
+        return false;
+    }
+    const body = gitignoreGlobToRegExp(pattern);
+    const re = new RegExp(anchored ? `^${body}(?:/.*)?$` : `(?:^|.*/)${body}(?:/.*)?$`);
+    return re.test(relPath);
+}
+
+function isIgnoredByGitignore(relPath, isDir, patterns) {
+    let ignored = false;
+    for (const raw of patterns || []) {
+        const negated = raw.startsWith("!");
+        const pattern = negated ? raw.slice(1) : raw;
+        if (matchGitignorePattern(relPath, isDir, pattern)) {
+            ignored = !negated;
+        }
+    }
+    return ignored;
+}
+
+function shouldSkipThemePath(relPath, isDir, name, ruleSets) {
+    if (name === ".git" || String(relPath).split("/").includes(".git")) {
+        return true;
+    }
+    for (const set of ruleSets || []) {
+        let local = relPath;
+        if (set.base) {
+            const prefix = `${set.base}/`;
+            if (relPath !== set.base && !relPath.startsWith(prefix)) {
+                continue;
+            }
+            local = relPath === set.base ? "" : relPath.slice(prefix.length);
+            if (!local) {
+                continue;
+            }
+        }
+        if (isIgnoredByGitignore(local, isDir, set.patterns)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+async function loadThemeExportRuleSets(themeRoot) {
+    const text = await apiGetText(`${themeRoot}/.gitignore`);
+    return [{ base: "", patterns: parseGitignoreLines(text) }];
+}
+
+async function walkThemeExportEntries(srcDir, ctx, onFile, onDir) {
     const entries = await apiReadDir(srcDir);
+    const relDir = ctx.relDir || "";
+    const ruleSets = (ctx.ruleSets || []).slice();
+    if (relDir && entries.some((item) => item?.name === ".gitignore" && !item.isDir)) {
+        const text = await apiGetText(`${srcDir}/.gitignore`);
+        ruleSets.push({ base: relDir, patterns: parseGitignoreLines(text) });
+    }
     for (const entry of entries) {
         if (!entry?.name) {
+            continue;
+        }
+        const relPath = relDir ? `${relDir}/${entry.name}` : entry.name;
+        if (shouldSkipThemePath(relPath, !!entry.isDir, entry.name, ruleSets)) {
+            continue;
+        }
+        const srcPath = `${srcDir}/${entry.name}`;
+        if (entry.isDir) {
+            await onDir?.(relPath, srcPath, entry);
+            await walkThemeExportEntries(srcPath, { relDir: relPath, ruleSets }, onFile, onDir);
+            continue;
+        }
+        await onFile?.(relPath, srcPath, entry);
+    }
+}
+
+async function copyDirRecursive(srcDir, destDir, ctx = null) {
+    await apiEnsureDir(destDir);
+    if (ctx) {
+        await walkThemeExportEntries(srcDir, ctx, async (relPath, srcPath, entry) => {
+            const blob = await apiGetBlob(srcPath);
+            if (!blob) {
+                return;
+            }
+            await apiPutBytes(`${destDir}/${relPath}`, blob, entry.name);
+        }, async (relPath) => {
+            await apiEnsureDir(`${destDir}/${relPath}`);
+        });
+        return;
+    }
+    const entries = await apiReadDir(srcDir);
+    for (const entry of entries) {
+        if (!entry?.name || entry.name === ".git") {
             continue;
         }
         const srcPath = `${srcDir}/${entry.name}`;
@@ -751,11 +914,14 @@ async function buildLocalThemesFingerprint() {
     const names = await listCustomThemeNames();
     const parts = [];
     for (const name of names) {
-        const themeJson = await apiGetText(`/conf/appearance/themes/${name}/theme.json`);
+        const themeRoot = `/conf/appearance/themes/${name}`;
+        const themeJson = await apiGetText(`${themeRoot}/theme.json`);
         parts.push(`${name}:${themeJson || ""}`);
-        const entries = await apiReadDir(`/conf/appearance/themes/${name}`);
-        entries.forEach((entry) => {
-            parts.push(`${name}/${entry.name}:${entry.updated || 0}:${entry.isDir ? "d" : "f"}`);
+        const ruleSets = await loadThemeExportRuleSets(themeRoot);
+        await walkThemeExportEntries(themeRoot, { relDir: "", ruleSets }, async (relPath, srcPath, entry) => {
+            parts.push(`${name}/${relPath}:${entry.updated || 0}:f`);
+        }, async (relPath, srcPath, entry) => {
+            parts.push(`${name}/${relPath}:${entry.updated || 0}:d`);
         });
     }
     return hashText(parts.join("|"));
@@ -815,7 +981,9 @@ async function exportThemesToPetal(plugin) {
     await removeDirContents(themesDir);
     const names = await listCustomThemeNames();
     for (const name of names) {
-        await copyDirRecursive(`/conf/appearance/themes/${name}`, `${themesDir}/${name}`);
+        const src = `/conf/appearance/themes/${name}`;
+        const ruleSets = await loadThemeExportRuleSets(src);
+        await copyDirRecursive(src, `${themesDir}/${name}`, { relDir: "", ruleSets });
     }
     return { names, hash: await buildLocalThemesFingerprint() };
 }
@@ -880,41 +1048,38 @@ async function pushConfigSync(plugin, options = {}) {
     }
     plugin.configSyncBusy = true;
     try {
-        const root = getConfigSyncRoot(plugin);
-        await apiEnsureDir(root);
-        const prev = await loadConfigSyncManifest(plugin);
+        if (options.notify) {
+            showMessage(plugin.i18n.configSyncSyncing || "正在同步…", 0);
+        }
+        await wipeConfigSyncCache(plugin);
         const localConfHash = await buildLocalConfFingerprint();
         const localThemesHash = await buildLocalThemesFingerprint();
-        const needConf = !prev?.conf?.hash || prev.conf.hash !== localConfHash || options.force;
-        const needThemes = !prev?.themes?.hash || prev.themes.hash !== localThemesHash || options.force;
-        if (!needConf && !needThemes) {
-            return { skipped: true, reason: "up-to-date" };
-        }
+        const packed = await exportConfToPetal(plugin);
+        const themePack = await exportThemesToPetal(plugin);
         const manifest = {
             version: 1,
             updatedAt: Date.now(),
-            conf: prev?.conf || null,
-            themes: prev?.themes || null,
-        };
-        if (needConf) {
-            const packed = await exportConfToPetal(plugin);
-            manifest.conf = {
+            conf: {
                 file: packed.file,
                 jsonFile: packed.jsonFile || "",
                 exportName: packed.name || "",
                 hash: localConfHash || packed.hash,
-            };
-        }
-        if (needThemes) {
-            const themePack = await exportThemesToPetal(plugin);
-            manifest.themes = {
+            },
+            themes: {
                 hash: localThemesHash || themePack.hash,
                 names: themePack.names,
-            };
-        }
+            },
+        };
         await saveConfigSyncManifest(plugin, manifest);
+        const syncResult = await triggerAndWaitSiyuanSync(plugin, { upload: true });
+        if (!syncResult.ok) {
+            if (options.notify) {
+                notifyConfigSyncSyncResult(plugin, syncResult, "push");
+            }
+            return { skipped: true, reason: `sync-${syncResult.reason}`, copied: true };
+        }
         if (options.notify) {
-            showMessage(plugin.i18n.configSyncPushed || "配置已写入缓存（需思源同步后才会到其他设备）");
+            showMessage(plugin.i18n.configSyncPushed || "已覆盖云端配置并完成同步");
         }
         return { ok: true, manifest };
     } finally {
@@ -931,10 +1096,17 @@ async function pullConfigSync(plugin, options = {}) {
         if (options.notify) {
             showMessage(plugin.i18n.configSyncSyncing || "正在同步…", 0);
         }
-        const syncResult = await triggerAndWaitSiyuanSync(plugin);
+        if (!isSiyuanCloudSyncEnabled()) {
+            if (options.notify) {
+                notifyConfigSyncSyncResult(plugin, { ok: false, reason: "disabled" }, "pull");
+            }
+            return { skipped: true, reason: "sync-disabled" };
+        }
+        await wipeConfigSyncCache(plugin);
+        const syncResult = await triggerAndWaitSiyuanSync(plugin, { upload: false });
         if (!syncResult.ok) {
             if (options.notify) {
-                notifyConfigSyncSyncResult(plugin, syncResult);
+                notifyConfigSyncSyncResult(plugin, syncResult, "pull");
             }
             return { skipped: true, reason: `sync-${syncResult.reason}` };
         }
@@ -946,38 +1118,24 @@ async function pullConfigSync(plugin, options = {}) {
             }
             return { skipped: true, reason: "no-pack" };
         }
-        const localConfHash = await buildLocalConfFingerprint();
-        const localThemesHash = await buildLocalThemesFingerprint();
-        const needConf = manifest.conf?.hash && (options.force || manifest.conf.hash !== localConfHash);
-        const needThemes = manifest.themes?.hash && (options.force || manifest.themes.hash !== localThemesHash);
-        if (!needConf && !needThemes) {
-            if (options.notify) {
-                showMessage(plugin.i18n.configSyncUpToDate || "缓存已是最新，无需更新");
-            }
-            return { skipped: true, reason: "up-to-date" };
-        }
-        if (needConf) {
-            await importConfFromPetal(plugin, manifest);
-        }
-        if (needThemes) {
-            await importThemesFromPetal(plugin);
-        }
+        await importConfFromPetal(plugin, manifest);
+        await importThemesFromPetal(plugin);
         if (options.notify !== false) {
             promptConfigSyncRestart(plugin);
         }
-        return { ok: true, needConf, needThemes };
+        return { ok: true, needConf: true, needThemes: true };
     } finally {
         plugin.configSyncBusy = false;
     }
 }
 
 function promptConfigSyncRestart(plugin) {
-    const title = plugin?.i18n?.configSyncRestartTitle || "缓存已写入配置";
+    const title = plugin?.i18n?.configSyncRestartTitle || "已下载云端配置";
     const text = isMobileFrontend()
         ? (plugin?.i18n?.configSyncRestartDescMobile
-            || "配置与主题已从缓存写入。点击确定后将刷新界面。若部分设置未生效，请完全退出后重新打开思源。请在设置中手动选择主题。")
+            || "配置与主题已从云端下载。点击确定后将刷新界面。若部分设置未生效，请完全退出后重新打开思源。请在设置中手动选择主题。")
         : (plugin?.i18n?.configSyncRestartDesc
-            || "配置与主题已从缓存写入。点击确定后将自动重启思源以生效。重启后请在设置中手动选择主题。");
+            || "配置与主题已从云端下载。点击确定后将自动重启思源以生效。重启后请在设置中手动选择主题。");
     if (typeof confirm === "function") {
         confirm(title, text, () => {
             restartSiYuanApp();
